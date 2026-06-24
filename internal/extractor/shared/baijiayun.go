@@ -3,13 +3,13 @@
 //
 // Baijiayun has two playback flows (from Baijiayun_Video.pyc constants):
 //
-//   Live replay:
-//     GET https://api.baijiayun.com/web/playback/getPlayInfo
-//          ?room_id={room_id}&token={token}&use_encrypt=0&render=jsonp
+//	Live replay:
+//	  GET https://api.baijiayun.com/web/playback/getPlayInfo
+//	       ?room_id={room_id}&token={token}&use_encrypt=0&render=jsonp
 //
-//   VOD playback:
-//     GET https://www.baijiayun.com/vod/video/getPlayUrl
-//          ?vid={video_id}&render=jsonp&token={token}&use_encrypt=0
+//	VOD playback:
+//	  GET https://www.baijiayun.com/vod/video/getPlayUrl
+//	       ?vid={video_id}&render=jsonp&token={token}&use_encrypt=0
 //
 // Both endpoints return JSONP with the JSON payload wrapped in `(...)`. We
 // strip the wrapper and parse the inner JSON.
@@ -36,16 +36,29 @@ type BaijiayunVideo struct {
 	Definition string `json:"definition"`
 }
 
+// BaijiayunCDNURL is one URL candidate inside data.play_info.*.cdn_list.
+type BaijiayunCDNURL struct {
+	URL    string `json:"url"`
+	EncURL string `json:"enc_url"`
+}
+
+// BaijiayunPlayInfo describes one quality object in getPlayInfo data.play_info.
+type BaijiayunPlayInfo struct {
+	Size    int64             `json:"size"`
+	CDNList []BaijiayunCDNURL `json:"cdn_list"`
+}
+
 // BaijiayunPlaybackResponse parses the JSONP response from getPlayInfo or
 // getPlayUrl. Different endpoints use slightly different keys; we accept both.
 type BaijiayunPlaybackResponse struct {
 	Code int    `json:"code"`
 	Msg  string `json:"msg"`
 	Data struct {
-		PlaybackURL string           `json:"playback_url"`
-		VideoURL    string           `json:"video_url"`
-		Title       string           `json:"title"`
-		Videos      []BaijiayunVideo `json:"video"` // VOD format
+		PlaybackURL string                       `json:"playback_url"`
+		VideoURL    string                       `json:"video_url"`
+		Title       string                       `json:"title"`
+		Videos      []BaijiayunVideo             `json:"video"`     // VOD format
+		PlayInfo    map[string]BaijiayunPlayInfo `json:"play_info"` // playback format
 	} `json:"data"`
 }
 
@@ -91,7 +104,13 @@ func BaijiayunResolvePlayback(c *util.Client, roomID, token string, headers map[
 	if resp.Data.PlaybackURL != "" {
 		return resp.Data.PlaybackURL, nil
 	}
-	return "", fmt.Errorf("baijiayun playback: no playback_url in response")
+	if resp.Data.VideoURL != "" {
+		return resp.Data.VideoURL, nil
+	}
+	if u := pickBaijiayunPlayInfoURL(resp.Data.PlayInfo); u != "" {
+		return u, nil
+	}
+	return "", fmt.Errorf("baijiayun playback: no playable URL in response")
 }
 
 var jsonpUnwrapRe = regexp.MustCompile(`(?s)^[\w_$]*\((.*)\);?$`)
@@ -110,4 +129,30 @@ func fetchAndUnwrapJSONP(c *util.Client, apiURL string, headers map[string]strin
 		return nil, fmt.Errorf("baijiayun parse JSONP: %w", err)
 	}
 	return &resp, nil
+}
+
+func pickBaijiayunPlayInfoURL(playInfo map[string]BaijiayunPlayInfo) string {
+	var best BaijiayunPlayInfo
+	var have bool
+	for _, item := range playInfo {
+		if len(item.CDNList) == 0 {
+			continue
+		}
+		if !have || item.Size > best.Size {
+			best = item
+			have = true
+		}
+	}
+	if !have {
+		return ""
+	}
+	for _, cdn := range best.CDNList {
+		if cdn.URL != "" {
+			return cdn.URL
+		}
+		if cdn.EncURL != "" && !strings.HasPrefix(cdn.EncURL, "bjcloudvod://") {
+			return cdn.EncURL
+		}
+	}
+	return ""
 }
