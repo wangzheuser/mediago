@@ -3,13 +3,13 @@
 //
 // Baijiayun has two playback flows (from Baijiayun_Video.pyc constants):
 //
-//   Live replay:
-//     GET https://api.baijiayun.com/web/playback/getPlayInfo
-//          ?room_id={room_id}&token={token}&use_encrypt=0&render=jsonp
+//	Live replay:
+//	  GET https://api.baijiayun.com/web/playback/getPlayInfo
+//	       ?room_id={room_id}&token={token}&use_encrypt=0&render=jsonp
 //
-//   VOD playback:
-//     GET https://www.baijiayun.com/vod/video/getPlayUrl
-//          ?vid={video_id}&render=jsonp&token={token}&use_encrypt=0
+//	VOD playback:
+//	  GET https://www.baijiayun.com/vod/video/getPlayUrl
+//	       ?vid={video_id}&render=jsonp&token={token}&use_encrypt=0
 //
 // Both endpoints return JSONP with the JSON payload wrapped in `(...)`. We
 // strip the wrapper and parse the inner JSON.
@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/nichuanfang/medigo/internal/util"
@@ -36,16 +38,26 @@ type BaijiayunVideo struct {
 	Definition string `json:"definition"`
 }
 
+// BaijiayunPlayInfo is the play_info quality map returned by getPlayUrl.
+type BaijiayunPlayInfo struct {
+	Size    any `json:"size"`
+	CDNList []struct {
+		URL    string `json:"url"`
+		EncURL string `json:"enc_url"`
+	} `json:"cdn_list"`
+}
+
 // BaijiayunPlaybackResponse parses the JSONP response from getPlayInfo or
 // getPlayUrl. Different endpoints use slightly different keys; we accept both.
 type BaijiayunPlaybackResponse struct {
 	Code int    `json:"code"`
 	Msg  string `json:"msg"`
 	Data struct {
-		PlaybackURL string           `json:"playback_url"`
-		VideoURL    string           `json:"video_url"`
-		Title       string           `json:"title"`
-		Videos      []BaijiayunVideo `json:"video"` // VOD format
+		PlaybackURL string                       `json:"playback_url"`
+		VideoURL    string                       `json:"video_url"`
+		Title       string                       `json:"title"`
+		Videos      []BaijiayunVideo             `json:"video"` // VOD format
+		PlayInfo    map[string]BaijiayunPlayInfo `json:"play_info"`
 	} `json:"data"`
 }
 
@@ -70,6 +82,9 @@ func BaijiayunResolveVOD(c *util.Client, vid, token string, headers map[string]s
 	if len(resp.Data.Videos) > 0 {
 		return resp.Data.Videos[0].URL, nil
 	}
+	if u := pickBaijiayunPlayInfoURL(resp.Data.PlayInfo); u != "" {
+		return u, nil
+	}
 	return "", fmt.Errorf("baijiayun VOD: no playable URL")
 }
 
@@ -92,6 +107,62 @@ func BaijiayunResolvePlayback(c *util.Client, roomID, token string, headers map[
 		return resp.Data.PlaybackURL, nil
 	}
 	return "", fmt.Errorf("baijiayun playback: no playback_url in response")
+}
+
+func pickBaijiayunPlayInfoURL(playInfo map[string]BaijiayunPlayInfo) string {
+	if len(playInfo) == 0 {
+		return ""
+	}
+	type candidate struct {
+		size int64
+		url  string
+	}
+	candidates := make([]candidate, 0, len(playInfo))
+	for _, info := range playInfo {
+		for _, cdn := range info.CDNList {
+			u := strings.TrimSpace(cdn.URL)
+			if u == "" {
+				u = strings.TrimSpace(cdn.EncURL)
+			}
+			if strings.HasPrefix(u, "//") {
+				u = "https:" + u
+			}
+			if strings.HasPrefix(u, "http") {
+				candidates = append(candidates, candidate{size: numberAsInt64(info.Size), url: u})
+				break
+			}
+		}
+	}
+	if len(candidates) == 0 {
+		return ""
+	}
+	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].size > candidates[j].size })
+	return candidates[0].url
+}
+
+func numberAsInt64(v any) int64 {
+	switch x := v.(type) {
+	case float64:
+		return int64(x)
+	case float32:
+		return int64(x)
+	case int:
+		return int64(x)
+	case int64:
+		return x
+	case json.Number:
+		n, _ := x.Int64()
+		return n
+	case string:
+		if strings.Contains(x, ".") {
+			f, _ := strconv.ParseFloat(x, 64)
+			return int64(f)
+		}
+		n, _ := strconv.ParseInt(x, 10, 64)
+		return n
+	default:
+		return 0
+	}
 }
 
 var jsonpUnwrapRe = regexp.MustCompile(`(?s)^[\w_$]*\((.*)\);?$`)
