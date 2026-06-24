@@ -42,7 +42,8 @@ const (
 
 var (
 	patterns     = []string{`(?:[\w-]+\.)?(?:biguo|qianxuecloud)\.(?:cn|com)/`}
-	cidRe        = regexp.MustCompile(`(?i)(?:/courses?/|courseId=|cid=|id=)([0-9a-f]{24})|(?:^|[^0-9a-fA-F])([0-9a-fA-F]{24})(?:[^0-9a-fA-F]|$)`)
+	cidRe        = regexp.MustCompile(`(?i)(?:/courses?/|courseId=|cid=|id=)([0-9a-f]{24})`)
+	hex24Re      = regexp.MustCompile(`(?i)[0-9a-f]{24}`)
 	titleCleanRe = regexp.MustCompile(`[\\/:*?"<>|\r\n\t]+`)
 )
 
@@ -113,16 +114,24 @@ func (y *Yixiaoerguo) Extract(rawURL string, opts *extractor.ExtractOpts) (*extr
 }
 
 func parseCID(raw string) string {
-	m := cidRe.FindStringSubmatch(raw)
-	if len(m) == 0 {
-		return ""
+	if m := cidRe.FindStringSubmatch(raw); len(m) > 1 && m[1] != "" {
+		return strings.ToLower(m[1])
 	}
-	for _, s := range m[1:] {
-		if s != "" {
-			return s
+	for _, loc := range hex24Re.FindAllStringIndex(raw, -1) {
+		if hasHexNeighbor(raw, loc[0], loc[1]) {
+			continue
 		}
+		return strings.ToLower(raw[loc[0]:loc[1]])
 	}
 	return ""
+}
+
+func hasHexNeighbor(s string, start, end int) bool {
+	return (start > 0 && isASCIIHex(s[start-1])) || (end < len(s) && isASCIIHex(s[end]))
+}
+
+func isASCIIHex(b byte) bool {
+	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')
 }
 
 func tokenFromJar(jar http.CookieJar) string {

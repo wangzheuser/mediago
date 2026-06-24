@@ -51,6 +51,9 @@ medigo -o ./downloads https://www.douyin.com/video/123456
 
 # List supported sites
 medigo sites
+
+# Route extractor and downloader requests through a proxy
+medigo --proxy http://127.0.0.1:7890 https://www.bilibili.com/video/BV1GJ411x7h7
 ```
 
 ### Flags
@@ -65,6 +68,8 @@ medigo sites
 | `--list` | List available streams |
 | `--all` | Download all chapters/episodes |
 | `--json` | Output media info as JSON |
+| `--proxy` | HTTP/SOCKS proxy URL for extractor and downloader requests |
+| `--overwrite` | Overwrite existing output files |
 
 ## Supported Sites (92)
 

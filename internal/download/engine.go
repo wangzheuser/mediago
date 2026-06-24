@@ -39,13 +39,15 @@ func New(opts Opts) *Engine {
 		opts.Retries = 3
 	}
 	ffmpeg, _ := exec.LookPath("ffmpeg")
+	httpClient, err := util.NewHTTPClient(5*time.Minute, "")
+	if err != nil {
+		httpClient = &http.Client{Timeout: 5 * time.Minute}
+	}
 	return &Engine{
 		opts:   opts,
 		ffmpeg: ffmpeg,
 		client: util.NewClient(),
-		http: &http.Client{
-			Timeout: 5 * time.Minute,
-		},
+		http:   httpClient,
 	}
 }
 
