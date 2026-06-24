@@ -36,29 +36,18 @@ type BaijiayunVideo struct {
 	Definition string `json:"definition"`
 }
 
-// BaijiayunCDNURL is one URL candidate inside data.play_info.*.cdn_list.
-type BaijiayunCDNURL struct {
-	URL    string `json:"url"`
-	EncURL string `json:"enc_url"`
-}
-
-// BaijiayunPlayInfo describes one quality object in getPlayInfo data.play_info.
-type BaijiayunPlayInfo struct {
-	Size    int64             `json:"size"`
-	CDNList []BaijiayunCDNURL `json:"cdn_list"`
-}
-
 // BaijiayunPlaybackResponse parses the JSONP response from getPlayInfo or
 // getPlayUrl. Different endpoints use slightly different keys; we accept both.
 type BaijiayunPlaybackResponse struct {
 	Code int    `json:"code"`
 	Msg  string `json:"msg"`
 	Data struct {
-		PlaybackURL string                       `json:"playback_url"`
-		VideoURL    string                       `json:"video_url"`
-		Title       string                       `json:"title"`
-		Videos      []BaijiayunVideo             `json:"video"`     // VOD format
-		PlayInfo    map[string]BaijiayunPlayInfo `json:"play_info"` // playback format
+		PlaybackURL string           `json:"playback_url"`
+		VideoURL    string           `json:"video_url"`
+		PlayURL     string           `json:"play_url"`
+		URL         string           `json:"url"`
+		Title       string           `json:"title"`
+		Videos      []BaijiayunVideo `json:"video"` // VOD format
 	} `json:"data"`
 }
 
@@ -79,6 +68,12 @@ func BaijiayunResolveVOD(c *util.Client, vid, token string, headers map[string]s
 	}
 	if resp.Data.VideoURL != "" {
 		return resp.Data.VideoURL, nil
+	}
+	if resp.Data.PlayURL != "" {
+		return resp.Data.PlayURL, nil
+	}
+	if resp.Data.URL != "" {
+		return resp.Data.URL, nil
 	}
 	if len(resp.Data.Videos) > 0 {
 		return resp.Data.Videos[0].URL, nil
@@ -104,13 +99,7 @@ func BaijiayunResolvePlayback(c *util.Client, roomID, token string, headers map[
 	if resp.Data.PlaybackURL != "" {
 		return resp.Data.PlaybackURL, nil
 	}
-	if resp.Data.VideoURL != "" {
-		return resp.Data.VideoURL, nil
-	}
-	if u := pickBaijiayunPlayInfoURL(resp.Data.PlayInfo); u != "" {
-		return u, nil
-	}
-	return "", fmt.Errorf("baijiayun playback: no playable URL in response")
+	return "", fmt.Errorf("baijiayun playback: no playback_url in response")
 }
 
 var jsonpUnwrapRe = regexp.MustCompile(`(?s)^[\w_$]*\((.*)\);?$`)
@@ -129,30 +118,4 @@ func fetchAndUnwrapJSONP(c *util.Client, apiURL string, headers map[string]strin
 		return nil, fmt.Errorf("baijiayun parse JSONP: %w", err)
 	}
 	return &resp, nil
-}
-
-func pickBaijiayunPlayInfoURL(playInfo map[string]BaijiayunPlayInfo) string {
-	var best BaijiayunPlayInfo
-	var have bool
-	for _, item := range playInfo {
-		if len(item.CDNList) == 0 {
-			continue
-		}
-		if !have || item.Size > best.Size {
-			best = item
-			have = true
-		}
-	}
-	if !have {
-		return ""
-	}
-	for _, cdn := range best.CDNList {
-		if cdn.URL != "" {
-			return cdn.URL
-		}
-		if cdn.EncURL != "" && !strings.HasPrefix(cdn.EncURL, "bjcloudvod://") {
-			return cdn.EncURL
-		}
-	}
-	return ""
 }
