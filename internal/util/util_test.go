@@ -98,3 +98,41 @@ func TestBase64Decode(t *testing.T) {
 		t.Errorf("got %q, want %q", decoded, "hello")
 	}
 }
+
+func TestParseProxyURL(t *testing.T) {
+	tests := []struct {
+		name       string
+		input      string
+		wantScheme string
+		wantHost   string
+		wantErr    bool
+	}{
+		{name: "empty", input: ""},
+		{name: "http default", input: "127.0.0.1:7890", wantScheme: "http", wantHost: "127.0.0.1:7890"},
+		{name: "socks5h normalized", input: "socks5h://127.0.0.1:7897", wantScheme: "socks5", wantHost: "127.0.0.1:7897"},
+		{name: "unsupported", input: "ftp://127.0.0.1:21", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseProxyURL(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("ParseProxyURL(%q) expected error", tt.input)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseProxyURL(%q) error: %v", tt.input, err)
+			}
+			if tt.input == "" {
+				if got != nil {
+					t.Fatalf("ParseProxyURL(empty) = %v, want nil", got)
+				}
+				return
+			}
+			if got.Scheme != tt.wantScheme || got.Host != tt.wantHost {
+				t.Fatalf("ParseProxyURL(%q) = %s://%s, want %s://%s", tt.input, got.Scheme, got.Host, tt.wantScheme, tt.wantHost)
+			}
+		})
+	}
+}

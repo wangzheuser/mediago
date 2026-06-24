@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -17,18 +18,90 @@ var userAgents = []string{
 	"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
 }
 
+var defaultProxy atomic.Value // string
+
 type Client struct {
 	http    *http.Client
 	retries int
 }
 
 func NewClient() *Client {
-	return &Client{
-		http: &http.Client{
-			Timeout: 30 * time.Second,
-		},
-		retries: 3,
+	client, err := NewClientWithProxy("")
+	if err != nil {
+		// The package-level proxy is validated by SetDefaultProxy. This fallback
+		// keeps callers safe if an external test mutates state unexpectedly.
+		return &Client{http: &http.Client{Timeout: 30 * time.Second}, retries: 3}
 	}
+	return client
+}
+
+func NewClientWithProxy(proxy string) (*Client, error) {
+	hc, err := NewHTTPClient(30*time.Second, proxy)
+	if err != nil {
+		return nil, err
+	}
+	return &Client{http: hc, retries: 3}, nil
+}
+
+func NewHTTPClient(timeout time.Duration, proxy string) (*http.Client, error) {
+	transport, err := NewProxyTransport(proxy)
+	if err != nil {
+		return nil, err
+	}
+	return &http.Client{Timeout: timeout, Transport: transport}, nil
+}
+
+func NewProxyTransport(proxy string) (*http.Transport, error) {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	proxyURL, err := ParseProxyURL(firstNonEmptyProxy(proxy, DefaultProxy()))
+	if err != nil {
+		return nil, err
+	}
+	if proxyURL != nil {
+		transport.Proxy = http.ProxyURL(proxyURL)
+	}
+	return transport, nil
+}
+
+func SetDefaultProxy(proxy string) error {
+	proxy = strings.TrimSpace(proxy)
+	if _, err := ParseProxyURL(proxy); err != nil {
+		return err
+	}
+	defaultProxy.Store(proxy)
+	return nil
+}
+
+func DefaultProxy() string {
+	if v := defaultProxy.Load(); v != nil {
+		return v.(string)
+	}
+	return ""
+}
+
+func ParseProxyURL(proxy string) (*url.URL, error) {
+	proxy = strings.TrimSpace(proxy)
+	if proxy == "" {
+		return nil, nil
+	}
+	if !strings.Contains(proxy, "://") {
+		proxy = "http://" + proxy
+	}
+	parsed, err := url.Parse(proxy)
+	if err != nil {
+		return nil, fmt.Errorf("invalid proxy URL %q: %w", proxy, err)
+	}
+	if parsed.Host == "" {
+		return nil, fmt.Errorf("invalid proxy URL %q: missing host", proxy)
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "http", "https", "socks5":
+	case "socks5h":
+		parsed.Scheme = "socks5"
+	default:
+		return nil, fmt.Errorf("unsupported proxy scheme %q (use http, https, socks5, or socks5h)", parsed.Scheme)
+	}
+	return parsed, nil
 }
 
 func (c *Client) SetTimeout(d time.Duration) {
@@ -37,6 +110,15 @@ func (c *Client) SetTimeout(d time.Duration) {
 
 func (c *Client) SetCookieJar(jar http.CookieJar) {
 	c.http.Jar = jar
+}
+
+func (c *Client) SetProxy(proxy string) error {
+	transport, err := NewProxyTransport(proxy)
+	if err != nil {
+		return err
+	}
+	c.http.Transport = transport
+	return nil
 }
 
 func RandomUA() string {
@@ -122,4 +204,13 @@ func (c *Client) do(method, url string, body io.Reader, headers map[string]strin
 		return resp, nil
 	}
 	return nil, fmt.Errorf("request failed after %d retries: %w", c.retries, lastErr)
+}
+
+func firstNonEmptyProxy(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
 }

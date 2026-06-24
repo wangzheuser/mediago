@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/nichuanfang/medigo/internal/extractor"
+	"github.com/nichuanfang/medigo/internal/util"
 )
 
 func (e *Engine) downloadHLS(filename string, stream extractor.Stream) (string, error) {
@@ -53,6 +54,13 @@ func (e *Engine) hlsViaFFmpeg(m3u8URL, outPath string, headers map[string]string
 	os.MkdirAll(filepath.Dir(outPath), 0o755)
 
 	args := []string{"-y"}
+	if proxy := util.DefaultProxy(); proxy != "" {
+		if parsed, err := util.ParseProxyURL(proxy); err == nil {
+			if parsed.Scheme == "http" || parsed.Scheme == "https" {
+				args = append(args, "-http_proxy", parsed.String())
+			}
+		}
+	}
 	if len(headers) > 0 {
 		var hdr []string
 		for k, v := range headers {
@@ -65,6 +73,16 @@ func (e *Engine) hlsViaFFmpeg(m3u8URL, outPath string, headers map[string]string
 	cmd := exec.Command(e.ffmpeg, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	if proxy := util.DefaultProxy(); proxy != "" {
+		cmd.Env = append(os.Environ(),
+			"HTTP_PROXY="+proxy,
+			"HTTPS_PROXY="+proxy,
+			"ALL_PROXY="+proxy,
+			"http_proxy="+proxy,
+			"https_proxy="+proxy,
+			"all_proxy="+proxy,
+		)
+	}
 	return cmd.Run()
 }
 
@@ -158,6 +176,16 @@ func (e *Engine) muxDASH(videoPath, audioPath, outPath string, hasAudio bool) er
 	cmd := exec.Command(e.ffmpeg, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	if proxy := util.DefaultProxy(); proxy != "" {
+		cmd.Env = append(os.Environ(),
+			"HTTP_PROXY="+proxy,
+			"HTTPS_PROXY="+proxy,
+			"ALL_PROXY="+proxy,
+			"http_proxy="+proxy,
+			"https_proxy="+proxy,
+			"all_proxy="+proxy,
+		)
+	}
 	return cmd.Run()
 }
 
