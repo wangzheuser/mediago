@@ -94,3 +94,60 @@ func TestEndpointsForBrandDomains(t *testing.T) {
 		})
 	}
 }
+
+func TestGaotuPriceFromPayload(t *testing.T) {
+	price, ok := gaotuPriceFromPayload(map[string]any{
+		"data": map[string]any{
+			"coreButton": map[string]any{
+				"price": "12345",
+			},
+		},
+	})
+	if !ok {
+		t.Fatal("price not found")
+	}
+	if price != 123.45 {
+		t.Fatalf("price = %v, want 123.45", price)
+	}
+}
+
+func TestCollectGaotuPanNodes(t *testing.T) {
+	nodes := collectGaotuPanNodes(map[string]any{
+		"data": map[string]any{
+			"dirList": []any{
+				map[string]any{
+					"entityType":   float64(1),
+					"entityNumber": "DIR1",
+					"name":         "资料目录",
+					"rootNumber":   "ROOT1",
+				},
+				map[string]any{
+					"entityType":   float64(2),
+					"entityNumber": "DOC1",
+					"url":          "https://cdn.example.com/handout.pdf?token=x",
+					"name":         "讲义.pdf",
+					"rootNumber":   "ROOT1",
+				},
+				map[string]any{
+					"entityType":   float64(100),
+					"entityNumber": "VID1",
+					"url":          "https://interactive.gaotu.cn/play?vid=abc",
+					"name":         "课堂回放",
+					"rootNumber":   "ROOT1",
+				},
+			},
+		},
+	})
+	if len(nodes) != 3 {
+		t.Fatalf("len(nodes) = %d, want 3: %#v", len(nodes), nodes)
+	}
+	if !isGaotuDir(nodes[0]) {
+		t.Fatalf("first node should be directory: %#v", nodes[0])
+	}
+	if nodes[1].ID != "DOC1" || nodes[1].Format != "pdf" || nodes[1].Root != "ROOT1" {
+		t.Fatalf("doc node parsed incorrectly: %#v", nodes[1])
+	}
+	if nodes[2].Type != "100" || nodes[2].ID != "VID1" {
+		t.Fatalf("video node parsed incorrectly: %#v", nodes[2])
+	}
+}

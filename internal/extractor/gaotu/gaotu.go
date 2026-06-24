@@ -96,24 +96,32 @@ func (g *Gaotu) Extract(rawURL string, opts *extractor.ExtractOpts) (*extractor.
 		return entry, nil
 	}
 
-	entries, title, err := resolveCourse(c, headers, endpoints, id)
+	entries, title, extra, err := resolveCourse(c, headers, endpoints, id)
 	if err != nil {
 		return nil, err
 	}
 	if len(entries) == 0 {
-		return nil, fmt.Errorf("gaotu: no playable lessons found for clazz %s", id.Clazz)
+		return nil, fmt.Errorf("gaotu: no playable resource found for clazz %s", id.Clazz)
 	}
-	return &extractor.MediaInfo{Site: "gaotu", Title: util.SanitizeFilename(firstNonEmpty(title, "gaotu_"+id.Clazz)), Entries: entries}, nil
+	return &extractor.MediaInfo{Site: "gaotu", Title: util.SanitizeFilename(firstNonEmpty(title, "gaotu_"+id.Clazz)), Entries: entries, Extra: extra}, nil
 }
 
-func resolveCourse(c *util.Client, headers map[string]string, endpoints gaotuEndpoints, id ids) ([]*extractor.MediaInfo, string, error) {
+func resolveCourse(c *util.Client, headers map[string]string, endpoints gaotuEndpoints, id ids) ([]*extractor.MediaInfo, string, map[string]any, error) {
 	payload, err := postJSON(c, endpoints.infoURL(), map[string]any{"platformType": 3, "clazzNumber": id.Clazz}, headers)
 	if err != nil {
-		return nil, "", fmt.Errorf("fetch gaotu clazz detail: %w", err)
+		return nil, "", nil, fmt.Errorf("fetch gaotu clazz detail: %w", err)
 	}
 	title := firstNonEmpty(pickTitle(payload), id.Clazz)
+	extra := map[string]any{"clazz_number": id.Clazz}
+	if root := firstFieldString(payload, "subclazzNumber", "rootNumber"); root != "" {
+		extra["subclazz_number"] = root
+	}
+	if price, ok := fetchGaotuPrice(c, headers, endpoints, id.Clazz); ok {
+		extra["price"] = price
+	}
+	entries := make([]*extractor.MediaInfo, 0)
 	if media := findMediaURL(payload); media != "" {
-		return []*extractor.MediaInfo{mediaInfo(title, media, headers)}, title, nil
+		entries = append(entries, mediaInfo(title, media, headers))
 	}
 
 	nodes := collectLessons(payload)
@@ -128,7 +136,6 @@ func resolveCourse(c *util.Client, headers map[string]string, endpoints gaotuEnd
 	}
 
 	seen := map[string]bool{}
-	entries := make([]*extractor.MediaInfo, 0, len(nodes))
 	for _, node := range nodes {
 		if node.ID == "" || seen[node.ID] {
 			continue
@@ -141,7 +148,10 @@ func resolveCourse(c *util.Client, headers map[string]string, endpoints gaotuEnd
 			entries = append(entries, entry)
 		}
 	}
-	return entries, title, nil
+	if root, _ := extra["subclazz_number"].(string); root != "" {
+		entries = append(entries, resolveGaotuFiles(c, headers, endpoints, root)...)
+	}
+	return entries, title, compactExtra(extra), nil
 }
 
 func resolveLesson(c *util.Client, headers map[string]string, endpoints gaotuEndpoints, id ids, fallbackTitle string) (*extractor.MediaInfo, error) {
