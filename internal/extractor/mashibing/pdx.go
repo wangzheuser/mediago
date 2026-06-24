@@ -20,18 +20,32 @@ const (
 )
 
 var (
-	// polyv_pdx_secret from source line 43
-	polyvPDXSecret = mustB64Decode("OWtjN9xcDcc2cwXKxECpRgKw7piD4RwCdfOUlyNHFdSV0gHi=")
+	// polyv_pdx_secret from source line 43 (base64-decoded to 34 bytes, use first 32 for AES-256)
+	polyvPDXSecret = b64DecodeOrPanic("OWtjN9xcDcc2cwXKxECpRgKw7piD4RwCdfOUlyNHFdSV0gHi=")
 	// polyv_pdx_iv_bytes from source line 44-59
 	polyvPDXIV = []byte{13, 22, 8, 12, 7, 6, 13, 1, 50, 11, 12, 8, 5, 16, 4, 1}
 )
 
-func mustB64Decode(s string) []byte {
+func b64DecodeOrPanic(s string) []byte {
+	// Try standard first, then URL-safe
 	b, err := base64.StdEncoding.DecodeString(s)
 	if err != nil {
-		panic(err)
+		b, err = base64.URLEncoding.DecodeString(s)
+		if err != nil {
+			// Try without padding
+			b, err = base64.RawURLEncoding.DecodeString(strings.TrimRight(s, "="))
+			if err != nil {
+				panic(fmt.Sprintf("polyv PDX: cannot decode secret: %v", err))
+			}
+		}
 	}
-	return b
+	// AES key must be 16, 24, or 32 bytes. Take first 32.
+	if len(b) >= 32 {
+		return b[:32]
+	}
+	padded := make([]byte, 32)
+	copy(padded, b)
+	return padded
 }
 
 // decryptPolyvPDXText decrypts a PDX-encrypted response body.
