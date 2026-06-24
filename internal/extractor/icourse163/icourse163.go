@@ -62,11 +62,12 @@ const (
 	youdao_test_course_url = "https://ke.youdao.com/course/detail/220912?loginBack=true&Pdt=jpkWeb"
 )
 
-// Patterns chosen to intersect with Mooc_Config.courses_re['Icourse163_Mooc']:
+// Main-course pattern chosen to intersect with Mooc_Config.courses_re['Icourse163_Mooc']:
 //
 //	\s*https?://www\.icourse163\.org/(?P<mooc>.*?)((learn)|(course))/(?P<cid1>(?!kaopei-)[\%\w-]*-\d+)(.*?tid=(?P<tid1>\d+))?
 //
-// Go RE2 has no negative lookahead so the kaopei- exclusion is enforced in code.
+// Kaoyan and Column sibling patterns are registered below and routed before
+// the main-course parser.
 var patterns = []string{
 	`(?:www\.)?icourse163\.org/.*?(?:learn|course)/[%\w-]+-\d+`,
 	`(?:www\.)?icourse163\.org/columns/\d+\.htm`,

@@ -6,9 +6,9 @@
 //     → result (string mp4 URL, per-quality)
 //     The Python source sorts lineIDs desc and probes top 2 (HD + Sd fallback).
 //
-// Course traversal from courseHome HTML uses BeautifulSoup-style scraping that
-// returns blocked-flagged when only courseHome URL is given. Direct videoID URLs
-// extract cleanly.
+// Course traversal follows the source _get_infos courseHome HTML scrape:
+// courseHome page -> /home/communication/content/{courseId}/{termId} -> videoID
+// list -> initVideo/changeVideoLine. Direct videoID URLs still extract cleanly.
 package zhihuishu
 
 import (
