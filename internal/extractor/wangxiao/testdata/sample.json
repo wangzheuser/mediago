@@ -1,7 +1,4 @@
 {
-  "code": 0,
-  "data": {
-    "title": "test_course",
-    "list": []
-  }
+  "play_page": "<html><head><title>Wangxiao Mock Course</title></head><body><span class=\"course-title\">Wangxiao Mock Course</span><script>var cc_vid=\"VID123\";var siteid=\"SITE123\";</script></body></html>",
+  "bokecc": "<video><copy><quality>10</quality><playurl>https://cdn.example.com/wangxiao.mp4</playurl></copy></video>"
 }

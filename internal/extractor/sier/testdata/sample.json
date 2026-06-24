@@ -1,7 +1,40 @@
 {
-  "code": 0,
-  "data": {
-    "title": "test_course",
-    "list": []
+  "course_list": {
+    "entity": {
+      "courseList": [
+        {
+          "courseId": "1001",
+          "courseName": "Sier Mock Course"
+        }
+      ]
+    }
+  },
+  "plan": {
+    "entity": {
+      "list": [
+        {
+          "catalogList": [
+            {
+              "catalogId": "cat-1",
+              "catalogName": "Lesson 1",
+              "resource": {
+                "videoId": "video-1",
+                "playUrl": "https://cdn.example.com/sier.mp4"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "catalog": {
+    "entity": {
+      "catalogId": "cat-1",
+      "catalogName": "Lesson 1",
+      "resource": {
+        "videoId": "video-1",
+        "playUrl": "https://cdn.example.com/sier.mp4"
+      }
+    }
   }
 }

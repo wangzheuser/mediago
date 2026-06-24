@@ -1,7 +1,28 @@
 {
-  "code": 0,
-  "data": {
-    "title": "test_course",
-    "list": []
+  "study_info": {
+    "code": 200,
+    "data": {
+      "title": "Sanjieke Mock Course"
+    }
+  },
+  "tree": {
+    "code": 200,
+    "data": {
+      "tree": [
+        {
+          "nodeId": "node-1",
+          "name": "Chapter 1"
+        }
+      ]
+    }
+  },
+  "section": {
+    "code": 200,
+    "data": {
+      "videoContent": {
+        "contentId": "video-1",
+        "url": "https://cdn.example.com/sanjieke.m3u8"
+      }
+    }
   }
 }

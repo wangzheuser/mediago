@@ -1,7 +1,17 @@
 {
-  "code": 0,
-  "data": {
-    "title": "test_course",
-    "list": []
-  }
+  "home": "<html><body>退出登录</body></html>",
+  "course_list": {
+    "data": []
+  },
+  "classrooms": "<html><body></body></html>",
+  "course_page": "<html><head><title>Wallstreets Mock Course - 华尔街学堂 - mock</title></head><body></body></html>",
+  "task_list": "{\"title\":\"Wallstreets Mock Lesson\",\"taskId\":\"2001\",\"type\":\"video\"}",
+  "material": "<html><body></body></html>",
+  "activity_show": "<html><body><div data-token=\"token-1\" data-file-global-id=\"res-1\"></div></body></html>",
+  "play": {
+    "playlist": "https://cdn.example.com/wallstreets/master.m3u8",
+    "version": 3
+  },
+  "master": "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\nhttps://cdn.example.com/wallstreets/720.m3u8\n",
+  "variant": "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:5.0,\nhttps://cdn.example.com/wallstreets/seg-1.ts\n"
 }

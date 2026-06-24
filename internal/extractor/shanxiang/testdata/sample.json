@@ -1,7 +1,28 @@
 {
-  "code": 0,
-  "data": {
-    "title": "test_course",
-    "list": []
-  }
+  "study_page": "<html><head><title>Shanxiang Mock Course</title></head><body><a href=\"/course/playbackView?id=play-1&skuId=2001&scheduleId=schedule-1\" title=\"Lesson 1\">Lesson 1</a></body></html>",
+  "playback_page": "<html><body><script>window.ccConfig={userId:\"user-1\",roomId:\"room-1\",recordId:\"record-1\",viewertoken:\"token-1\",viewername:\"viewer-1\"};</script></body></html>",
+  "cssl_login": {
+    "result": "ok",
+    "datas": {
+      "sessionId": "sess-1"
+    }
+  },
+  "cssl_vod": {
+    "data": {
+      "vod_info": {
+        "video": [
+          {
+            "url": "https://cdn.example.com/shanxiang.m3u8",
+            "definition": 720
+          }
+        ],
+        "audio": [
+          {
+            "url": "https://cdn.example.com/shanxiang.m4a"
+          }
+        ]
+      }
+    }
+  },
+  "m3u8": "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:5.0,\nhttps://cdn.example.com/shanxiang-1.ts\n"
 }

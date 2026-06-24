@@ -1,7 +1,6 @@
 {
-  "code": 0,
-  "data": {
-    "title": "test_course",
-    "list": []
-  }
+  "course_page": "<html><head><title>Unipus Mock Course - 中国高校外语慕课平台</title></head><body><h1>Unipus Mock Course</h1></body></html>",
+  "join": {},
+  "task_list": "<html><body><ul><li class=\"task-item js-task-chapter\">第一章</li><li class=\"task-item videoclass\" id=\"task_id_2001\"><a class=\"title\" data-url=\"/course/1001/task/2001/content/preview\">视频课时 Unipus Lesson</a></li></ul></body></html>",
+  "task_content": "<html><body><video src=\"https://cdn.example.com/unipus.mp4\" title=\"Unipus Lesson\"></video></body></html>"
 }

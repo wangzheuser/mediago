@@ -1,7 +1,15 @@
 {
-  "code": 0,
-  "data": {
-    "title": "test_course",
-    "list": []
+  "detail": {
+    "code": 0,
+    "data": {
+      "title": "Wendao Mock Course",
+      "lessons": [
+        {
+          "directoryName": "Wendao Mock Lesson",
+          "videoUrl": "https://cdn.example.com/wendao.mp4",
+          "directoryType": 0
+        }
+      ]
+    }
   }
 }

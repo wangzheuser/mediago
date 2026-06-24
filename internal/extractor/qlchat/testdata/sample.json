@@ -1,7 +1,82 @@
 {
-  "code": 0,
-  "data": {
-    "title": "test_course",
-    "list": []
+  "course_list": {
+    "code": 0,
+    "data": {
+      "list": [
+        {
+          "courseType": "channel",
+          "bussinessId": "123",
+          "skuTitle": "Qlchat Mock Course",
+          "liveId": "live-1"
+        }
+      ]
+    }
+  },
+  "learn_list": {
+    "code": 0,
+    "data": {
+      "learningList": []
+    }
+  },
+  "course_items": {
+    "code": 0,
+    "data": {
+      "dataList": [
+        {
+          "businessType": "topic",
+          "businessName": "Lesson 1",
+          "businessId": "topic-1",
+          "topicPo": {
+            "audioAssemblyUrl": "https://cdn.example.com/qlchat-audio.m4a",
+            "isAuthTopic": true,
+            "type": "video"
+          }
+        }
+      ]
+    }
+  },
+  "media_url": {
+    "code": 0,
+    "data": {
+      "video": [
+        {
+          "height": 720,
+          "width": 1280,
+          "playUrl": "https://cdn.example.com/qlchat.mp4",
+          "type": "END_VOD"
+        }
+      ]
+    }
+  },
+  "price": {
+    "code": 0,
+    "data": {
+      "discountType": 0
+    }
+  },
+  "purchased": {
+    "code": 0,
+    "data": {
+      "purchased": true
+    }
+  },
+  "empty_list": {
+    "code": 0,
+    "data": {
+      "list": []
+    }
+  },
+  "empty_data_list": {
+    "code": 0,
+    "data": {
+      "dataList": []
+    }
+  },
+  "topic_page": "<html><body>{}</body></html>",
+  "live_url": {
+    "code": 0,
+    "data": {
+      "list": []
+    }
   }
 }

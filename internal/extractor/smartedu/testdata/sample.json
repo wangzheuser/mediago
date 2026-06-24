@@ -1,7 +1,27 @@
 {
-  "code": 0,
-  "data": {
-    "title": "test_course",
-    "list": []
+  "activity_detail": {
+    "id": "res-1",
+    "title": {
+      "zh-CN": "Smartedu Mock Course"
+    },
+    "relations": {
+      "national_course_resource": [
+        {
+          "id": "res-1-video",
+          "title": "Smartedu Mock Video",
+          "ti_items": [
+            {
+              "ti_file_flag": "href",
+              "ti_format": "mp4",
+              "ti_storage": "https://cdn.example.com/smartedu.mp4",
+              "ti_size": 2048
+            }
+          ]
+        },
+        {
+          "title": "Smartedu Dummy"
+        }
+      ]
+    }
   }
 }

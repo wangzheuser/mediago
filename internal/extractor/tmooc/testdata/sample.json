@@ -1,7 +1,46 @@
 {
-  "code": 0,
-  "data": {
-    "title": "test_course",
-    "list": []
+  "course_list": {
+    "data": {
+      "courseList": [
+        {
+          "studentClassroomId": "1001",
+          "courseVersion": "Tmooc Mock Course"
+        }
+      ]
+    }
+  },
+  "login": {
+    "code": 0,
+    "data": {}
+  },
+  "outline": {
+    "data": {
+      "bigStageList": [
+        {
+          "name": "Stage 1",
+          "smallStageList": [
+            {
+              "name": "Small Stage",
+              "knowledgeList": [
+                {
+                  "knowledgeName": "Tmooc Mock Lesson",
+                  "videoList": [
+                    {
+                      "videoId": "vid-1",
+                      "videoName": "Tmooc Mock Lesson"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "video_play": {
+    "data": {
+      "playUrl": "https://cdn.example.com/tmooc.mp4"
+    }
   }
 }

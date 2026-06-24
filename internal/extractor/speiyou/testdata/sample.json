@@ -1,7 +1,58 @@
 {
-  "code": 0,
-  "data": {
-    "title": "test_course",
-    "list": []
+  "subject": {
+    "data": []
+  },
+  "live_list": {
+    "data": [
+      {
+        "stdCourseId": "1001",
+        "courseName": "Speiyou Mock Course",
+        "stdSubject": "math",
+        "stdGrade": "7",
+        "stdClassId": "55",
+        "branchId": "1",
+        "areaId": "1",
+        "lecturerId": "66",
+        "tutorId": "77",
+        "liveTypeString": "SMALL_GROUPS_V2_MODE",
+        "liveId": "9001",
+        "liveName": "Speiyou Mock Lesson",
+        "liveStarttime": 1
+      }
+    ]
+  },
+  "course_list": {
+    "data": [
+      {
+        "stdCourseId": "1001",
+        "courseName": "Speiyou Mock Course",
+        "stdSubject": "math"
+      }
+    ]
+  },
+  "auth": {
+    "initData": {
+      "live": {
+        "stdSubject": "math",
+        "areaId": "1",
+        "liveTypeString": "SMALL_GROUPS_V2_MODE"
+      },
+      "course": {
+        "stdGrade": "7",
+        "branchId": "1"
+      },
+      "classInfo": {
+        "stdClassId": "55"
+      },
+      "teacher": {
+        "lecturerId": "66",
+        "tutorId": "77"
+      }
+    }
+  },
+  "video": {
+    "videoUrls": [
+      "https://cdn.example.com/speiyou.mp4"
+    ]
   }
 }

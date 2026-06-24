@@ -1,7 +1,17 @@
 {
-  "code": 0,
-  "data": {
-    "title": "test_course",
-    "list": []
+  "activity_detail": {
+    "data": {
+      "title": "Renrenjiang Mock Activity"
+    }
+  },
+  "activity_stream": {
+    "data": {
+      "hls_url": "https://cdn.example.com/renrenjiang.m3u8"
+    }
+  },
+  "documents": {
+    "data": {
+      "list": []
+    }
   }
 }

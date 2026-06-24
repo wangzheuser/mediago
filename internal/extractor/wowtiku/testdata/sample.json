@@ -1,7 +1,20 @@
 {
-  "code": 0,
-  "data": {
-    "title": "test_course",
-    "list": []
+  "user_info": {
+    "code": 0,
+    "data": {
+      "user_id": "u-1"
+    }
+  },
+  "detail": {
+    "code": 0,
+    "data": {
+      "name": "Wowtiku Mock Course",
+      "videos": [
+        {
+          "title": "Wowtiku Mock Lesson",
+          "video_url": "https://cdn.example.com/wowtiku.mp4"
+        }
+      ]
+    }
   }
 }

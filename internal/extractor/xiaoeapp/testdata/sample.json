@@ -1,7 +1,21 @@
 {
-  "code": 0,
-  "data": {
-    "title": "test_course",
-    "list": []
+  "user_info": {
+    "code": 0,
+    "data": {
+      "app_user_id": "app-user-1"
+    }
+  },
+  "course_list": {
+    "code": 0,
+    "data": {
+      "list": []
+    }
+  },
+  "video_detail": {
+    "code": 0,
+    "data": {
+      "goods_name": "Xiaoeapp Mock Video",
+      "video_url": "https://cdn.example.com/xiaoeapp.mp4"
+    }
   }
 }

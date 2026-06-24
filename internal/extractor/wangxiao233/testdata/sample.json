@@ -1,7 +1,32 @@
 {
-  "code": 0,
-  "data": {
-    "title": "test_course",
-    "list": []
+  "user_info": {
+    "code": 0,
+    "data": {
+      "userId": "u-1"
+    }
+  },
+  "tag": {
+    "code": 0,
+    "data": []
+  },
+  "version": {
+    "code": 0,
+    "data": [
+      {
+        "versionId": "v1",
+        "productId": "1002",
+        "childProductId": "1001",
+        "teacherId": "3001"
+      }
+    ]
+  },
+  "chapter": {
+    "code": 0,
+    "data": [
+      {
+        "title": "Wangxiao233 Mock Audio",
+        "mp3Url": "https://cdn.example.com/wangxiao233.mp3"
+      }
+    ]
   }
 }
