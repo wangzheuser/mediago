@@ -136,13 +136,19 @@ func apiGet(c *util.Client, sess wx233Session, apiURL string, params map[string]
 	return parseJSON(body)
 }
 func apiPost(c *util.Client, sess wx233Session, apiURL string, data map[string]any) (map[string]any, error) {
-	payload, _ := json.Marshal(data)
+	payload, err := json.Marshal(data)
+	if err != nil {
+		return nil, fmt.Errorf("wangxiao233 marshal: %w", err)
+	}
 	resp, err := c.Post(apiURL, bytes.NewReader(payload), signedHeaders(sess, "post", string(payload)))
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("wangxiao233 read body: %w", err)
+	}
 	return parseJSON(string(b))
 }
 func signedHeaders(sess wx233Session, method, text string) map[string]string {

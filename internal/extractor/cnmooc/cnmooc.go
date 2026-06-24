@@ -319,8 +319,11 @@ func normalizeURL(s, base string) string {
 	if err == nil && u.IsAbs() {
 		return s
 	}
-	b, _ := url.Parse(base)
-	r, _ := url.Parse(s)
+	b, errB := url.Parse(base)
+	r, errR := url.Parse(s)
+	if errB != nil || errR != nil || b == nil || r == nil {
+		return s
+	}
 	return b.ResolveReference(r).String()
 }
 func first(vals ...string) string {

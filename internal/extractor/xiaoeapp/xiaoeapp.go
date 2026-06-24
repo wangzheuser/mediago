@@ -189,7 +189,10 @@ func postAppAPI(c *util.Client, sess xeSession, path string, body map[string]any
 		return nil, err
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("xiaoeapp read body: %w", err)
+	}
 	var root map[string]any
 	if err := json.Unmarshal(b, &root); err != nil {
 		return nil, fmt.Errorf("xiaoeapp parse JSON: %w", err)
