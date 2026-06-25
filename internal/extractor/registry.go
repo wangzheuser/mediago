@@ -34,17 +34,26 @@ func Register(ext Extractor, info SiteInfo) {
 }
 
 func Match(url string) (Extractor, error) {
+	ext, _, err := MatchWithSite(url)
+	return ext, err
+}
+
+// MatchWithSite returns both the extractor and its registered site metadata.
+func MatchWithSite(url string) (Extractor, SiteInfo, error) {
 	mu.RLock()
 	defer mu.RUnlock()
 
-	for _, re := range extractors {
+	for i, re := range extractors {
 		for _, p := range re.patterns {
 			if p.MatchString(url) {
-				return re.ext, nil
+				if i < len(sites) {
+					return re.ext, sites[i], nil
+				}
+				return re.ext, SiteInfo{}, nil
 			}
 		}
 	}
-	return nil, fmt.Errorf("no extractor found for URL: %s", url)
+	return nil, SiteInfo{}, fmt.Errorf("no extractor found for URL: %s", url)
 }
 
 func ListSites() []SiteInfo {

@@ -1,9 +1,13 @@
 package download
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/nichuanfang/medigo/internal/extractor"
 )
@@ -33,5 +37,58 @@ func TestDownloadSubtitlesWritesDataURL(t *testing.T) {
 	}
 	if string(data) != "WEBVTT\n\n00:00.000 --> 00:01.000\n你好" {
 		t.Fatalf("subtitle data = %q", string(data))
+	}
+}
+
+func TestDownloadSingleCancelRemovesPart(t *testing.T) {
+	dir := t.TempDir()
+	started := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1048576")
+		flusher, _ := w.(http.Flusher)
+		close(started)
+		chunk := make([]byte, 8192)
+		for i := 0; i < 128; i++ {
+			select {
+			case <-r.Context().Done():
+				return
+			default:
+			}
+			if _, err := w.Write(chunk); err != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	engine := New(Opts{OutputDir: dir, Overwrite: true, NoProgress: true, Context: ctx})
+	outPath := filepath.Join(dir, "video.mp4")
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- engine.downloadSingle(server.URL, outPath, nil, 0)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("server did not receive request")
+	}
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("downloadSingle returned nil error after cancellation")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("downloadSingle did not return after cancellation")
+	}
+	if _, err := os.Stat(outPath + ".part"); !os.IsNotExist(err) {
+		t.Fatalf("part file still exists or stat failed unexpectedly: %v", err)
 	}
 }

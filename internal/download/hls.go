@@ -76,13 +76,12 @@ func (e *Engine) downloadHLS(filename string, stream extractor.Stream) (string, 
 func (e *Engine) hlsViaFFmpeg(m3u8URL, outPath string, headers map[string]string) error {
 	os.MkdirAll(filepath.Dir(outPath), 0o755)
 
+	partPath := outPath + ".part"
+	_ = os.Remove(partPath)
+
 	args := []string{"-y", "-protocol_whitelist", "file,http,https,tcp,tls,crypto,data"}
-	if proxy := util.DefaultProxy(); proxy != "" {
-		if parsed, err := util.ParseProxyURL(proxy); err == nil {
-			if parsed.Scheme == "http" || parsed.Scheme == "https" {
-				args = append(args, "-http_proxy", parsed.String())
-			}
-		}
+	if proxy := ffmpegHTTPProxyURL(); proxy != "" {
+		args = append(args, "-http_proxy", proxy)
 	}
 	if len(headers) > 0 {
 		var hdr []string
@@ -91,22 +90,17 @@ func (e *Engine) hlsViaFFmpeg(m3u8URL, outPath string, headers map[string]string
 		}
 		args = append(args, "-headers", strings.Join(hdr, "\r\n"))
 	}
-	args = append(args, "-i", m3u8URL, "-c", "copy", outPath)
+	args = append(args, "-i", m3u8URL, "-c", "copy", "-f", "mp4", partPath)
 
-	cmd := exec.Command(e.ffmpeg, args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if proxy := util.DefaultProxy(); proxy != "" {
-		cmd.Env = append(os.Environ(),
-			"HTTP_PROXY="+proxy,
-			"HTTPS_PROXY="+proxy,
-			"ALL_PROXY="+proxy,
-			"http_proxy="+proxy,
-			"https_proxy="+proxy,
-			"all_proxy="+proxy,
-		)
+	cmd := exec.CommandContext(e.ctx, e.ffmpeg, args...)
+	if env := ffmpegEnv(); len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
 	}
-	return cmd.Run()
+	if err := runFFmpeg(cmd); err != nil {
+		_ = os.Remove(partPath)
+		return err
+	}
+	return os.Rename(partPath, outPath)
 }
 
 func (e *Engine) parseM3U8(m3u8URL string, headers map[string]string) ([]string, error) {
@@ -404,7 +398,7 @@ func (e *Engine) downloadHLSSegments(segments []hlsSegment, outPath string, head
 	}
 	defer os.RemoveAll(tmpDir)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(e.ctx)
 	defer cancel()
 
 	sem := make(chan struct{}, e.opts.Concurrency)
@@ -412,9 +406,14 @@ func (e *Engine) downloadHLSSegments(segments []hlsSegment, outPath string, head
 	var firstErr error
 	var errOnce sync.Once
 
+downloadLoop:
 	for i, seg := range segments {
+		select {
+		case <-ctx.Done():
+			break downloadLoop
+		case sem <- struct{}{}:
+		}
 		wg.Add(1)
-		sem <- struct{}{}
 		go func(idx int, seg hlsSegment) {
 			defer wg.Done()
 			defer func() { <-sem }()
@@ -435,6 +434,9 @@ func (e *Engine) downloadHLSSegments(segments []hlsSegment, outPath string, head
 	wg.Wait()
 	if firstErr != nil {
 		return firstErr
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
 	partPath := outPath + ".part"
 	if err := concatFiles(tmpDir, partPath, len(segments)); err != nil {
@@ -563,6 +565,7 @@ func (e *Engine) downloadDASH(filename string, stream extractor.Stream) (string,
 		ffmpeg: e.ffmpeg,
 		client: e.client,
 		http:   e.http,
+		ctx:    e.ctx,
 	}
 
 	videoStream := extractor.Stream{URLs: stream.URLs, Headers: stream.Headers, Format: "mp4"}
@@ -584,25 +587,23 @@ func (e *Engine) downloadDASH(filename string, stream extractor.Stream) (string,
 }
 
 func (e *Engine) muxDASH(videoPath, audioPath, outPath string, hasAudio bool) error {
+	partPath := outPath + ".part"
+	_ = os.Remove(partPath)
+
 	args := []string{"-y", "-i", videoPath}
 	if hasAudio {
 		args = append(args, "-i", audioPath)
 	}
-	args = append(args, "-c", "copy", outPath)
-	cmd := exec.Command(e.ffmpeg, args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if proxy := util.DefaultProxy(); proxy != "" {
-		cmd.Env = append(os.Environ(),
-			"HTTP_PROXY="+proxy,
-			"HTTPS_PROXY="+proxy,
-			"ALL_PROXY="+proxy,
-			"http_proxy="+proxy,
-			"https_proxy="+proxy,
-			"all_proxy="+proxy,
-		)
+	args = append(args, "-c", "copy", "-f", "mp4", partPath)
+	cmd := exec.CommandContext(e.ctx, e.ffmpeg, args...)
+	if env := ffmpegEnv(); len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
 	}
-	return cmd.Run()
+	if err := runFFmpeg(cmd); err != nil {
+		_ = os.Remove(partPath)
+		return err
+	}
+	return os.Rename(partPath, outPath)
 }
 
 func SelectBestStream(streams map[string]extractor.Stream, preferred string) (string, extractor.Stream) {

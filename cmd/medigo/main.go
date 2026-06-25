@@ -1,10 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	"github.com/spf13/cobra"
 
@@ -117,6 +121,7 @@ var (
 	cookieBrowser  string
 	listFormats    bool
 	dumpJSON       bool
+	simulate       bool
 	writeInfoJSON  bool
 	writeSubs      bool
 	noOverwrites   bool
@@ -129,6 +134,9 @@ var (
 )
 
 func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	rootCmd := &cobra.Command{
 		Use:   "medigo [flags] URL [URL...]",
 		Short: "Download media from 92 Chinese platforms",
@@ -138,7 +146,11 @@ Similar to yt-dlp but focused on Chinese internet platforms.`,
 		Args:              cobra.ArbitraryArgs,
 		DisableAutoGenTag: true,
 		SilenceUsage:      true,
+		SilenceErrors:     true,
 	}
+	rootCmd.SetContext(ctx)
+	rootCmd.Version = version
+	rootCmd.SetVersionTemplate("medigo {{.Version}}\n")
 
 	// Format selection (yt-dlp: -f, --format)
 	rootCmd.Flags().StringVarP(&formatSpec, "format", "f", "best", "format selection (best/worst/1080p/720p/480p)")
@@ -153,6 +165,7 @@ Similar to yt-dlp but focused on Chinese internet platforms.`,
 	// Info/listing (yt-dlp: -F, -j, --write-info-json)
 	rootCmd.Flags().BoolVarP(&listFormats, "list-formats", "F", false, "list available formats and exit")
 	rootCmd.Flags().BoolVarP(&dumpJSON, "dump-json", "j", false, "dump info JSON to stdout and exit")
+	rootCmd.Flags().BoolVar(&simulate, "simulate", false, "show extracted info without downloading")
 	rootCmd.Flags().BoolVar(&writeInfoJSON, "write-info-json", false, "write .info.json file alongside download")
 	rootCmd.Flags().BoolVar(&writeSubs, "write-subs", false, "write subtitle files alongside download")
 
@@ -177,11 +190,17 @@ Similar to yt-dlp but focused on Chinese internet platforms.`,
 	})
 
 	if err := rootCmd.Execute(); err != nil {
+		if errors.Is(err, context.Canceled) {
+			interruptedf()
+			os.Exit(130)
+		}
+		errorf("%v", err)
 		os.Exit(1)
 	}
 }
 
 func runMain(cmd *cobra.Command, args []string) error {
+	ctx := cmd.Context()
 	if listExtractors {
 		return printExtractors()
 	}
@@ -198,8 +217,11 @@ func runMain(cmd *cobra.Command, args []string) error {
 
 	failures := 0
 	for _, url := range args {
-		if err := processURL(url); err != nil {
-			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+		if err := processURL(ctx, url); err != nil {
+			if errors.Is(err, context.Canceled) {
+				return err
+			}
+			errorf("%v", err)
 			failures++
 		}
 	}
@@ -209,11 +231,16 @@ func runMain(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func processURL(url string) error {
-	ext, err := extractor.Match(url)
+func processURL(ctx context.Context, url string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	ext, site, err := extractor.MatchWithSite(url)
 	if err != nil {
 		return fmt.Errorf("unsupported URL: %s\nUse --list-extractors to see supported sites.", url)
 	}
+	infof("Extracting: %s %s", site.Name, url)
 
 	store := cookie.NewStore()
 	if cookieFile != "" {
@@ -238,31 +265,63 @@ func processURL(url string) error {
 		return fmt.Errorf("[%s] %w", url, err)
 	}
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	if dumpJSON {
 		return printJSON(info)
 	}
 
 	if info.IsPlaylist() {
-		fmt.Printf("[info] playlist: %s (%d items)\n", info.Title, len(info.Entries))
+		infof("Playlist: %s (%d items)", info.Title, len(info.Entries))
 		if listFormats {
-			fmt.Println("[info] use a single-item URL with -F to inspect formats")
+			warnf("use a single-item URL with -F to inspect formats")
 			return nil
 		}
+		if simulate {
+			for i, entry := range info.Entries {
+				if entry == nil {
+					continue
+				}
+				if err := printSimulation(entry, i+1, len(info.Entries)); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		entryFailures := 0
 		for i, entry := range info.Entries {
 			if entry == nil {
 				continue
 			}
-			if err := downloadOne(entry); err != nil {
-				fmt.Fprintf(os.Stderr, "ERROR [%d/%d %s]: %v\n", i+1, len(info.Entries), entry.Title, err)
+			if err := downloadEntry(ctx, i, len(info.Entries), entry); err != nil {
+				if errors.Is(err, context.Canceled) {
+					return err
+				}
+				errorf("[%d/%d %s]: %v", i+1, len(info.Entries), firstNonEmpty(entry.Title, fmt.Sprintf("item-%d", i+1)), err)
+				entryFailures++
 			}
+		}
+		if entryFailures > 0 {
+			return fmt.Errorf("%d of %d playlist items failed", entryFailures, len(info.Entries))
 		}
 		return nil
 	}
 
-	return downloadOne(info)
+	infof("%s", info.Title)
+	if simulate {
+		return printSimulation(info, 0, 0)
+	}
+	return downloadOne(ctx, info)
 }
 
-func downloadOne(info *extractor.MediaInfo) error {
+func downloadEntry(ctx context.Context, itemIndex, totalItems int, info *extractor.MediaInfo) error {
+	downloadf("Downloading item %d of %d: %s", itemIndex+1, totalItems, firstNonEmpty(info.Title, fmt.Sprintf("item-%d", itemIndex+1)))
+	return downloadOne(ctx, info)
+}
+
+func downloadOne(ctx context.Context, info *extractor.MediaInfo) error {
 	if listFormats {
 		return printFormats(info)
 	}
@@ -281,15 +340,20 @@ func downloadOne(info *extractor.MediaInfo) error {
 		Retries:     3,
 		NoProgress:  noProgress,
 		Proxy:       proxy,
+		Context:     ctx,
 	})
 
 	info.Title = baseFromTemplate(outFilename)
 
+	if strings.EqualFold(stream.Format, "dash") && engine.HasFFmpeg() {
+		mergerf("Merging formats into %s", outFilename)
+	}
 	outPath, err := engine.Download(info, stream)
 	if err != nil {
 		return fmt.Errorf("download failed: %w", err)
 	}
 
+	downloadf("100%% of %s", sizeStringForPath(outPath, stream.Size))
 	if writeInfoJSON {
 		writeInfoJSONFile(outPath, info)
 	}
@@ -298,12 +362,10 @@ func downloadOne(info *extractor.MediaInfo) error {
 			return fmt.Errorf("download subtitles: %w", err)
 		} else {
 			for _, sub := range subs {
-				fmt.Printf("[subtitle] %s\n", sub)
+				subtitlef("%s", sub)
 			}
 		}
 	}
-
-	fmt.Printf("[download] %s\n", outPath)
 	return nil
 }
 
@@ -313,24 +375,6 @@ func printJSON(info *extractor.MediaInfo) error {
 		return err
 	}
 	fmt.Println(string(data))
-	return nil
-}
-
-func printFormats(info *extractor.MediaInfo) error {
-	fmt.Printf("[info] Available formats for: %s\n", info.Title)
-	fmt.Printf("%-10s %-10s %-8s %-12s\n", "ID", "QUALITY", "FORMAT", "SIZE")
-	fmt.Println(strings.Repeat("-", 44))
-	for id, s := range info.Streams {
-		size := "unknown"
-		if s.Size > 0 {
-			if s.Size > 1024*1024 {
-				size = fmt.Sprintf("%.1fMiB", float64(s.Size)/(1024*1024))
-			} else {
-				size = fmt.Sprintf("%.1fKiB", float64(s.Size)/1024)
-			}
-		}
-		fmt.Printf("%-10s %-10s %-8s %-12s\n", id, s.Quality, s.Format, size)
-	}
 	return nil
 }
 

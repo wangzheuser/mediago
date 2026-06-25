@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/schollz/progressbar/v3"
@@ -28,6 +27,7 @@ type Opts struct {
 	Retries     int
 	NoProgress  bool
 	Proxy       string
+	Context     context.Context
 }
 
 type Engine struct {
@@ -35,6 +35,7 @@ type Engine struct {
 	ffmpeg string
 	client *util.Client
 	http   *http.Client
+	ctx    context.Context
 }
 
 func New(opts Opts) *Engine {
@@ -55,11 +56,16 @@ func New(opts Opts) *Engine {
 			client = pc
 		}
 	}
+	ctx := opts.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	return &Engine{
 		opts:   opts,
 		ffmpeg: ffmpeg,
 		client: client,
 		http:   httpClient,
+		ctx:    ctx,
 	}
 }
 
@@ -136,6 +142,9 @@ func (e *Engine) downloadDirect(filename string, stream extractor.Stream) (strin
 }
 
 func (e *Engine) downloadSingle(url, outPath string, headers map[string]string, size int64) error {
+	if err := e.ctx.Err(); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
 		return err
 	}
@@ -144,7 +153,7 @@ func (e *Engine) downloadSingle(url, outPath string, headers map[string]string, 
 		return writeDataURL(url, outPath)
 	}
 
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequestWithContext(e.ctx, "GET", url, nil)
 	if err != nil {
 		return err
 	}
@@ -235,9 +244,8 @@ func (e *Engine) downloadSegments(urls []string, outPath string, headers map[str
 	if !e.opts.NoProgress {
 		bar = progressbar.DefaultBytes(totalSize, filepath.Base(outPath))
 	}
-	var downloaded atomic.Int64
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(e.ctx)
 	defer cancel()
 
 	sem := make(chan struct{}, e.opts.Concurrency)
@@ -245,9 +253,14 @@ func (e *Engine) downloadSegments(urls []string, outPath string, headers map[str
 	var firstErr error
 	var errOnce sync.Once
 
+downloadLoop:
 	for i, u := range urls {
+		select {
+		case <-ctx.Done():
+			break downloadLoop
+		case sem <- struct{}{}:
+		}
 		wg.Add(1)
-		sem <- struct{}{}
 		go func(idx int, url string) {
 			defer wg.Done()
 			defer func() { <-sem }()
@@ -267,10 +280,8 @@ func (e *Engine) downloadSegments(urls []string, outPath string, headers map[str
 			}
 			info, _ := os.Stat(segPath)
 			if info != nil {
-				n := info.Size()
-				downloaded.Add(n)
 				if bar != nil {
-					bar.Add64(n)
+					bar.Add64(info.Size())
 				}
 			}
 		}(i, u)
@@ -279,6 +290,9 @@ func (e *Engine) downloadSegments(urls []string, outPath string, headers map[str
 
 	if firstErr != nil {
 		return firstErr
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
 
 	partPath := outPath + ".part"
