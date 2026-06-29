@@ -4,13 +4,15 @@ package cnmooc
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/Sophomoresty/mediago/internal/extractor"
-	"github.com/Sophomoresty/mediago/internal/util"
 	"html"
+	"io"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
+
+	"github.com/Sophomoresty/mediago/internal/extractor"
+	"github.com/Sophomoresty/mediago/internal/util"
 )
 
 const (
@@ -40,6 +42,9 @@ func (c *Cnmooc) Extract(rawURL string, opts *extractor.ExtractOpts) (*extractor
 	}
 	client := util.NewClient()
 	client.SetCookieJar(opts.Cookies)
+	if err := validateCnmoocLogin(client); err != nil {
+		return nil, err
+	}
 	detailURL := coursePage(courseID, openID)
 	body, err := client.GetString(abs(detailURL), requestHeaders(referer, false))
 	if err != nil {
@@ -77,12 +82,19 @@ func (c *Cnmooc) Extract(rawURL string, opts *extractor.ExtractOpts) (*extractor
 			}
 		}
 		for li, link := range extractLinks(text) {
-			if !isVideoURL(link.URL) {
+			switch {
+			case isVideoURL(link.URL):
+				mi := media(fmt.Sprintf("%02d.%02d %s", pi+1, li+1, sanitize(link.Title)), link.URL, nil, nil)
+				if !seenKey(seen, link.URL) {
+					entries = append(entries, mi)
+				}
+			case isFileURL(link.URL):
+				mi := fileMedia(fmt.Sprintf("%02d.%02d %s", pi+1, li+1, sanitize(link.Title)), link.URL, nil)
+				if !seenKey(seen, link.URL) {
+					entries = append(entries, mi)
+				}
+			default:
 				continue
-			}
-			mi := media(fmt.Sprintf("%02d.%02d %s", pi+1, li+1, sanitize(link.Title)), link.URL, nil, nil)
-			if !seenKey(seen, link.URL) {
-				entries = append(entries, mi)
 			}
 		}
 	}
@@ -90,6 +102,68 @@ func (c *Cnmooc) Extract(rawURL string, opts *extractor.ExtractOpts) (*extractor
 		return nil, fmt.Errorf("cnmooc: no playable video URLs found in pages or item/detail.mooc")
 	}
 	return &extractor.MediaInfo{Site: "cnmooc", Title: sanitize(title), Entries: entries, Extra: map[string]any{"course_id": courseID, "open_id": openID}}, nil
+}
+
+func validateCnmoocLogin(c *util.Client) error {
+	checks := []string{
+		"/portal/myCourseIndex/1.mooc",
+		"/home/doAuth.mooc?bu=%2Fportal%2FmyCourseIndex%2F1.mooc",
+		"/home/index.mooc",
+	}
+	var lastErr error
+	for _, path := range checks {
+		text, finalURL, err := cnmoocGetText(c, abs(path), referer)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if htmlHasCnmoocLoginState(text, finalURL) {
+			return nil
+		}
+		lastErr = fmt.Errorf("%s did not contain logged-in markers", path)
+	}
+	if lastErr != nil {
+		return fmt.Errorf("cnmooc login check failed: %w", lastErr)
+	}
+	return fmt.Errorf("cnmooc login check failed")
+}
+
+func cnmoocGetText(c *util.Client, rawURL, ref string) (string, string, error) {
+	resp, err := c.Get(rawURL, requestHeaders(ref, false))
+	if err != nil {
+		return "", "", err
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", "", err
+	}
+	finalURL := rawURL
+	if resp.Request != nil && resp.Request.URL != nil {
+		finalURL = resp.Request.URL.String()
+	}
+	return string(b), finalURL, nil
+}
+
+func htmlHasCnmoocLoginState(text, finalURL string) bool {
+	if strings.TrimSpace(text) == "" {
+		return false
+	}
+	lowerText := strings.ToLower(text)
+	lowerURL := strings.ToLower(finalURL)
+	if strings.Contains(lowerURL, "/home/login") {
+		return false
+	}
+	if (strings.Contains(lowerText, `id="userloginpage"`) && strings.Contains(lowerText, `id="isguest" value="true"`)) || strings.Contains(lowerText, `$.g_login_coeus_user_id = "-1"`) {
+		return false
+	}
+	if strings.Contains(text, "/home/logout.mooc") {
+		return true
+	}
+	if strings.Contains(text, "/portal/myCourseIndex/") && strings.Contains(lowerText, `id="isguest" value="false"`) {
+		return true
+	}
+	return regexp.MustCompile(`(?i)class=["'][^"']*mycourse`).FindStringIndex(text) != nil
 }
 
 type itemInfo struct{ NodeID, ItemID, ItemType, Title, VideoURL string }
@@ -104,12 +178,14 @@ func resolveItem(c *util.Client, jar http.CookieJar, it itemInfo, openID, fallba
 	}
 	for _, u := range cands {
 		u = normalizeURL(u, origin)
-		if !isVideoURL(u) {
-			continue
-		}
 		title := first(it.Title, sourceTitle(detail), "CNMOOC视频"+fallback)
 		extra := map[string]any{"node_id": it.NodeID, "item_id": it.ItemID, "item_type": it.ItemType}
-		return media(sanitize(title), u, subtitleInfos(detail), extra)
+		if isVideoURL(u) {
+			return media(sanitize(title), u, subtitleInfos(detail), extra)
+		}
+		if isFileURL(u) {
+			return fileMedia(sanitize(first(it.Title, sourceTitle(detail), "CNMOOC资料"+fallback)), u, extra)
+		}
 	}
 	return nil
 }
@@ -309,6 +385,28 @@ func subtitleInfos(detail map[string]any) []extractor.Subtitle {
 func media(title, u string, subs []extractor.Subtitle, extra map[string]any) *extractor.MediaInfo {
 	return &extractor.MediaInfo{Site: "cnmooc", Title: title, Streams: map[string]extractor.Stream{"best": {Quality: "best", URLs: []string{u}, Format: pickFormat(u), Headers: requestHeaders(referer, false)}}, Subtitles: subs, Extra: extra}
 }
+func fileMedia(title, u string, extra map[string]any) *extractor.MediaInfo {
+	u = resolveFileURL(u)
+	if extra == nil {
+		extra = map[string]any{}
+	}
+	extra["type"] = "file"
+	extra["file_url"] = u
+	return &extractor.MediaInfo{Site: "cnmooc", Title: title, Streams: map[string]extractor.Stream{"file": {Quality: "file", URLs: []string{u}, Format: ext(u), Headers: requestHeaders(referer, false)}}, Extra: extra}
+}
+func resolveFileURL(raw string) string {
+	u := normalizeURL(raw, origin)
+	parsed, err := url.Parse(u)
+	if err != nil {
+		return u
+	}
+	for _, key := range []string{"file", "url", "downloadUrl"} {
+		if v := parsed.Query().Get(key); v != "" {
+			return normalizeURL(v, origin)
+		}
+	}
+	return u
+}
 func abs(p string) string { return normalizeURL(p, origin) }
 func normalizeURL(s, base string) string {
 	s = strings.TrimSpace(strings.ReplaceAll(s, `\/`, `/`))
@@ -384,7 +482,16 @@ func ext(u string) string {
 }
 func isVideoURL(u string) bool {
 	e := ext(u)
-	return e == "m3u8" || e == "mp4" || e == "flv" || e == "mp3"
+	return e == "m3u8" || e == "mp4" || e == "flv" || e == "mov" || e == "m4v" || e == "mp3" || e == "m4a" || e == "aac" || e == "wav"
+}
+func isFileURL(u string) bool {
+	e := ext(resolveFileURL(u))
+	switch e {
+	case "pdf", "ppt", "pptx", "doc", "docx", "xls", "xlsx", "zip", "rar", "7z", "caj", "txt", "srt", "vtt":
+		return true
+	default:
+		return false
+	}
 }
 func isSubtitle(u string) bool { e := ext(u); return e == "srt" || e == "vtt" }
 func pickFormat(u string) string {

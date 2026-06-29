@@ -2,11 +2,15 @@
 package smartedu
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/Sophomoresty/mediago/internal/extractor"
 	"github.com/Sophomoresty/mediago/internal/util"
@@ -48,14 +52,24 @@ type Smartedu struct{}
 func (s *Smartedu) Patterns() []string { return patterns }
 
 type smCtx struct {
-	c           *util.Client
-	headers     map[string]string
-	accessToken string
+	c                         *util.Client
+	headers                   map[string]string
+	accessToken, refreshToken string
+	macKey                    string
+	diff                      int64
 }
 
 type sourceItem struct {
 	kind, url, fmt, name, title, id string
+	headers                         map[string]string
 	size                            int64
+}
+
+type smarteduAuth struct {
+	accessToken  string
+	refreshToken string
+	macKey       string
+	diff         int64
 }
 
 func (s *Smartedu) Extract(rawURL string, opts *extractor.ExtractOpts) (*extractor.MediaInfo, error) {
@@ -95,7 +109,7 @@ func (s *Smartedu) Extract(rawURL string, opts *extractor.ExtractOpts) (*extract
 			sources = ctx.extractResources(detail, contentID, false, false, contentType)
 			title = firstNonEmpty(globalTitle(detail), contentID)
 		}
-	case "/syncClassroom":
+	case "/syncClassroom", "/syncClassroom/classActivity":
 		activityID := firstQuery(q, "activityId", "activityid")
 		fromPrepare := firstQuery(q, "fromPrepare", "fromprepare") == "1"
 		if activityID != "" {
@@ -140,13 +154,14 @@ func newCtx(jar http.CookieJar) *smCtx {
 	if cookie != "" {
 		h["Cookie"] = cookie
 	}
-	return &smCtx{c: c, headers: h, accessToken: decodeAccessToken(cookie)}
+	auth := decodeSmarteduAuth(cookie)
+	return &smCtx{c: c, headers: h, accessToken: auth.accessToken, refreshToken: auth.refreshToken, macKey: auth.macKey, diff: auth.diff}
 }
 
 func (x *smCtx) getFirst(urls []string) (map[string]any, error) {
 	var last error
 	for _, raw := range urls {
-		body, err := x.c.GetString(raw, x.headers)
+		body, err := x.c.GetString(raw, x.requestHeaders(raw, true))
 		if err != nil {
 			last = err
 			continue
@@ -164,6 +179,41 @@ func (x *smCtx) getFirst(urls []string) (map[string]any, error) {
 		return nil, last
 	}
 	return nil, fmt.Errorf("smartedu: empty JSON candidates")
+}
+
+func (x *smCtx) requestHeaders(raw string, auth bool) map[string]string {
+	h := make(map[string]string, len(x.headers)+1)
+	for k, v := range x.headers {
+		h[k] = v
+	}
+	if auth {
+		if a := x.authHeader(raw, "GET"); a != "" {
+			h["X-ND-AUTH"] = a
+		}
+	}
+	return h
+}
+
+func (x *smCtx) authHeader(raw, method string) string {
+	if x.accessToken == "" || x.macKey == "" || raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	uri := u.EscapedPath()
+	if uri == "" {
+		uri = "/"
+	}
+	if u.RawQuery != "" {
+		uri += "?" + u.RawQuery
+	}
+	nonce := fmt.Sprintf("%d:%s", time.Now().UnixMilli()+x.diff, util.RandomAlphanumeric(8))
+	base := fmt.Sprintf("%s\n%s\n%s\n%s\n", nonce, strings.ToUpper(firstNonEmpty(method, "GET")), uri, u.Host)
+	mac := hmac.New(sha256.New, []byte(x.macKey))
+	_, _ = mac.Write([]byte(base))
+	return fmt.Sprintf(`MAC id="%s",nonce="%s",mac="%s"`, x.accessToken, nonce, base64.StdEncoding.EncodeToString(mac.Sum(nil)))
 }
 
 func (x *smCtx) loadActivity(id string, prepare bool) (map[string]any, error) {
@@ -244,14 +294,15 @@ func (x *smCtx) sourceFromResource(r map[string]any, idx int, contentType string
 	id := str(r["id"])
 	if it := selectVideoItem(r); it != nil {
 		fmtv := strings.ToLower(firstNonEmpty(str(it["ti_format"]), extFormat(itemURL(it))))
-		return sourceItem{kind: "video", url: x.withAccess(itemURL(it)), fmt: firstNonEmpty(fmtv, "m3u8"), name: fmt.Sprintf("(%d)--%s", idx, title), title: title, id: id, size: itemSize(it)}
+		u := x.withAccess(itemURL(it))
+		return sourceItem{kind: "video", url: u, fmt: firstNonEmpty(fmtv, "m3u8"), name: fmt.Sprintf("(%d)--%s", idx, title), title: title, id: id, headers: x.requestHeaders(u, true), size: itemSize(it)}
 	}
 	if it := selectFileItem(r); it != nil {
 		u := x.withAccess(itemURL(it))
 		if contentType == "thematic_course" && str(it["ti_file_flag"]) == "source" {
 			u = privateToPublic(u)
 		}
-		return sourceItem{kind: "file", url: u, fmt: strings.ToLower(firstNonEmpty(str(it["ti_format"]), extFormat(u))), name: fmt.Sprintf("(%d)--%s", idx, title), title: title, id: id, size: itemSize(it)}
+		return sourceItem{kind: "file", url: u, fmt: strings.ToLower(firstNonEmpty(str(it["ti_format"]), extFormat(u))), name: fmt.Sprintf("(%d)--%s", idx, title), title: title, id: id, headers: x.requestHeaders(u, true), size: itemSize(it)}
 	}
 	return sourceItem{}
 }
@@ -276,8 +327,18 @@ func mediaFromSources(title string, srcs []sourceItem) (*extractor.MediaInfo, er
 		return nil, fmt.Errorf("smartedu: no playable resource found")
 	}
 	mk := func(src sourceItem) *extractor.MediaInfo {
-		return &extractor.MediaInfo{Site: "smartedu", Title: src.name, Streams: map[string]extractor.Stream{"default": {Quality: src.kind, URLs: []string{src.url}, Format: firstNonEmpty(src.fmt, "mp4"), Size: src.size, Headers: map[string]string{"Referer": refererURL}}}, Extra: map[string]any{"id": src.id, "kind": src.kind, "title": src.title}}
+		headers := src.headers
+		if len(headers) == 0 {
+			headers = map[string]string{"Referer": refererURL}
+		}
+		format := firstNonEmpty(src.fmt, "mp4")
+		stream := extractor.Stream{Quality: src.kind, URLs: []string{src.url}, Format: format, Size: src.size, Headers: headers}
+		if format == "m3u8" {
+			stream.NeedMerge = true
+		}
+		return &extractor.MediaInfo{Site: "smartedu", Title: src.name, Streams: map[string]extractor.Stream{"default": stream}, Extra: map[string]any{"id": src.id, "kind": src.kind, "title": src.title}}
 	}
+
 	if len(srcs) == 1 {
 		m := mk(srcs[0])
 		m.Title = firstNonEmpty(srcs[0].title, title)

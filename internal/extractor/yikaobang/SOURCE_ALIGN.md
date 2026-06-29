@@ -1,26 +1,25 @@
 # yikaobang 源码对齐对照
 
-Source: `~/code/xwz-downloader-source-release/decompiled_full/Mooc/Courses/Yikaobang/`.
+Python source: `/home/sophomores/code/xwz-downloader-source-release/restored_source/Mooc/Courses/Yikaobang/`.
+APK evidence: `yikaobang` Android 2.8.5.4 `NetworkRequestsURL.java` and course beans.
 
-## URL 常量
+## Python 可见逻辑
 
-| .cdc.py 行 | yikaobang.go 行/名 | 一致? |
+- `Yikaobang_Base.py` 只提供 `referer = https://www.yikaobang.com.cn/` 与 cookie/token header 骨架.
+- `Yikaobang_Course.prepare()` 显式标记缺少可靠课程/播放接口样本, 不提供伪实现.
+
+## Go 补全策略
+
+Go 实现保留 Python cookie/token 约束, 并基于 APK 中的 release endpoint/bean 字段补全运行链:
+
+| 能力 | Go 实现 | 证据 |
 | --- | --- | --- |
-| `Yikaobang_Base.py:29 referer = 'https://www.yikaobang.com.cn/'` | `yikaobang.go:11 refererURL` | ✓ |
-| Source has no course/play API URL constants | `yikaobang.go:12 homeURL` probes the only documented site URL | BLOCKED |
+| 课程列表 | `course/main/courseList`, `course/center/list`, `course/main/search`, legacy `vidteaching/main/list` | APK `NetworkRequestsURL.courseMainList/courseLearnCenterList` |
+| 课程详情/章节 | `course/main/detail`, `course/main/coursePackage`, `course/main/listAndUserPermission`, `course/center/catalogue`, legacy `vidteaching/main/chapter` | APK `CourseDirectoryItemData`, `CourseCalalogueBean` |
+| 视频源 | 解析 `playUrl/videoUrl/m3u8/vid/free_watch_vid`, 无直链时用 `Course/CourseV2/getCourseAk` / `vidteaching/main/video` 补取 Aliyun STS | APK `CourseChapterBean`, `CourseAkBean`, `VideoDownTempBean` |
+| 文件下载 | 解析 `course/center/handout` 和 payload 中 `url/fileUrl/downloadUrl/suffix/size_byte` | APK `VideoHandout` |
 
-## HTTP 调用
+## 边界
 
-| 源码方法 | Go 函数 | method | 一致? |
-| --- | --- | --- | --- |
-| `Yikaobang_Course.prepare` calls `set_cookie` then prints missing API sample message | `Extract` probes `homeURL` then returns blocked | GET | BLOCKED |
-
-## JSON 字段映射
-
-| 源码 key 链 | Go struct/tag | 一致? |
-| --- | --- | --- |
-| None. `Yikaobang_Course.prepare` explicitly says reliable course/play API samples are missing and no pseudo-implementation is provided. | None. Go does not fabricate JSON paths or streams. | BLOCKED |
-
-## 阻塞步骤
-
-BLOCKED: upstream source contains the explicit marker `医考帮当前仍缺少可靠的课程/播放接口样本，已保留统一结构骨架，暂不提供伪实现。`. `Extract()` returns `blocked: needs upstream API samples ...` after a home-page liveness probe.
+- 不调用 `Course/Course/clock` 等打卡/统计写接口.
+- 未从 APK 课程接口发现额外业务签名; Aliyun VOD 播放签名复用 `internal/extractor/shared` 的 HMAC-SHA1 OpenAPI 链.

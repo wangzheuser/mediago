@@ -2,7 +2,6 @@
 package dongao
 
 import (
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -101,17 +100,21 @@ func resolveCourse(c *util.Client, headers map[string]string, ids requestIDs) ([
 	var title string
 	var nodes []lectureNode
 	var direct []*extractor.MediaInfo
+	var resources []resourceRef
 
 	if ids.CourseID != "" {
-		body, err := c.GetString(fmt.Sprintf(catalog_url, url.PathEscape(ids.CourseID)), headers)
+		catalogURL := fmt.Sprintf(catalog_url, url.PathEscape(ids.CourseID))
+		body, err := c.GetString(catalogURL, headers)
 		if err == nil {
 			title = firstNonEmpty(parseTitle(body), ids.CourseID)
 			if media := findMediaInText(body); media != "" {
 				direct = append(direct, mediaInfo(title, media, headers))
 			}
+			resources = append(resources, collectResourceRefsFromText(body, catalogURL)...)
 			payload := parseJSONText(body)
 			if payload != nil {
 				nodes = append(nodes, collectLectureNodes(payload, title)...)
+				resources = append(resources, collectResourceRefsFromAny(payload, catalogURL)...)
 				title = firstNonEmpty(pickTitle(payload), title)
 			}
 			nodes = append(nodes, collectLectureLinks(body, title)...)
@@ -125,16 +128,19 @@ func resolveCourse(c *util.Client, headers map[string]string, ids requestIDs) ([
 			direct = append(direct, mediaInfo(firstNonEmpty(pickTitle(payload), title, ids.CourseID), media, headers))
 		}
 		nodes = append(nodes, collectLectureNodes(payload, title)...)
+		resources = append(resources, collectResourceRefsFromAny(payload, referer)...)
 	}
+	resourceEntries := resourceEntriesFromRefs(resources, headers)
 	if len(direct) > 0 {
-		return direct, title, nil
+		return dedupeMediaEntries(append(direct, resourceEntries...)), title, nil
 	}
 	if len(nodes) == 0 {
-		return nil, title, nil
+		return resourceEntries, title, nil
 	}
 
 	seen := map[string]bool{}
 	entries := make([]*extractor.MediaInfo, 0, len(nodes))
+	lectureResources := make([]resourceRef, 0)
 	for _, node := range nodes {
 		if node.ID == "" || seen[node.ID] {
 			continue
@@ -143,9 +149,12 @@ func resolveCourse(c *util.Client, headers map[string]string, ids requestIDs) ([
 		entry, err := resolveLecture(c, headers, node.ID, node.Title)
 		if err == nil {
 			entries = append(entries, entry)
+			lectureResources = append(lectureResources, resourceRefsFromExtra(entry)...)
 		}
 	}
-	return entries, title, nil
+	entries = append(entries, resourceEntriesFromRefs(lectureResources, headers)...)
+	entries = append(entries, resourceEntries...)
+	return dedupeMediaEntries(entries), title, nil
 }
 
 func resolveLecture(c *util.Client, headers map[string]string, lectureID, fallbackTitle string) (*extractor.MediaInfo, error) {
@@ -161,10 +170,13 @@ func resolveLecture(c *util.Client, headers map[string]string, lectureID, fallba
 		return nil, fmt.Errorf("fetch dongao lecture page: %w", err)
 	}
 	title := util.SanitizeFilename(firstNonEmpty(parseTitle(body), fallbackTitle, lectureID))
+	resourceRefs := collectResourceRefsFromText(body, playURL)
 
 	// Try direct media URL first (plaintext flow)
 	if media := findMediaInText(body); media != "" {
-		return mediaInfo(title, media, h), nil
+		entry := mediaInfo(title, media, h)
+		addResourceExtra(entry, resourceRefs)
+		return entry, nil
 	}
 
 	// Encrypted flow: extract player fields, build signed m3u8
@@ -182,22 +194,27 @@ func resolveLecture(c *util.Client, headers map[string]string, lectureID, fallba
 			m3u8Headers["X-Requested-With"] = "XMLHttpRequest"
 			m3u8Text, err := c.GetString(m3u8URL, m3u8Headers)
 			if err == nil && strings.Contains(m3u8Text, "#EXTM3U") {
-				signedM3U8, aesKey, _ := buildSignedM3U8(m3u8Text, fields)
+				signedM3U8, aesKey, _ := buildSignedM3U8(m3u8Text, fields, m3u8URL)
+				streamURL := m3u8URL
+				if strings.Contains(signedM3U8, "#EXTM3U") && signedM3U8 != m3u8Text {
+					streamURL = m3u8DataURL(signedM3U8)
+				}
 				stream := extractor.Stream{
 					Quality: "best",
-					URLs:    []string{m3u8URL},
+					URLs:    []string{streamURL},
 					Format:  "m3u8",
 					Headers: m3u8Headers,
 				}
 				if len(aesKey) > 0 {
-					_ = hex.EncodeToString(aesKey) // key material available for future inline-m3u8 use
+					stream.Headers["X-Dongao-TS-Key"] = fmt.Sprintf("%x", aesKey)
 				}
-				_ = signedM3U8 // available for inline-manifest download
-				return &extractor.MediaInfo{
+				entry := &extractor.MediaInfo{
 					Site:    "dongao",
 					Title:   title,
 					Streams: map[string]extractor.Stream{"best": stream},
-				}, nil
+				}
+				addResourceExtra(entry, resourceRefs)
+				return entry, nil
 			}
 		}
 	}

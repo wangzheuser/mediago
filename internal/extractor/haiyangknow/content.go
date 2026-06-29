@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/url"
 	"path"
+	"regexp"
 	"strings"
 
 	"github.com/Sophomoresty/mediago/internal/extractor"
@@ -160,12 +161,16 @@ func (x *hyCtx) sourcesFromLesson(lesson hyLesson, play map[string]any) []hySour
 func materialSources(lesson hyLesson, play map[string]any) []hySource {
 	var out []hySource
 	for _, item := range iterMaterialItems(lesson, play) {
-		if item.URL == "" {
+		if item.URL == "" && item.HTML == "" {
 			continue
 		}
 		item.Name = firstNonEmpty(item.Name, lesson.MaterialName)
-		item.Kind = "material"
-		item.Format = firstNonEmpty(item.Format, extFormat(item.URL), "pdf")
+		item.Kind = firstNonEmpty(item.Kind, "material")
+		if item.HTML != "" {
+			item.Format = "html"
+		} else {
+			item.Format = firstNonEmpty(item.Format, extFormat(item.URL), "pdf")
+		}
 		out = append(out, item)
 	}
 	return out
@@ -194,8 +199,8 @@ func collectMediaCandidates(value any) []string {
 }
 
 func iterMaterialItems(lesson hyLesson, play map[string]any) []hySource {
-	queue := []any{lesson.DocumentURL, lesson.Content, lesson.Raw["documentUrl"], lesson.Raw["contents"]}
-	for _, k := range []string{"documentUrl", "document_url", "fileUrl", "contents", "content"} {
+	queue := []any{lesson.DocumentURL, lesson.Content, lesson.Raw["documentUrl"], lesson.Raw["document_url"], lesson.Raw["fileUrl"], lesson.Raw["contents"], lesson.Raw["content"], lesson.Raw["htmlContent"]}
+	for _, k := range []string{"documentUrl", "document_url", "fileUrl", "contents", "content", "materialList", "materials", "attachments", "fileList", "resources"} {
 		queue = append(queue, play[k])
 	}
 	seen := map[string]bool{}
@@ -212,12 +217,36 @@ func iterMaterialItems(lesson hyLesson, play map[string]any) []hySource {
 			if strings.HasPrefix(s, "http") && !seen[strings.ToLower(s)] {
 				seen[strings.ToLower(s)] = true
 				out = append(out, hySource{Name: lesson.MaterialName, URL: s, Format: extFormat(s), Kind: "material"})
+			} else if strings.Contains(s, "<") && strings.Contains(s, ">") {
+				key := strings.ToLower(s)
+				if len(key) > 128 {
+					key = key[:128]
+				}
+				if !seen[key] {
+					seen[key] = true
+					out = append(out, hySource{Name: lesson.MaterialName, HTML: s, Format: "html", Kind: "material"})
+				}
 			}
 		case map[string]any:
-			for _, k := range []string{"url", "file_url", "download_url", "material_url", "documentUrl", "oss_url"} {
-				if str(t[k]) != "" {
-					queue = append(queue, t[k])
+			name := firstString(t, "name", "title", "file_name", "fileName", "resourceName")
+			for _, k := range []string{"url", "file_url", "download_url", "material_url", "documentUrl", "oss_url", "fileUrl", "downloadUrl"} {
+				if raw := str(t[k]); raw != "" {
+					queue = append(queue, map[string]any{"_yield_url": true, "url": raw, "name": name})
 				}
+			}
+			for _, k := range []string{"html", "content", "contents", "htmlContent"} {
+				if raw := str(t[k]); strings.Contains(raw, "<") && strings.Contains(raw, ">") {
+					queue = append(queue, raw)
+				}
+			}
+			if truthy(t["_yield_url"]) {
+				raw := str(t["url"])
+				key := strings.ToLower(raw)
+				if raw != "" && !seen[key] {
+					seen[key] = true
+					out = append(out, hySource{Name: firstNonEmpty(name, lesson.MaterialName), URL: normalizeMaterialURL(raw), Format: extFormat(raw), Kind: "material"})
+				}
+				continue
 			}
 			for _, vv := range t {
 				if _, ok := vv.(map[string]any); ok {
@@ -237,11 +266,18 @@ func iterMaterialItems(lesson hyLesson, play map[string]any) []hySource {
 func (x *hyCtx) mediaFromSources(sources []hySource) (*extractor.MediaInfo, error) {
 	var entries []*extractor.MediaInfo
 	for _, src := range sources {
-		if src.URL == "" {
+		if src.URL == "" && src.HTML == "" {
 			continue
 		}
-		fmtv := firstNonEmpty(src.Format, extFormat(src.URL), "mp4")
-		mi := &extractor.MediaInfo{Site: "haiyangknow", Title: firstNonEmpty(src.Name, path.Base(parsedPath(src.URL))), Streams: map[string]extractor.Stream{"best": {Quality: "best", URLs: []string{src.URL}, Format: fmtv, Size: src.Size, NeedMerge: src.NeedMerge, Headers: map[string]string{"Referer": referer, "Cookie": x.cookie}}}, Extra: map[string]any{"kind": src.Kind}}
+		rawURL := src.URL
+		fmtv := firstNonEmpty(src.Format, extFormat(rawURL), "mp4")
+		quality := "best"
+		if src.HTML != "" {
+			rawURL = "data:text/html;charset=utf-8," + url.PathEscape(src.HTML)
+			fmtv = "html"
+			quality = "document"
+		}
+		mi := &extractor.MediaInfo{Site: "haiyangknow", Title: firstNonEmpty(src.Name, path.Base(parsedPath(rawURL))), Streams: map[string]extractor.Stream{"best": {Quality: quality, URLs: []string{rawURL}, Format: fmtv, Size: src.Size, NeedMerge: src.NeedMerge, Headers: map[string]string{"Referer": referer, "Cookie": x.cookie}}}, Extra: map[string]any{"kind": src.Kind}}
 		for k, v := range src.Extra {
 			mi.Extra[k] = v
 		}
@@ -287,7 +323,19 @@ func normalizeMediaURL(s string) string {
 	return ""
 }
 
+func normalizeMaterialURL(s string) string {
+	s = strings.Trim(strings.TrimSpace(s), "'\"")
+	if strings.HasPrefix(s, "//") {
+		return "https:" + s
+	}
+	return s
+}
+
 func extFormat(raw string) string {
+	low := strings.ToLower(raw)
+	if m := regexp.MustCompile(`\.(m3u8|mp4|m4v|mov|flv|mp3|m4a|aac|wav|pdf|pptx?|docx?)(?:[?#]|$)`).FindStringSubmatch(low); len(m) == 2 {
+		return m[1]
+	}
 	return strings.TrimPrefix(strings.ToLower(path.Ext(parsedPath(raw))), ".")
 }
 func parsedPath(raw string) string {

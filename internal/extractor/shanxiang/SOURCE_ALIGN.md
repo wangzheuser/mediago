@@ -18,6 +18,7 @@
 | Shanxiang_Base._check_cookie line 205 `request_get_raw(login_check_url, headers...)` | shanxiang.go:89-90 study page fetch with `Referer: login_check_url` | GET | ✓ |
 | Shanxiang_Course._get_course_list decrypted `t477` | shanxiang.go:133-140 `fetchCourseFromList` | GET | ✓ |
 | Shanxiang_Course._get_study_html decrypted `t607` | shanxiang.go:89-95 | GET | ✓ |
+| Shanxiang_Course._parse_files / _parse_docview_file_url decrypted `t668/t695` | `parseFiles`, `parseDocviewFileURL`, `resolveFileEntry` | HTML links + docview unwrap | ✓ |
 | Shanxiang_Course._get_playback_html decrypted `t615` | shanxiang.go:156-165 `resolvePlayback` | GET | ✓ |
 | Shanxiang_Course._get_cc_session decrypted `t824`; task R6 requires shared helper | shanxiang.go:174-177 `shared.CssLcloudResolvePlayInfo` | POST+GET inside shared | ✓ |
 | Shanxiang_Course.download_video decrypted `t921` `.m3u8` branch | shanxiang.go:187-193 `shared.CssLcloudRewriteM3U8Keys` | GET key fetch inside shared | ✓ |
@@ -31,6 +32,7 @@
 | `_parse_cc_info_from_html`: `(userId|roomId|recordId|viewername|viewertoken|groupId)` | shanxiang.go:224-228 `ccPairRe`, 262-276 `parseCCInfo` | ✓ |
 | `_parse_cc_info_from_html`: hidden `userId/roomId/recordId/viewerName/viewerId/liveId/videoId` | shanxiang.go:267-274 hidden input fallback | ✓ |
 | `_get_cc_session`: `data.user.token`, `_get_video_url`: `play_data.data.video` | `shared.CssLcloudResolvePlayInfo` parses CSSL `sessionId` + `vod_info.video/audio` | ✓ |
+| `_parse_files`: docview/pdf/ppt/doc style materials | `parseFiles`, `isFileURL`, `fileFormat` | ✓ |
 
 ## 阻塞步骤
 

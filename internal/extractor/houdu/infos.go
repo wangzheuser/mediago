@@ -119,8 +119,10 @@ func (x *hdCtx) makeLessonSources(lesson map[string]any, prefix []int, defaultTy
 	lessonType := firstNonEmpty(firstString(lesson, "lesson_type"), defaultType, firstString(lesson, "course_type"))
 	modes := lessonModes(lesson, lessonType)
 	for _, mode := range modes {
-		if playURL := x.getPlayURLForMode(lessonID, mode); playURL != "" {
-			return []hdSource{{Name: name, URL: playURL, Kind: "video", Format: extFormat(playURL), NeedMerge: strings.Contains(strings.ToLower(playURL), ".m3u8"), Extra: map[string]any{"lesson_id": lessonID, "mode": mode, "lesson_type": lessonType}}}
+		if pb := x.getPlaybackForMode(lessonID, mode, lesson); pb.URL != "" {
+			format := firstNonEmpty(pb.Format, extFormat(pb.URL))
+			extra := mergeExtra(pb.Extra, map[string]any{"lesson_id": lessonID, "mode": mode, "lesson_type": lessonType})
+			return []hdSource{{Name: name, URL: pb.URL, Kind: "video", Format: format, NeedMerge: pb.NeedMerge || strings.Contains(strings.ToLower(pb.URL), ".m3u8"), Extra: extra}}
 		}
 	}
 	return nil

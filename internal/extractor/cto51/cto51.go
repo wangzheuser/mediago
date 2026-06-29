@@ -26,6 +26,9 @@ const (
 	urlEStudy            = "https://e.51cto.com/study"
 	urlCourse            = "https://edu.51cto.com/course/%s.html"
 	urlLesson            = "https://edu.51cto.com/lesson/%s.html"
+	urlTrainLessonPlay   = "https://edu.51cto.com/center/course/lesson/index?id=%s"
+	urlTrainLiveView     = "https://edu.51cto.com/center/wejob/live/view?id=%s"
+	urlTrainLivePlay     = "https://edu.51cto.com/center/wejob/play/lived?live_id=%s"
 	urlCourseTypeAPI     = "https://edu.51cto.com/center/course/user-june/search-list"
 	urlCourseListAPI     = "https://edu.51cto.com/center/course/user-june/list"
 	urlLessonListAPI     = "https://edu.51cto.com/center/course/user/get-lesson-list"
@@ -56,7 +59,13 @@ type Cto51 struct{}
 func (c *Cto51) Patterns() []string { return patterns }
 
 type route struct{ CID, LID, TrainID, TrainCourseID string }
-type media struct{ URL, Title, Format string }
+type media struct {
+	URL    string
+	Title  string
+	Format string
+	Size   int64
+	Extra  map[string]any
+}
 
 var (
 	courseRe      = regexp.MustCompile(`(?i)/course/(\d+)\.html|(?:course_id|courseId|cid)=([0-9]+)`)
@@ -66,8 +75,9 @@ var (
 	lessonLinkRe  = regexp.MustCompile(`(?is)<a\b[^>]*href=["']([^"']*/lesson/(\d+)\.html[^"']*)["'][^>]*>(.*?)</a>`)
 	titleRe       = regexp.MustCompile(`(?is)<h1[^>]*>(.*?)</h1>|<title[^>]*>(.*?)</title>`)
 	aliParamRe    = regexp.MustCompile(`(?is)var\s+aliplayparam\s*=\s*\{(?P<body>[\s\S]*?)\}\s*;`)
-	jsPairRe      = regexp.MustCompile(`(?is)["']?([A-Za-z0-9_]+)["']?\s*:\s*["']([^"']+)["']`)
-	mediaURLRe    = regexp.MustCompile(`(?i)https?:\\?/\\?/[^"'<>\s]+?\.(?:m3u8|mp4)(?:\?[^"'<>\s]*)?`)
+	jsPairRe      = regexp.MustCompile(`(?is)["']?([A-Za-z0-9_]+)["']?\s*:\s*(?:"([^"]*)"|'([^']*)'|([^,\n}]+))`)
+	mediaURLRe    = regexp.MustCompile(`(?i)https?:\\?/\\?/[^"'<>\s]+?\.(?:m3u8|mp4|flv|mp3|m4a|aac|pdf|pptx?|docx?|xlsx?|zip|rar|7z|tar|gz|txt|md)(?:\?[^"'<>\s]*)?`)
+	fileAnchorRe  = regexp.MustCompile(`(?is)<a\b[^>]*href=["']([^"']+)["'][^>]*>(.*?)</a>`)
 )
 
 func (x *Cto51) Extract(rawURL string, opts *extractor.ExtractOpts) (*extractor.MediaInfo, error) {
@@ -78,71 +88,103 @@ func (x *Cto51) Extract(rawURL string, opts *extractor.ExtractOpts) (*extractor.
 	c.SetCookieJar(opts.Cookies)
 	h := headers(rawURL)
 	r := parseRoute(rawURL)
+	listOnly := opts.ListOnly
 
 	if r.LID != "" {
-		return resolveLesson(c, r.LID, h)
+		if r.TrainCourseID != "" {
+			return resolveTrainingLesson(c, r, h, listOnly)
+		}
+		return resolveLesson(c, r.LID, h, listOnly)
 	}
 	if r.TrainID != "" {
-		return resolveTraining(c, r, h)
+		return resolveTraining(c, r, h, listOnly)
 	}
 	if r.CID != "" {
-		return resolveCourse(c, r.CID, h)
+		return resolveCourse(c, r.CID, h, listOnly)
 	}
 	return resolveMyCourses(c, h)
 }
 
-func resolveCourse(c *util.Client, cid string, h map[string]string) (*extractor.MediaInfo, error) {
-	payloads := fetchJSONPayloads(c, h, []apiReq{
-		{urlCourseIndexAPI, map[string]string{"course_id": cid, "course_id_str": cid}},
-		{urlLessonListAPI, map[string]string{"id": cid, "page": "1"}},
-		{urlLessonFileListAPI, map[string]string{"course_id": cid, "page": "1", "size": "100"}},
-		{urlCourseFileListAPI, map[string]string{"course_id": cid}},
-	})
-	entries := entriesFromPayloads(c, payloads, h)
-	if len(entries) == 0 {
+func resolveCourse(c *util.Client, cid string, h map[string]string, listOnly bool) (*extractor.MediaInfo, error) {
+	payloads := fetchCoursePayloads(c, cid, h)
+	title := firstNonEmpty(courseTitleFromPayloads(payloads), "51cto_"+cid)
+	lessons := lessonsFromPayloads(payloads, lessonContext{CourseID: cid})
+	files := filesFromPayloads(payloads, "material")
+
+	pageBody := ""
+	if len(lessons) == 0 || title == "51cto_"+cid {
 		page := fmt.Sprintf(urlCourse, cid)
-		body, err := c.GetString(page, h)
-		if err != nil {
-			return nil, fmt.Errorf("51cto fetch course page: %w", err)
-		}
-		for _, item := range parseLessonLinks(body) {
-			entry, err := resolveLesson(c, item.ID, h)
-			if err == nil {
-				entry.Title = util.SanitizeFilename(firstNonEmpty(item.Title, entry.Title))
-				entries = append(entries, entry)
+		if body, err := c.GetString(page, h); err == nil {
+			pageBody = body
+			title = firstNonEmpty(extractTitle(body), title)
+			if len(lessons) == 0 {
+				lessons = append(lessons, parseLessonLinks(body)...)
 			}
-		}
-		if len(entries) == 0 {
-			entries = entriesFromPayloads(c, []any{body}, h)
-		}
-		if len(entries) > 0 {
-			return &extractor.MediaInfo{Site: "cto51", Title: util.SanitizeFilename(firstNonEmpty(extractTitle(body), "51cto_"+cid)), Entries: entries}, nil
+			files = append(files, filesFromHTML(body, "", "", "material")...)
 		}
 	}
-	if len(entries) == 1 {
+
+	entries := make([]*extractor.MediaInfo, 0, len(lessons)+len(files))
+	seen := map[string]bool{}
+	for i, item := range dedupeLessons(lessons) {
+		if item.ID == "" && item.URL == "" {
+			continue
+		}
+		entry, err := lessonEntry(c, item, h, listOnly, i+1)
+		if err != nil {
+			continue
+		}
+		appendEntry(&entries, seen, entry)
+	}
+	for i, f := range dedupeFiles(files) {
+		entry, err := fileEntry(c, f, h, i+1)
+		if err != nil {
+			continue
+		}
+		appendEntry(&entries, seen, entry)
+	}
+	if len(entries) == 0 && pageBody != "" {
+		entries = entriesFromPayloads(c, []any{pageBody}, h)
+	}
+	if len(entries) == 0 {
+		entries = entriesFromPayloads(c, payloads, h)
+	}
+	if len(entries) == 1 && !listOnly {
 		return entries[0], nil
 	}
-	if len(entries) > 1 {
-		return &extractor.MediaInfo{Site: "cto51", Title: "51cto_" + cid, Entries: entries}, nil
+	if len(entries) > 0 {
+		return &extractor.MediaInfo{Site: "cto51", Title: util.SanitizeFilename(title), Entries: entries, Extra: map[string]any{"course_id": cid}}, nil
 	}
-	return nil, fmt.Errorf("51cto course %s: no playable lesson media", cid)
+	return nil, fmt.Errorf("51cto course %s: no playable lesson/file media", cid)
 }
 
-func resolveLesson(c *util.Client, lid string, h map[string]string) (*extractor.MediaInfo, error) {
+func resolveLesson(c *util.Client, lid string, h map[string]string, listOnly bool) (*extractor.MediaInfo, error) {
+	if listOnly {
+		return lessonListEntry(lessonRef{ID: lid, Title: "lesson_" + lid}, 1), nil
+	}
 	pageURL := fmt.Sprintf(urlLesson, lid)
 	body, err := c.GetString(pageURL, h)
 	if err != nil {
 		return nil, fmt.Errorf("51cto fetch lesson page: %w", err)
 	}
-	if m := mediaFromText(body); m.URL != "" {
+	if m := videoFromText(body); m.URL != "" {
 		return mediaInfo(firstNonEmpty(extractTitle(body), "lesson_"+lid), m.URL, m.Format, h), nil
 	}
 	if auth := parseAliPlayParam(body); len(auth) > 0 {
+		auth["lesson_id"] = firstNonEmpty(auth["lesson_id"], lid)
+		if apiAuth, err := requestVodPlayAuth(c, auth, h); err == nil && len(apiAuth) > 0 {
+			auth = mergeAuth(auth, apiAuth)
+		}
 		if m, err := resolveAuth(c, auth, h); err == nil && m.URL != "" {
 			return mediaInfo(firstNonEmpty(extractTitle(body), "lesson_"+lid), m.URL, m.Format, h), nil
 		}
 	}
-	payloads := fetchJSONPayloads(c, h, []apiReq{{urlVodPlayAuthAPI, map[string]string{"lesson_id": lid, "id": lid}}})
+	if auth, err := requestVodPlayAuth(c, map[string]string{"lesson_id": lid, "type": "course"}, h); err == nil && len(auth) > 0 {
+		if m, err := resolveAuth(c, auth, h); err == nil && m.URL != "" {
+			return mediaInfo(firstNonEmpty(extractTitle(body), "lesson_"+lid), m.URL, m.Format, h), nil
+		}
+	}
+	payloads := fetchJSONPayloads(c, h, []apiReq{{urlVodPlayAuthAPI, map[string]string{"type": "course", "lesson_id": lid, "id": lid}}})
 	entries := entriesFromPayloads(c, payloads, h)
 	if len(entries) > 0 {
 		return entries[0], nil
@@ -150,37 +192,63 @@ func resolveLesson(c *util.Client, lid string, h map[string]string) (*extractor.
 	return nil, fmt.Errorf("51cto lesson %s: no media URL/playAuth found", lid)
 }
 
-func resolveTraining(c *util.Client, r route, h map[string]string) (*extractor.MediaInfo, error) {
+func resolveTraining(c *util.Client, r route, h map[string]string, listOnly bool) (*extractor.MediaInfo, error) {
 	if r.TrainCourseID != "" && r.LID != "" {
-		return resolveLesson(c, r.LID, h)
+		return resolveTrainingLesson(c, r, h, listOnly)
 	}
-	payloads := fetchJSONPayloads(c, h, []apiReq{
-		{urlTrainStageAPI, map[string]string{"train_id": r.TrainID}},
-		{urlTrainCourseAPI, map[string]string{"train_id": r.TrainID}},
-		{urlTrainInfoAPI, map[string]string{"train_id": r.TrainID, "train_course_id": r.TrainCourseID}},
-		{urlTrainLiveAPI, map[string]string{"train_id": r.TrainID}},
-		{urlTrainFileAPI, map[string]string{"train_id": r.TrainID}},
-		{urlTrainNextAPI, map[string]string{"train_id": r.TrainID}},
-	})
-	entries := entriesFromPayloads(c, payloads, h)
-	if len(entries) == 1 {
+	payloads := fetchTrainingPayloads(c, r, h)
+	title := firstNonEmpty(courseTitleFromPayloads(payloads), "train_"+r.TrainID)
+	lessons := lessonsFromPayloads(payloads, lessonContext{TrainID: r.TrainID, TrainCourseID: r.TrainCourseID, SourceKind: "training"})
+	files := filesFromPayloads(payloads, "material")
+	entries := make([]*extractor.MediaInfo, 0, len(lessons)+len(files))
+	seen := map[string]bool{}
+	for i, item := range dedupeLessons(lessons) {
+		entry, err := lessonEntry(c, item, h, listOnly, i+1)
+		if err == nil {
+			appendEntry(&entries, seen, entry)
+		}
+	}
+	for i, f := range dedupeFiles(files) {
+		entry, err := fileEntry(c, f, h, i+1)
+		if err == nil {
+			appendEntry(&entries, seen, entry)
+		}
+	}
+	if len(entries) == 0 {
+		entries = entriesFromPayloads(c, payloads, h)
+	}
+	if len(entries) == 1 && !listOnly {
 		return entries[0], nil
 	}
-	if len(entries) > 1 {
-		return &extractor.MediaInfo{Site: "cto51", Title: "train_" + r.TrainID, Entries: entries}, nil
+	if len(entries) > 0 {
+		return &extractor.MediaInfo{Site: "cto51", Title: util.SanitizeFilename(title), Entries: entries, Extra: map[string]any{"train_id": r.TrainID}}, nil
 	}
 	return nil, fmt.Errorf("51cto train %s: no playable media", r.TrainID)
 }
 
 func resolveMyCourses(c *util.Client, h map[string]string) (*extractor.MediaInfo, error) {
-	payloads := fetchJSONPayloads(c, h, []apiReq{
-		{urlStudyCourse, nil}, {urlCourseTypeAPI, nil}, {urlCourseListAPI, nil}, {urlTrainingAPI, map[string]string{"type": "1"}}, {urlOrderListAPI, map[string]string{"page": "1"}},
-	})
-	entries := entriesFromPayloads(c, payloads, h)
+	payloads := fetchMyCoursePayloads(c, h)
+	courses := courseRefsFromPayloads(payloads)
+	entries := courseRefEntries(courses)
 	if len(entries) == 0 {
-		return nil, fmt.Errorf("51cto: no playable media in account course APIs")
+		htmlHeaders := cloneHeaders(h)
+		htmlHeaders["Referer"] = firstNonEmpty(h["Referer"], "https://edu.51cto.com/")
+		if body, err := c.GetString(urlEStudy, htmlHeaders); err == nil {
+			entries = courseRefEntries(courseRefsFromHTML(body))
+		}
+	}
+	if len(entries) == 0 {
+		entries = entriesFromPayloads(c, payloads, h)
+	}
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("51cto: no course/media entries in account APIs")
 	}
 	return &extractor.MediaInfo{Site: "cto51", Title: "51cto", Entries: entries}, nil
+}
+
+func resolveTrainingLesson(c *util.Client, r route, h map[string]string, listOnly bool) (*extractor.MediaInfo, error) {
+	ref := lessonRef{ID: r.LID, TrainID: r.TrainID, TrainCourseID: r.TrainCourseID, SourceKind: "training", URL: trainingLessonURL(r.TrainID, r.TrainCourseID, r.LID)}
+	return lessonEntry(c, ref, h, listOnly, 1)
 }
 
 type apiReq struct {
@@ -214,7 +282,7 @@ func entriesFromPayloads(c *util.Client, payloads []any, h map[string]string) []
 				continue
 			}
 			seen[m.URL] = true
-			entries = append(entries, mediaInfo(firstNonEmpty(m.Title, "51cto"), m.URL, m.Format, h))
+			entries = append(entries, mediaInfoFromMedia(m, h))
 		}
 	}
 	return entries
@@ -233,17 +301,48 @@ func collectMedia(c *util.Client, v any, h map[string]string) []media {
 			}
 		}
 	case map[string]any:
-		title := textValue(x, "lesson_name", "lessonName", "course_name", "courseName", "title", "name", "file_name", "fileName")
+		title := textValue(x, "lesson_name", "lessonName", "course_name", "courseName", "title", "name", "file_name", "fileName", "attach_name", "attachName", "video_name", "videoName", "live_name", "liveName")
 		if auth := authFromMap(x); len(auth) > 0 {
 			if m, err := resolveAuth(c, auth, h); err == nil && m.URL != "" {
 				m.Title = title
+				m.Size = int64Value(x, "size", "fileSize", "file_size", "video_size", "videoSize")
 				out = append(out, m)
 			}
 		}
-		for _, key := range []string{"play_url", "playUrl", "url", "lesson_url", "lessonUrl", "video_url", "videoUrl", "m3u8", "m3u8_url", "file_url", "fileUrl", "path"} {
-			if m := mediaFromText(textValue(x, key)); m.URL != "" {
+		for _, key := range []string{"play_url", "playUrl", "url", "lesson_url", "lessonUrl", "video_url", "videoUrl", "m3u8", "m3u8_url", "m3u8Url", "master_m3u8_url", "masterM3u8Url", "mp4_url", "mp4Url", "file_url", "fileUrl", "download_url", "downloadUrl", "downUrl", "attach_url", "attachUrl", "replay_url", "replayUrl", "playback_url", "playbackUrl", "live_url", "liveUrl", "path", "href", "link"} {
+			raw := textValue(x, key)
+			if m := mediaFromText(raw); m.URL != "" {
+				m.Title = title
+				m.Size = int64Value(x, "size", "fileSize", "file_size", "video_size", "videoSize")
+				out = append(out, m)
+				continue
+			}
+			if pageURL := playPageURL(normalizeURL(raw, "https://edu.51cto.com/")); pageURL != "" {
+				if m, err := resolvePlayPage(c, pageURL, h); err == nil && m.URL != "" {
+					m.Title = title
+					out = append(out, m)
+				}
+			}
+		}
+		if liveID := textValue(x, "live_id", "liveId", "liveID", "liveid"); liveID != "" {
+			for _, pageURL := range []string{fmt.Sprintf(urlTrainLiveView, liveID), fmt.Sprintf(urlTrainLivePlay, liveID)} {
+				if m, err := resolvePlayPage(c, pageURL, h); err == nil && m.URL != "" {
+					m.Title = title
+					out = append(out, m)
+					break
+				}
+			}
+		}
+		if lessonID := textValue(x, "lesson_id", "lessonId", "lessonID", "lid"); lessonID != "" {
+			if m, err := resolvePlayPage(c, fmt.Sprintf(urlTrainLessonPlay, lessonID), h); err == nil && m.URL != "" {
 				m.Title = title
 				out = append(out, m)
+			}
+			if courseID := textValue(x, "course_id", "courseId", "courseID", "cid"); courseID != "" {
+				if m, err := resolvePlayPage(c, fmt.Sprintf(urlTrainLessonPlay, courseID+"_"+lessonID), h); err == nil && m.URL != "" {
+					m.Title = title
+					out = append(out, m)
+				}
 			}
 		}
 		for _, vv := range x {
@@ -257,10 +356,38 @@ func collectMedia(c *util.Client, v any, h map[string]string) []media {
 	return out
 }
 
+func resolvePlayPage(c *util.Client, pageURL string, h map[string]string) (media, error) {
+	if pageURL == "" {
+		return media{}, fmt.Errorf("empty 51cto play page")
+	}
+	reqHeaders := cloneHeaders(h)
+	reqHeaders["Referer"] = firstNonEmpty(h["Referer"], "https://edu.51cto.com/")
+	body, err := c.GetString(pageURL, reqHeaders)
+	if err != nil {
+		return media{}, err
+	}
+	if m := videoFromText(body); m.URL != "" {
+		return m, nil
+	}
+	if auth := parseAliPlayParam(body); len(auth) > 0 {
+		if apiAuth, err := requestVodPlayAuth(c, auth, reqHeaders); err == nil && len(apiAuth) > 0 {
+			auth = mergeAuth(auth, apiAuth)
+		}
+		return resolveAuth(c, auth, reqHeaders)
+	}
+	var payload any
+	if json.Unmarshal([]byte(body), &payload) == nil {
+		if m := firstMedia(collectMedia(c, payload, reqHeaders)); m.URL != "" {
+			return m, nil
+		}
+	}
+	return media{}, fmt.Errorf("51cto play page has no media")
+}
+
 func resolveAuth(c *util.Client, auth map[string]string, h map[string]string) (media, error) {
 	if auth["app_id"] != "" && auth["file_id"] != "" && auth["psign"] != "" {
 		api := fmt.Sprintf(urlQCloudPlayAPI, url.PathEscape(auth["app_id"]), url.PathEscape(auth["file_id"]))
-		body, err := c.GetString(addQuery(api, map[string]string{"keyId": "1", "psign": auth["psign"]}), h)
+		body, err := c.GetString(addQuery(api, qcloudPlayParams(auth["psign"])), h)
 		if err != nil {
 			return media{}, err
 		}
@@ -282,9 +409,28 @@ func resolveAuth(c *util.Client, auth map[string]string, h map[string]string) (m
 			SecurityToken:   auth["sts_token"],
 			Region:          firstNonEmpty(auth["region"], "cn-shanghai"),
 			AuthInfo:        auth["auth_info"],
+			AuthTimeout:     auth["auth_timeout"],
 		}
-		if info, err := shared.AliyunResolvePlayInfo(c, payload, auth["vod_video_id"], shared.AliyunPlayOptions{Headers: h}); err == nil && info.URL != "" {
-			return media{URL: info.URL}, nil
+		opts := shared.AliyunPlayOptions{
+			Headers:         h,
+			Referer:         firstNonEmpty(h["Referer"], "https://edu.51cto.com/"),
+			Origin:          firstNonEmpty(h["Origin"], "https://edu.51cto.com"),
+			Formats:         auth["formats"],
+			AuthTimeout:     auth["auth_timeout"],
+			FetchM3U8:       true,
+			RewriteM3U8Keys: true,
+		}
+		if auth["rand"] != "" {
+			opts.ExtraParams = map[string]string{"Rand": auth["rand"]}
+		}
+		if info, err := shared.AliyunResolvePlayInfo(c, payload, auth["vod_video_id"], opts); err == nil && info.URL != "" {
+			mediaURL := info.URL
+			format := firstNonEmpty(info.Format, mediaFormat(info.URL))
+			if info.M3U8Text != "" {
+				mediaURL = "data:application/vnd.apple.mpegurl;base64," + base64.StdEncoding.EncodeToString([]byte(info.M3U8Text))
+				format = "m3u8"
+			}
+			return media{URL: mediaURL, Format: format}, nil
 		}
 	}
 
@@ -294,12 +440,154 @@ func resolveAuth(c *util.Client, auth map[string]string, h map[string]string) (m
 	return media{}, fmt.Errorf("51cto auth has no supported media")
 }
 
+func requestVodPlayAuth(c *util.Client, auth map[string]string, h map[string]string) (map[string]string, error) {
+	reqHeaders := cloneHeaders(h)
+	reqHeaders["Accept"] = "application/json, text/plain, */*"
+	reqHeaders["Referer"] = firstNonEmpty(h["Referer"], "https://edu.51cto.com/")
+
+	playID := firstNonEmpty(auth["type"], auth["playid"], "course")
+	if playID == "courseindex" {
+		playID = "course"
+	}
+	lessonID := auth["lesson_id"]
+	lessonType := auth["lesson_type"]
+	if strings.HasPrefix(playID, "wejob") || strings.HasPrefix(lessonType, "wejob") {
+		reqHeaders["Referer"] = firstNonEmpty(trainingLessonURL("", auth["train_course_id"], lessonID), reqHeaders["Referer"])
+	}
+	candidates := []map[string]string{
+		{"type": playID, "lesson_id": lessonID, "id": auth["vod_video_id"], "sign": auth["psign"], "lesson_type": lessonType},
+		{"type": playID, "lesson_id": lessonID, "id": auth["vod_video_id"], "sign": auth["psign"]},
+		{"playid": playID, "lesson_id": lessonID, "id": auth["vod_video_id"], "sign": auth["psign"], "lesson_type": lessonType},
+		{"playid": playID, "vod_video_id": auth["vod_video_id"], "vod_video_id_auth": auth["psign"]},
+		{"play_id": playID, "vod_video_id": auth["vod_video_id"], "vod_video_id_auth": auth["psign"]},
+		{"playid": playID, "vid": auth["vod_video_id"], "auth": auth["psign"]},
+		{"playid": playID, "fileid": auth["vod_video_id"], "sign": auth["psign"]},
+	}
+	var lastErr error
+	for _, params := range candidates {
+		params = compactParams(params)
+		if len(params) == 0 {
+			continue
+		}
+		body, err := c.GetString(addQuery(urlVodPlayAuthAPI, params), reqHeaders)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		var payload any
+		if err := json.Unmarshal([]byte(body), &payload); err != nil {
+			lastErr = err
+			continue
+		}
+		if out := authFromVodPayload(payload, auth); len(out) > 0 && (out["app_id"] != "" || out["psign"] != "" || out["vod_video_id"] != "") {
+			return out, nil
+		}
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, fmt.Errorf("51cto vod-play-auth returned no playable auth")
+}
+
+func authFromVodPayload(payload any, fallback map[string]string) map[string]string {
+	merged := map[string]any{}
+	for k, v := range fallback {
+		if v != "" {
+			merged[k] = v
+		}
+	}
+	for _, m := range walkMaps(payload) {
+		for k, v := range m {
+			if textValue(merged, k) == "" {
+				merged[k] = v
+			}
+		}
+	}
+	out := authFromMap(merged)
+	if s := deepFindText(payload, "appID", "appId", "app_id", "appid"); s != "" {
+		out["app_id"] = s
+	}
+	if s := deepFindText(payload, "playAuth", "play_auth", "psign", "p_sign", "pSign", "sign"); s != "" {
+		out["psign"] = s
+	}
+	if s := deepFindText(payload, "vodVideoId", "vod_video_id", "fileId", "fileid", "vid", "videoId", "video_id"); s != "" {
+		out["vod_video_id"] = s
+		out["file_id"] = s
+	}
+	if out["file_id"] == "" {
+		out["file_id"] = out["vod_video_id"]
+	}
+	if decoded := decodePlayAuth(out["psign"]); len(decoded) > 0 {
+		for k, v := range decoded {
+			if v != "" {
+				out[k] = v
+			}
+		}
+	}
+	return out
+}
+
+func qcloudPlayParams(psign string) map[string]string {
+	params := map[string]string{"keyId": "1", "psign": psign}
+	if overlayKey := randomHex(32); overlayKey != "" {
+		if ciphered := rsaEncryptOverlay(overlayKey); ciphered != "" {
+			params["cipheredOverlayKey"] = ciphered
+		} else {
+			params["overlayKey"] = overlayKey
+		}
+	}
+	if overlayIV := randomHex(32); overlayIV != "" {
+		if ciphered := rsaEncryptOverlay(overlayIV); ciphered != "" {
+			params["cipheredOverlayIv"] = ciphered
+		} else {
+			params["overlayIv"] = overlayIV
+		}
+	}
+	return params
+}
+
+func mergeAuth(base, overlay map[string]string) map[string]string {
+	out := map[string]string{}
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range overlay {
+		if strings.TrimSpace(v) != "" {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+func compactParams(in map[string]string) map[string]string {
+	out := map[string]string{}
+	for k, v := range in {
+		if strings.TrimSpace(v) != "" {
+			out[k] = strings.TrimSpace(v)
+		}
+	}
+	return out
+}
+
 func authFromMap(m map[string]any) map[string]string {
 	out := map[string]string{
-		"app_id":   textValue(m, "app_id", "appId", "appID", "appid"),
-		"file_id":  textValue(m, "file_id", "fileId", "fileID", "fileid", "vid", "video_id", "videoId"),
-		"psign":    textValue(m, "psign", "pSign", "p_sign", "playAuth", "play_auth", "sign", "token"),
-		"play_url": textValue(m, "play_url", "playUrl", "url"),
+		"app_id":            textValue(m, "app_id", "appId", "appID", "appid", "appIdStr"),
+		"file_id":           textValue(m, "file_id", "fileId", "fileID", "fileid", "qcloud_file_id", "qcloudFileId", "fileIdStr", "vid", "video_id", "videoId"),
+		"psign":             textValue(m, "psign", "pSign", "p_sign", "playSign", "play_sign", "playAuth", "play_auth", "vod_video_id_auth", "vodVideoIdAuth", "auth", "sign", "token"),
+		"play_url":          textValue(m, "play_url", "playUrl", "PlayURL", "url", "m3u8", "m3u8_url"),
+		"vod_video_id":      textValue(m, "vod_video_id", "vodVideoId", "vodVideoID", "VideoId", "videoId", "videoID", "video_id", "vid", "media_id", "mediaId", "mediaID", "aliyun_vid", "aliyunVid"),
+		"access_key_id":     textValue(m, "AccessKeyId", "AccessKeyID", "accessKeyId", "access_key_id", "access_id", "ky"),
+		"access_key_secret": textValue(m, "AccessKeySecret", "accessKeySecret", "access_key_secret", "access_secret", "sc"),
+		"sts_token":         textValue(m, "SecurityToken", "securityToken", "sts_token", "stsToken", "tk"),
+		"region":            textValue(m, "Region", "region", "regionId", "domain_region"),
+		"auth_info":         textValue(m, "AuthInfo", "authInfo", "auth_info"),
+		"auth_timeout":      textValue(m, "AuthTimeout", "authTimeout", "auth_timeout"),
+		"formats":           textValue(m, "Formats", "formats"),
+		"rand":              textValue(m, "Rand", "rand"),
+		"type":              textValue(m, "type", "playid", "play_id"),
+		"lesson_id":         textValue(m, "lesson_id", "lessonId", "lessonID", "lid"),
+		"lesson_type":       textValue(m, "lesson_type", "lessonType", "lessonTypeStr"),
+		"playerid":          textValue(m, "playerid", "playerId"),
 	}
 	if decoded := decodePlayAuth(out["psign"]); len(decoded) > 0 {
 		for k, v := range decoded {
@@ -316,27 +604,33 @@ func parseAliPlayParam(text string) map[string]string {
 	if m == nil {
 		return nil
 	}
-	out := map[string]string{}
+	raw := map[string]any{}
 	for _, pair := range jsPairRe.FindAllStringSubmatch(m[1], -1) {
-		out[strings.ToLower(pair[1])] = pair[2]
+		value := firstNonEmpty(pair[2:]...)
+		raw[pair[1]] = value
+		raw[strings.ToLower(pair[1])] = value
 	}
-	return map[string]string{"app_id": firstNonEmpty(out["appid"], out["app_id"]), "file_id": firstNonEmpty(out["fileid"], out["file_id"], out["vid"]), "psign": firstNonEmpty(out["psign"], out["playsign"], out["playauth"], out["token"]), "play_url": out["url"]}
+	return authFromMap(raw)
 }
 
 func decodePlayAuth(s string) map[string]string {
 	if s == "" || strings.HasPrefix(s, "http") {
 		return nil
 	}
-	padded := s + strings.Repeat("=", (4-len(s)%4)%4)
+	var m map[string]any
+	trimmed := strings.TrimSpace(s)
+	if strings.HasPrefix(trimmed, "{") && strings.HasSuffix(trimmed, "}") {
+		if json.Unmarshal([]byte(trimmed), &m) != nil {
+			return nil
+		}
+		return authFromMap(m)
+	}
+	padded := trimmed + strings.Repeat("=", (4-len(trimmed)%4)%4)
 	b, err := base64.StdEncoding.DecodeString(padded)
 	if err != nil {
 		b, err = base64.URLEncoding.DecodeString(padded)
 	}
-	if err != nil {
-		return nil
-	}
-	var m map[string]any
-	if json.Unmarshal(b, &m) != nil {
+	if err != nil || json.Unmarshal(b, &m) != nil {
 		return nil
 	}
 	return authFromMap(m)
@@ -347,13 +641,24 @@ func mediaFromText(text string) media {
 	if m := mediaURLRe.FindStringSubmatch(text); m != nil {
 		text = normalizeText(m[0])
 	}
+	text = normalizeURL(text, "https://edu.51cto.com/")
 	lower := strings.ToLower(text)
-	if !strings.HasPrefix(lower, "http") || !(strings.Contains(lower, ".m3u8") || strings.Contains(lower, ".mp4")) {
+	if !strings.HasPrefix(lower, "http") {
 		return media{}
 	}
-	format := "mp4"
-	if strings.Contains(lower, ".m3u8") {
-		format = "m3u8"
+	format := mediaFormat(text)
+	if format == "" {
+		return media{}
 	}
 	return media{URL: text, Format: format}
+}
+
+func videoFromText(text string) media {
+	m := mediaFromText(text)
+	switch m.Format {
+	case "m3u8", "mp4", "flv", "mp3", "m4a", "aac":
+		return m
+	default:
+		return media{}
+	}
 }

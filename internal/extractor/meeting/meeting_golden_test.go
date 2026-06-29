@@ -28,6 +28,55 @@ func TestExtractMock(t *testing.T) {
 	goldenAssertMedia(t, "meeting", got)
 }
 
+func TestParseMeetingBatchText(t *testing.T) {
+	items := parseMeetingBatchText(`标题：第一节课
+链接：https://meeting.tencent.com/cw/ABC123
+密码：pass123
+
+第二节课
+https://meeting.tencent.com/live/456789?pwd=livepwd
+`)
+	if len(items) != 2 {
+		t.Fatalf("items = %d, want 2: %#v", len(items), items)
+	}
+	if items[0].URL != "https://meeting.tencent.com/cw/ABC123" || items[0].Password != "pass123" || items[0].Title != "第一节课" {
+		t.Fatalf("unexpected first item: %#v", items[0])
+	}
+	if items[1].URL != "https://meeting.tencent.com/live/456789?pwd=livepwd" || items[1].Password != "livepwd" || items[1].Title != "第二节课" {
+		t.Fatalf("unexpected second item: %#v", items[1])
+	}
+}
+
+func TestExtractBatchText(t *testing.T) {
+	routes := map[string]json.RawMessage{
+		"POST /wemeet-tapi/v2/meetlog/public/detail/common-record-info":       json.RawMessage(`{"data":{"title":"Record","sharing_id":"SHARE1","recordings":[{"recording_id":"REC1"}]}}`),
+		"GET /wemeet-cloudrecording-webapi/v1/sign":                           json.RawMessage(`{"data":{"origin_video_url":"https://media.example.com/meeting/rec1.mp4","title":"录制.mp4","id":"REC1"}}`),
+		"POST /wemeet-tapi/liveportal/v2/query_live_stream":                   json.RawMessage(`{"data":{"room_id":"ROOM1"}}`),
+		"POST /wemeet-tapi/liveportal/v2/query_meeting_room_live_replay_info": json.RawMessage(`{"data":{"replay_url_long":"https://media.example.com/meeting/live.m3u8","title":"直播回放"}}`),
+		"__default": json.RawMessage(`{"data":{}}`),
+	}
+	goldenInstallTransport(t, routes)
+	jar := goldenNewJar(t)
+	raw := `标题：录播课
+链接：https://meeting.tencent.com/cw/ABC123
+密码：secret
+
+直播课
+https://meeting.tencent.com/live/456789?pwd=livepwd`
+	got, err := (&Meeting{}).Extract(raw, &extractor.ExtractOpts{Cookies: jar})
+	if err != nil {
+		t.Fatalf("Extract returned error: %v", err)
+	}
+	if len(got.Entries) != 2 {
+		t.Fatalf("entries = %d, want 2: %#v", len(got.Entries), got.Entries)
+	}
+	assertMeetingEntryURL(t, got, "https://media.example.com/meeting/rec1.mp4")
+	assertMeetingEntryURL(t, got, "https://media.example.com/meeting/live.m3u8")
+	if !strings.HasPrefix(got.Entries[0].Title, "录播课_") {
+		t.Fatalf("batch title prefix not merged: %q", got.Entries[0].Title)
+	}
+}
+
 func goldenLoadRoutes(t *testing.T) map[string]json.RawMessage {
 	t.Helper()
 	data, err := os.ReadFile("testdata/sample.json")
@@ -152,4 +201,18 @@ func goldenAssertMedia(t *testing.T, site string, got *extractor.MediaInfo) {
 			t.Fatalf("Entries[%d] has no streams or child entries: %#v", i, entry)
 		}
 	}
+}
+
+func assertMeetingEntryURL(t *testing.T, got *extractor.MediaInfo, want string) {
+	t.Helper()
+	for _, entry := range got.Entries {
+		for _, stream := range entry.Streams {
+			for _, u := range stream.URLs {
+				if u == want {
+					return
+				}
+			}
+		}
+	}
+	t.Fatalf("entry URL %s not found in %#v", want, got.Entries)
 }

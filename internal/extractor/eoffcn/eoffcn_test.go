@@ -50,3 +50,64 @@ func TestCollectOldOrdersAndMatch(t *testing.T) {
 		t.Fatalf("matched order = %#v, want SPU-1/199.5", got)
 	}
 }
+
+func TestResolveEoffcnWhiteboardKeepsMediaAndStreamExtra(t *testing.T) {
+	payload := map[string]any{
+		"data": map[string]any{
+			"video_type": 6,
+			"live_url":   "https://cdn.example.com/replay/index.m3u8",
+			"board_context": map[string]any{
+				"api_url": "https://pcvod.offcncloud.com/replay?room_num=ROOM-NUM&room_id=ROOM-ID&account=acct&k=key",
+			},
+		},
+	}
+
+	playback := resolveEoffcnPlayback(nil, nil, payload)
+	if playback.URL != "https://cdn.example.com/replay/index.m3u8" {
+		t.Fatalf("URL = %q, want media m3u8", playback.URL)
+	}
+	if playback.Extra["whiteboard"] != true {
+		t.Fatalf("whiteboard extra = %#v, want true", playback.Extra["whiteboard"])
+	}
+	if playback.Extra["whiteboard_api_url"] != "https://pcvod.offcncloud.com/replay?room_num=ROOM-NUM&room_id=ROOM-ID&account=acct&k=key" {
+		t.Fatalf("whiteboard_api_url = %#v", playback.Extra["whiteboard_api_url"])
+	}
+
+	info := mediaInfoWithExtra("board", playback.URL, eoffcnStreamHeaders(map[string]string{"Referer": "https://www.eoffcn.com"}, playback.URL, playback.Extra), playback.Extra)
+	stream := info.Streams["best"]
+	if stream.Extra["whiteboard"] != true {
+		t.Fatalf("stream extra whiteboard = %#v, want true", stream.Extra["whiteboard"])
+	}
+	if stream.Format != "m3u8" || !stream.NeedMerge {
+		t.Fatalf("stream format/merge = %s/%v, want m3u8/true", stream.Format, stream.NeedMerge)
+	}
+	if got := stream.Headers["Referer"]; got != "https://www.eoffcn.com" {
+		t.Fatalf("Referer = %q, want original media referer", got)
+	}
+}
+
+func TestExtractWatchDemandPlaybackBoardOnly(t *testing.T) {
+	playback := extractWatchDemandPlayback(`{"data":{"video_type":6,"white_board_play_url":"https://pcvod.offcncloud.com/replay?room_num=RN&room_id=RID&account=acct&k=key"}}`)
+	if playback.URL != "https://pcvod.offcncloud.com/replay?room_num=RN&room_id=RID&account=acct&k=key" {
+		t.Fatalf("URL = %q, want board API URL", playback.URL)
+	}
+	if playback.Extra["whiteboard"] != true {
+		t.Fatalf("whiteboard extra = %#v, want true", playback.Extra["whiteboard"])
+	}
+	params, ok := playback.Extra["whiteboard_params"].(map[string]string)
+	if !ok {
+		t.Fatalf("whiteboard_params = %#v, want map[string]string", playback.Extra["whiteboard_params"])
+	}
+	if params["room_num"] != "RN" || params["room_id"] != "RID" || params["account"] != "acct" || params["k"] != "key" {
+		t.Fatalf("whiteboard params = %#v", params)
+	}
+
+	info := mediaInfoWithExtra("board-only", playback.URL, eoffcnStreamHeaders(map[string]string{"Referer": "https://www.eoffcn.com"}, playback.URL, playback.Extra), playback.Extra)
+	stream := info.Streams["best"]
+	if stream.Format != "html" {
+		t.Fatalf("stream format = %q, want html", stream.Format)
+	}
+	if got := stream.Headers["Referer"]; got != eoffcnBoardReferer {
+		t.Fatalf("Referer = %q, want %q", got, eoffcnBoardReferer)
+	}
+}

@@ -69,6 +69,42 @@ func (sess *mddclassSession) mediaHeaders(video mddclassVideo) map[string]string
 	return headers
 }
 
+func (sess *mddclassSession) ocsMediaHeaders(video mddclassVideo, coursewareInfo map[string]any) map[string]string {
+	headers := map[string]string{
+		"User-Agent":      mddclassOCSUserAgent,
+		"Accept":          "*/*",
+		"Referer":         mddclassOCSReferer,
+		"Origin":          mddclassOCSOrigin,
+		"Hujiang-App-Key": mddclassPCWebKey,
+		"SKsight-App-Key": mddclassPCWebKey,
+		"X-CC-COMPANY":    mddclassFirstText(video.CompanyDomain, sess.CompanyDomain, mddclassCompanyDomain),
+		"Cookie":          sess.Cookie,
+		"cookie":          sess.Cookie,
+	}
+	if value := mddclassFirstText(coursewareInfo["ocsAccessToken"], sess.Auth["ocsAccessToken"], sess.Auth["ocs_access_token"], sess.Auth["ocsPlayerAccessToken"], sess.Auth["playerAccessToken"], sess.Auth["access_token"]); value != "" {
+		headers["Authorization"] = value
+		headers["AccessToken"] = value
+		headers["X-Access-Token"] = value
+	}
+	if value := mddclassFirstText(coursewareInfo["tenantId"], coursewareInfo["tenant_id"], sess.Auth["tenantId"], sess.Auth["tenant_id"]); value != "" {
+		headers["tenantId"] = value
+		headers["Tenant-Id"] = value
+		headers["X-Tenant-Id"] = value
+	}
+	if value := mddclassFirstText(coursewareInfo["coursewareId"], coursewareInfo["courseware_id"], coursewareInfo["courseWareId"], coursewareInfo["ocsId"], coursewareInfo["ocs_id"]); value != "" {
+		headers["coursewareId"] = value
+		headers["Courseware-Id"] = value
+		headers["X-Courseware-Id"] = value
+	}
+	if value := mddclassFirstText(coursewareInfo["userSign"], coursewareInfo["user_sign"], sess.Auth["userSign"], sess.Auth["user_sign"]); value != "" {
+		headers["X-User-Sign"] = value
+		headers["userSign"] = value
+		headers["User-Sign"] = value
+	}
+	sess.applyAuthHeaders(headers)
+	return headers
+}
+
 func (sess *mddclassSession) applyAuthHeaders(headers map[string]string) {
 	if value := mddclassFirstText(sess.Auth["userSign"], sess.Auth["user_sign"]); value != "" {
 		headers["X-User-Sign"] = value

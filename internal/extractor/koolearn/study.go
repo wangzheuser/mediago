@@ -20,44 +20,15 @@ import (
 	"github.com/Sophomoresty/mediago/internal/util"
 )
 
-// study.koolearn.com URL templates. Source: Koolearn_Course/Chuguo/Tiny class
-// attributes. %s placeholders preserve the source's positional order.
+// study.koolearn.com URL templates used by the active video-resolution pipeline.
 const (
-	// Koolearn_Course
-	urlCourse        = "https://study.koolearn.com/%s/course/%s/%s"                                                                          // ctype, cid, order
-	urlCourseLive    = "https://study.koolearn.com/common/live/data/%s?orderNo=%s&id=-1&level=1"                                             // cid, order
-	urlCourseLiveSub = "https://study.koolearn.com/common/live/data/%s?orderNo=%s&id=%s&level=2"                                             // cid, order, node_id
-	urlCourseCat     = "https://study.koolearn.com/%s/course_kc_data/%s/%s?pathId=%s&nodeId=-1&level=1"                                      // ctype, cid, order, path_id
-	urlCourseLesson  = "https://study.koolearn.com/%s/course_kc_data/%s/%s?pathId=%s&nodeId=%s&level=%d&learningSubjectId=%s"                // ctype, cid, order, path_id, inner_node_id, level, node_id
-	urlChapter       = "https://study.koolearn.com/tongyong/diagnostic/lesson/chapter?orderNo=%s&productId=%s&saId=%s"                       // order, cid, path_id
-	urlUnit          = "https://study.koolearn.com/tongyong/diagnostic/lesson/unit?lsId=%s&orderNo=%s&productId=%s&saId=%s"                  // ls_id, order, cid, path_id
-	urlNode          = "https://study.koolearn.com/tongyong/diagnostic/lesson/node?unitId=%s&lsId=%s&orderNo=%s&productId=%s&saId=%s"        // unit_id, ls_id, order, cid, path_id
-	urlGetVideoURL   = "https://media-vod.roombox.xdf.cn/v1/play/getVideoUrl"                                                                // POST
-	urlNewVideoInfo  = "https://study.koolearn.com/common/learning/getNewVideoInfo?courseId=%s&nodeId=%s&urlPart=%s&productId=%s&orderNo=%s" // user_cid, video_id, ctype, cid, order
-	urlLivePlayback  = "https://api.roombox.xdf.cn/api/client/module/info/playback?classroomId=%s"                                           // live_id
-	urlVipInfo       = "https://vip.koolearn.com/api/classlist/list?lessonType=2&type=end&productId=%s&orderNo=%s"                           // cid, order
-	urlVipSign       = "https://vip.koolearn.com/api/live/url/student/review?classId=%s"                                                     // live_id
-	urlVipVideo      = "https://vip.koolearn.com/api/live/replayVideo/%s/%s?signature=%s"                                                    // consumer_type, live_id, sign
+	urlGetVideoURL  = "https://media-vod.roombox.xdf.cn/v1/play/getVideoUrl"                                                                // POST
+	urlNewVideoInfo = "https://study.koolearn.com/common/learning/getNewVideoInfo?courseId=%s&nodeId=%s&urlPart=%s&productId=%s&orderNo=%s" // user_cid, video_id, ctype, cid, order
+	urlLivePlayback = "https://api.roombox.xdf.cn/api/client/module/info/playback?classroomId=%s"                                           // live_id
+	urlVipSign      = "https://vip.koolearn.com/api/live/url/student/review?classId=%s"                                                     // live_id
+	urlVipVideo     = "https://vip.koolearn.com/api/live/replayVideo/%s/%s?signature=%s"                                                    // consumer_type, live_id, sign
 
-	// Koolearn_Chuguo
-	urlChuguoSubject  = "https://study.koolearn.com/chuguo/lesson/%s?orderNo=%s&currentModuleId=%s"                                                                                 // cid, order, mod_id
-	urlChuguoCourse   = "https://study.koolearn.com/chuguo/index/course-module/%s/%s"                                                                                               // order, cid
-	urlChuguoCat      = "https://study.koolearn.com/chuguo/lesson/nodes?productId=%s&moduleId=%s&learningSubjectId=%s&courseId=%s&level=1"                                          // cid, mod_id, sub_id, user_cid
-	urlChuguoLesson   = "https://study.koolearn.com/chuguo/lesson/nodes?productId=%s&moduleId=%s&learningSubjectId=%s&courseId=%s&nodeId=%s&level=%d&isPushed=%s"                   // cid, mod_id, sub_id, user_cid, node_id, level, is_push
-	urlChuguoNewVideo = "https://study.koolearn.com/common/learning/getNewVideoInfo?courseId=%s&nodeId=%s&urlPart=%s&productId=%s&orderNo=%s&isRecommend=%d"                       // user_cid, video_id, ctype, cid, order, is_recommend
-	urlChuguoLive     = "https://study.koolearn.com/chuguo/live/data/%s/%s"                                                                                                         // cid, order
-	urlChuguoLiveSub  = "https://study.koolearn.com/chuguo/live/data/%s/%s?id=%s"                                                                                                    // cid, order, node_id
-	urlChuguoIndex    = "https://study.koolearn.com/chuguo/index/%s?orderNo=%s"                                                                                                      // cid, order
-	urlChuguoNewIndex = "https://study.koolearn.com/chuguo/index/new/index?productId=%s&orderNo=%s"                                                                                  // cid, order
-
-	// Koolearn_Tiny
-	urlTinyTitle  = "https://study.koolearn.com/chuguo/small-class/index/top-msg?orderNo=%s&productId=%s"                                                       // order, cid
-	urlTinyCourse = "https://study.koolearn.com/chuguo/small-class/index/course-module?orderNo=%s&productId=%s"                                                 // order, cid
-	urlTinyCat    = "https://study.koolearn.com/chuguo/small-class/lesson/nodes?itemId=%s&orderNo=%s&productId=%s&level=1&type=%s"                              // mod_id, order, cid, mod_type
-	urlTinyLesson = "https://study.koolearn.com/chuguo/small-class/lesson/nodes?productId=%s&orderNo=%s&itemId=%s&type=%s&learningSubjectId=%s&level=%d"        // cid, order, node_id, mod_type, mod_id, level
-	urlTinyLive   = "https://vip.koolearn.com/api/live/replayVideo/%s/%s?signature=%s"                                                                          // lid1, lid2, sign
-
-	urlUserFind = "https://study.koolearn.com/common/find/user"
+	urlChuguoNewVideo = "https://study.koolearn.com/common/learning/getNewVideoInfo?courseId=%s&nodeId=%s&urlPart=%s&productId=%s&orderNo=%s&isRecommend=%d" // user_cid, video_id, ctype, cid, order, is_recommend
 )
 
 // maxTreeDepth caps the course-tree recursion. Source descends levels 2->3->4,
@@ -88,6 +59,7 @@ type studyContext struct {
 	cid      string
 	order    string
 	ctype    string
+	brand    string
 	userCID  string
 	userID   string
 	paramURL string // Koolearn_Course self._param_url (?ct=&courseId=)

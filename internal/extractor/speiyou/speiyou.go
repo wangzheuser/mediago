@@ -83,7 +83,8 @@ func (s *Speiyou) Extract(rawURL string, opts *extractor.ExtractOpts) (*extracto
 		if playURL == "" {
 			continue
 		}
-		entries = append(entries, &extractor.MediaInfo{Site: "speiyou", Title: info.Title, Streams: map[string]extractor.Stream{"best": {Quality: "best", URLs: []string{playURL}, Format: pickFormat(playURL), Headers: map[string]string{"Referer": referer, "Origin": "owcr://classroom", "User-Agent": USER_AGENT}}}, Extra: map[string]any{"live_id": info.LiveID, "std_course_id": info.StdCourseID, "std_subject": info.StdSubject}})
+		format := pickFormat(playURL)
+		entries = append(entries, &extractor.MediaInfo{Site: "speiyou", Title: info.Title, Streams: map[string]extractor.Stream{"best": {Quality: "best", URLs: []string{playURL}, Format: format, NeedMerge: format == "m3u8", Headers: map[string]string{"Referer": referer, "Origin": "owcr://classroom", "User-Agent": USER_AGENT}}}, Extra: map[string]any{"live_id": info.LiveID, "std_course_id": info.StdCourseID, "std_subject": info.StdSubject}})
 	}
 	if len(entries) == 0 {
 		return nil, fmt.Errorf("speiyou: no playback videoUrls returned from classroom API")

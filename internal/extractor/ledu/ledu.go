@@ -14,6 +14,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -44,10 +45,16 @@ const (
 	courseMaterialsPath   = "/homepage/lessonDetail/queryCourseMaterialListV0303"
 	handoutPDFPath        = "/homepage/lessonDetail/share/handout"
 	videoInfoPath         = "/playback/v4/video/init?from=YUNXUEXI"
+	legacyRecordPath      = "/classroom-ai/record/v1/resources"
 	recordResourcesPath   = "/classroom-ai/record/v3/resources"
+	realRecordInitPath    = "/classroom/basic/v1/real-record/init/auth"
+	previewSourcePath     = "/newtask/student/task/video/getM3U8videoUrl"
+	previewBehaviorPath   = "/service-taskcenter/outside/task/getItemBehaviorData"
 	courseSubjectListPath = "/course/v1/student/course/subject-list"
 	courseListPath        = "/course/v1/student/course/list"
 	courseDetailListPath  = "/course/v1/student/course/user-live-list"
+	courseNotePath        = "/course/v1/note/%s"
+	coursePaperLinkPath   = "/futureboard/prepare/futureboard/course/paper/download"
 	classroomInitAuthPath = "/classroom/basic/v2/init/auth"
 	classroomInitStuPath  = "/classroom/basic/v2/init/student"
 	browserUA             = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
@@ -73,17 +80,18 @@ func (s *Ledu) Extract(rawURL string, opts *extractor.ExtractOpts) (*extractor.M
 	c := util.NewClient()
 	c.SetCookieJar(opts.Cookies)
 	cookie := leduCookieString(opts.Cookies)
-	studentID := firstText(cookieValue(cookie, "stuId"), cookieValue(cookie, "stuIdStr"), cookieValue(cookie, "user_id"), cookieValue(cookie, "uid"), cookieValue(cookie, "puid"), cookieValue(cookie, "pu_uid"))
+	studentID := firstText(cookieValue(cookie, "stuId"), cookieValue(cookie, "stuIdStr"), cookieValue(cookie, "LEDU_STUID_PROD"), cookieValue(cookie, "studentId"), cookieValue(cookie, "student_id"), cookieValue(cookie, "user_id"), cookieValue(cookie, "uid"), cookieValue(cookie, "puid"), cookieValue(cookie, "pu_uid"))
 	if studentID == "" {
 		return nil, fmt.Errorf("ledu requires stuId/user_id cookie")
 	}
 	headers := leduHeaders(cookie, studentID, "", "", "", "", "")
-	if _, err := leduGetJSON(c, courseAPIHost, courseSubjectListPath, map[string]string{"stuId": studentID}, headers); err != nil {
-		return nil, fmt.Errorf("ledu validate pc cookie: %w", err)
-	}
+	_, validateErr := leduGetJSON(c, courseAPIHost, courseSubjectListPath, map[string]string{"stuId": studentID}, headers)
 
 	cid := parseClassID(rawURL)
 	classes := fetchClasses(c, headers, studentID)
+	if len(classes) == 0 && validateErr != nil {
+		return nil, fmt.Errorf("ledu validate pc cookie: %w", validateErr)
+	}
 	classInfo := chooseClass(classes, cid)
 	if classInfo == nil && len(classes) > 0 {
 		classInfo = classes[0]
@@ -98,7 +106,10 @@ func (s *Ledu) Extract(rawURL string, opts *extractor.ExtractOpts) (*extractor.M
 
 	details := fetchCourseDetails(c, headers, studentID, courseID)
 	if len(details) == 0 {
-		details = append(details, classInfo)
+		details = detailItemsFromClassInfo(classInfo)
+		if len(details) == 0 {
+			details = append(details, classInfo)
+		}
 	}
 	entries := buildEntries(c, details, leduHeaders(cookie, studentID, cid, courseID, grade, "", ""))
 	if len(entries) == 0 {
@@ -122,8 +133,8 @@ func fetchClasses(c *util.Client, headers map[string]string, stuID string) []map
 	var out []map[string]any
 	seen := map[string]bool{}
 	for _, status := range []string{"1", "2", "3"} {
-		for page := 1; page <= 3; page++ {
-			payload, err := leduGetJSON(c, courseAPIHost, courseListPath, map[string]string{"order": "asc", "perPage": "50", "page": strconv.Itoa(page), "stdSubject": "", "courseStatus": status, "stuId": stuID}, headers)
+		for page := 1; page <= 50; page++ {
+			payload, err := leduGetJSON(c, courseAPIHost, courseListPath, map[string]string{"order": "asc", "perPage": "100", "page": strconv.Itoa(page), "stdSubject": "", "courseStatus": status, "stuId": stuID}, headers)
 			if err != nil {
 				break
 			}
@@ -131,6 +142,7 @@ func fetchClasses(c *util.Client, headers map[string]string, stuID string) []map
 			if len(recs) == 0 {
 				break
 			}
+			added := 0
 			for _, rec := range recs {
 				id := firstText(rec["classId"], rec["id"], rec["class_id"], rec["stdClassId"])
 				if id == "" || seen[id] {
@@ -138,11 +150,15 @@ func fetchClasses(c *util.Client, headers map[string]string, stuID string) []map
 				}
 				seen[id] = true
 				out = append(out, rec)
+				added++
 			}
-			if len(recs) < 50 {
+			if added == 0 || len(recs) < 100 {
 				break
 			}
 		}
+	}
+	if len(out) == 0 {
+		out = fetchH5Classes(c, headers)
 	}
 	return out
 }
@@ -151,19 +167,140 @@ func fetchCourseDetails(c *util.Client, headers map[string]string, stuID, course
 	var out []map[string]any
 	seen := map[string]bool{}
 	for _, typ := range []string{"1", "2", "3", "4"} {
-		payload, err := leduGetJSON(c, courseAPIHost, courseDetailListPath, map[string]string{"order": orderForType(typ), "version": "", "perPage": "50", "page": "1", "needPage": "1", "type": typ, "stdCourseId": courseID, "stuId": stuID}, headers)
-		if err != nil {
-			continue
+		for page := 1; page <= 50; page++ {
+			payload, err := leduGetJSON(c, courseAPIHost, courseDetailListPath, map[string]string{"order": orderForType(typ), "version": "", "perPage": "100", "page": strconv.Itoa(page), "needPage": "1", "type": typ, "stdCourseId": courseID, "stuId": stuID}, headers)
+			if err != nil {
+				break
+			}
+			recs := extractRecords(extractPayload(payload))
+			if len(recs) == 0 {
+				break
+			}
+			added := 0
+			for _, rec := range recs {
+				key := firstText(rec["liveId"], rec["taskId"], rec["noteId"], rec["paperId"], rec["coursewareId"], rec["liveName"]) + ":" + typ
+				if key == ":" || seen[key] {
+					continue
+				}
+				seen[key] = true
+				rec["detailType"] = typ
+				out = append(out, rec)
+				added++
+			}
+			if added == 0 || len(recs) < 100 {
+				break
+			}
 		}
-		for _, rec := range extractRecords(extractPayload(payload)) {
-			key := firstText(rec["liveId"], rec["taskId"], rec["noteId"], rec["paperId"], rec["coursewareId"], rec["liveName"]) + ":" + typ
-			if key == ":" || seen[key] {
+	}
+	return out
+}
+
+func fetchH5Classes(c *util.Client, headers map[string]string) []map[string]any {
+	var out []map[string]any
+	seen := map[string]bool{}
+	for _, status := range []string{"1", "2", "3"} {
+		for page := 1; page <= 50; page++ {
+			payloads := []map[string]any{
+				{"classStatus": status, "pageSize": 100, "page": page},
+				{"pageSize": 100, "pageNo": page, "classStatus": status},
+				{"pageSize": 100, "pageNum": page, "classStatus": status},
+			}
+			var recs []map[string]any
+			for _, body := range payloads {
+				payload, err := leduPostJSON(c, appHost, h5GetClassListPath, body, headers)
+				if err != nil {
+					continue
+				}
+				recs = extractRecords(extractPayload(payload))
+				if len(recs) > 0 {
+					break
+				}
+			}
+			if len(recs) == 0 {
+				break
+			}
+			added := 0
+			for _, rec := range recs {
+				id := firstText(rec["classId"], rec["id"], rec["class_id"], rec["stdClassId"])
+				if id == "" || seen[id] {
+					continue
+				}
+				seen[id] = true
+				out = append(out, rec)
+				added++
+			}
+			if added == 0 || len(recs) < 100 {
+				break
+			}
+		}
+	}
+	if len(out) == 0 {
+		for _, body := range []map[string]any{
+			{"pageSize": 100, "pageNo": 1},
+			{"pageSize": 100, "page": 1},
+			{},
+		} {
+			payload, err := leduPostEncryptedAppJSON(c, getClassListPath, body, headers)
+			if err != nil {
 				continue
 			}
-			seen[key] = true
-			rec["detailType"] = typ
-			out = append(out, rec)
+			for _, rec := range extractRecords(extractPayload(payload)) {
+				id := firstText(rec["classId"], rec["id"], rec["class_id"], rec["stdClassId"])
+				if id == "" || seen[id] {
+					continue
+				}
+				seen[id] = true
+				out = append(out, rec)
+			}
+			if len(out) > 0 {
+				break
+			}
 		}
+	}
+	return out
+}
+
+func detailItemsFromClassInfo(classInfo map[string]any) []map[string]any {
+	if classInfo == nil {
+		return nil
+	}
+	var curricula []map[string]any
+	for _, key := range []string{"curriculumList", "curriculumInfos", "curriculums", "curriculumDTOList", "stuCurriculumNumberListVos", "stuCurriculumNumberListVOs"} {
+		if items := extractRecords(classInfo[key]); len(items) > 0 {
+			curricula = items
+			break
+		}
+	}
+	if len(curricula) == 0 {
+		return nil
+	}
+	registIDs := uniqueLeduTexts(valuesFromAny(firstNonNil(classInfo["registIdList"], classInfo["registIds"], classInfo["registerIds"], classInfo["registId"])))
+	out := make([]map[string]any, 0, len(curricula))
+	for i, curriculum := range curricula {
+		detail := cloneAnyMap(classInfo)
+		delete(detail, "curriculumList")
+		delete(detail, "curriculumInfos")
+		delete(detail, "curriculums")
+		delete(detail, "curriculumDTOList")
+		for k, v := range curriculum {
+			detail[k] = v
+		}
+		if detail["classId"] == nil {
+			detail["classId"] = firstText(classInfo["classId"], classInfo["id"], classInfo["class_id"], classInfo["stdClassId"])
+		}
+		if detail["curriculumId"] == nil {
+			detail["curriculumId"] = firstText(curriculum["curriculum_id"], curriculum["coursewareCurriculumId"], curriculum["courseId"], curriculum["id"])
+		}
+		if detail["curriculumNo"] == nil {
+			detail["curriculumNo"] = firstText(curriculum["curriculum_no"], curriculum["curriculumNum"], curriculum["number"], strconv.Itoa(i+1))
+		}
+		if detail["registId"] == nil {
+			detail["registId"] = firstText(curriculum["regist_id"], curriculum["registerId"], pickIndex(registIDs, i))
+		}
+		if detail["liveName"] == nil {
+			detail["liveName"] = firstText(curriculum["curriculumName"], curriculum["curriculumDisplayName"], curriculum["cName"], curriculum["name"], curriculum["title"], fmt.Sprintf("lesson_%d", i+1))
+		}
+		out = append(out, detail)
 	}
 	return out
 }
@@ -178,27 +315,34 @@ func buildEntries(c *util.Client, details []map[string]any, headers map[string]s
 	for i, detail := range details {
 		roots := []map[string]any{detail}
 		liveID := firstText(detail["liveId"], detail["live_id"])
+		playbackHeaders := cloneHeaders(headers)
 
-		// 1. classroomInitAuth -- critical precondition for video playback
+		// 1. classroomInitAuth -- critical precondition for video playback.
+		// The Python flow updates the PC classroom context with initData before
+		// calling init/student and playback/video/init; keep that context on the
+		// per-lesson headers rather than discarding it after parsing roots.
 		if liveID != "" {
-			ctx := cloneHeaders(headers)
-			ctx["liveId"] = liveID
-			ctx["tutorId"] = firstText(detail["tutorId"], detail["tutor_id"])
-			if authPayload, err := classroomInitAuth(c, ctx, liveID); err == nil {
+			playbackHeaders["liveId"] = liveID
+			playbackHeaders["tutorId"] = firstText(detail["tutorId"], detail["tutor_id"])
+			if authPayload, err := classroomInitAuth(c, playbackHeaders, liveID); err == nil {
 				authToken, initData := initAuthTokens(authPayload)
-				_ = authToken // token is set via response headers in real flow
+				if authToken != "" {
+					playbackHeaders["token"] = authToken
+					playbackHeaders["authorization"] = authToken
+					playbackHeaders["Authorization"] = "Bearer " + authToken
+					playbackHeaders["login-token"] = authToken
+				}
 				if initData != nil {
+					applyLeduInitContext(playbackHeaders, initData)
 					roots = append(roots, nestedMaps(initData)...)
 				}
+				_, _ = leduGetJSON(c, onlineAPIHost, classroomInitStuPath, nil, playbackHeaders)
 			}
 		}
 
 		// 2. Video init (existing path)
 		if liveID != "" {
-			ctx := cloneHeaders(headers)
-			ctx["liveId"] = liveID
-			ctx["tutorId"] = firstText(detail["tutorId"], detail["tutor_id"])
-			if payload, err := leduGetJSON(c, onlineAPIHost, videoInfoPath, nil, ctx); err == nil {
+			if payload, err := leduGetJSON(c, onlineAPIHost, videoInfoPath, nil, playbackHeaders); err == nil {
 				roots = append(roots, nestedMaps(extractPayload(payload))...)
 			}
 		}
@@ -233,33 +377,97 @@ func buildEntries(c *util.Client, details []map[string]any, headers map[string]s
 
 		// 5. recordResources -- for recorded video URLs (encUrl/m3u8Url with encKey/encIv)
 		resourceID := firstText(detail["resourceId"], detail["resource_id"], detail["cloudLearnVideoResourceId"])
+		seenResourceIDs := map[string]bool{}
 		if resourceID != "" {
-			if recPayload := fetchRecordResources(c, headers, resourceID); recPayload != nil {
+			seenResourceIDs[resourceID] = true
+			if recPayload := fetchRecordResources(c, playbackHeaders, resourceID); recPayload != nil {
 				roots = append(roots, nestedMaps(recPayload)...)
+			}
+		}
+
+		// 5a. Lesson-detail scene nodes can contain their own playback or
+		// record identifiers. Python normalizes these into video_info before
+		// dispatching download_playback/download_record; hydrate them here so
+		// later media collection sees actual source URLs.
+		seenPlaybackLiveIDs := map[string]bool{}
+		if liveID != "" {
+			seenPlaybackLiveIDs[liveID] = true
+		}
+		for _, node := range nestedMaps(roots) {
+			nodeLiveID := firstText(node["liveId"], node["live_id"])
+			if nodeLiveID != "" && !seenPlaybackLiveIDs[nodeLiveID] {
+				seenPlaybackLiveIDs[nodeLiveID] = true
+				ctx := cloneHeaders(playbackHeaders)
+				applyLeduNodeContext(ctx, node)
+				ctx["liveId"] = nodeLiveID
+				if authPayload, err := classroomInitAuth(c, ctx, nodeLiveID); err == nil {
+					authToken, initData := initAuthTokens(authPayload)
+					if authToken != "" {
+						ctx["token"] = authToken
+						ctx["authorization"] = authToken
+						ctx["Authorization"] = "Bearer " + authToken
+						ctx["login-token"] = authToken
+					}
+					if initData != nil {
+						applyLeduInitContext(ctx, initData)
+						roots = append(roots, nestedMaps(initData)...)
+					}
+					_, _ = leduGetJSON(c, onlineAPIHost, classroomInitStuPath, nil, ctx)
+				}
+				if payload, err := leduGetJSON(c, onlineAPIHost, videoInfoPath, nil, ctx); err == nil {
+					roots = append(roots, nestedMaps(extractPayload(payload))...)
+				}
+			}
+			for _, rid := range []string{firstText(node["resourceId"], node["resource_id"], node["cloudLearnVideoResourceId"], node["realRecordId"], node["real_record_id"])} {
+				if rid == "" || seenResourceIDs[rid] {
+					continue
+				}
+				seenResourceIDs[rid] = true
+				if recPayload := fetchRecordResources(c, playbackHeaders, rid); recPayload != nil {
+					roots = append(roots, nestedMaps(recPayload)...)
+				}
+			}
+		}
+
+		// 5b. real-record and preview tasks. The restored Python source probes
+		// real-record init first, then falls back to record resources and preview
+		// task video APIs when task/courseware identifiers are present.
+		for _, node := range nestedMaps(roots) {
+			if recPayload := fetchRealRecordInit(c, playbackHeaders, node); recPayload != nil {
+				roots = append(roots, nestedMaps(recPayload)...)
+				if rrid := firstTextFromMaps(recPayload, "realRecordId", "real_record_id", "cloudLearnVideoResourceId", "resourceId"); rrid != "" {
+					if rr := fetchRecordResources(c, playbackHeaders, rrid); rr != nil {
+						roots = append(roots, nestedMaps(rr)...)
+					}
+				}
+			}
+			if preview := fetchPreviewMedia(c, playbackHeaders, node); preview != nil {
+				roots = append(roots, nestedMaps(preview)...)
 			}
 		}
 
 		// 6. courseMaterials -- downloadable files (PDFs, docs, etc.)
 		if classID != "" && (curriculumID != "" || liveID != "") {
-			materials := fetchCourseMaterials(c, headers, classID, curriculumID, curriculumNo, registID, stuID, puid)
+			materials := fetchCourseMaterials(c, playbackHeaders, classID, curriculumID, curriculumNo, registID, stuID, puid)
 			for _, mat := range materials {
-				murl := firstText(mat["itemUrl"], mat["fileUrl"], mat["url"], mat["downloadUrl"], mat["resourceUrl"], mat["attachmentUrl"])
+				murl := resolveLeduMaterialURL(c, playbackHeaders, mat)
 				if murl == "" || seen[murl] {
 					continue
 				}
-				if strings.HasPrefix(murl, "//") {
-					murl = "https:" + murl
-				}
-				if !strings.HasPrefix(murl, "http") {
+				murl = normalizeLeduURL(murl)
+				if murl == "" {
 					continue
 				}
 				seen[murl] = true
 				name := firstText(mat["itemName"], mat["name"], mat["title"], mat["fileName"], fmt.Sprintf("material_%03d", len(entries)+1))
 				format := mediaFormat(murl, mat)
-				stream := extractor.Stream{Quality: "best", URLs: []string{murl}, Format: format, Headers: map[string]string{"Referer": leduReferer}}
+				stream := extractor.Stream{Quality: "best", URLs: []string{murl}, Format: format, Headers: leduMediaHeaders(playbackHeaders)}
 				extra := map[string]any{"type": "material"}
 				if pid := firstText(mat["paperId"], mat["paper_id"]); pid != "" {
 					extra["paperId"] = pid
+				}
+				if noteID := firstText(mat["noteId"], mat["note_id"]); noteID != "" {
+					extra["noteId"] = noteID
 				}
 				entries = append(entries, &extractor.MediaInfo{Site: "ledu", Title: fmt.Sprintf("(%d.%d)--%s", i+1, len(entries)+1, name), Streams: map[string]extractor.Stream{"best": stream}, Extra: extra})
 			}
@@ -274,7 +482,7 @@ func buildEntries(c *util.Client, details []map[string]any, headers map[string]s
 			seen[murl] = true
 			name := firstText(node["video_name"], node["videoTitle"], node["video_title"], node["liveName"], node["taskName"], node["itemName"], node["title"], node["name"], fmt.Sprintf("item_%03d", len(entries)+1))
 			format := mediaFormat(murl, node)
-			stream := extractor.Stream{Quality: "best", URLs: []string{murl}, Format: format, Headers: map[string]string{"Referer": leduReferer}}
+			stream := extractor.Stream{Quality: "best", URLs: []string{murl}, Format: format, Headers: leduMediaHeaders(playbackHeaders)}
 			if format == "m3u8" {
 				stream.NeedMerge = true
 			}
@@ -285,6 +493,13 @@ func buildEntries(c *util.Client, details []map[string]any, headers map[string]s
 			}
 			if encIv := firstText(node["encIv"]); encIv != "" {
 				extra["encIv"] = encIv
+			}
+			if format == "m3u8" {
+				if dataURL, text, ok := prepareLeduM3U8(c, murl, node, playbackHeaders); ok {
+					stream.URLs = []string{dataURL}
+					extra["m3u8_text"] = text
+					extra["source_type"] = "m3u8_text"
+				}
 			}
 			entries = append(entries, &extractor.MediaInfo{Site: "ledu", Title: fmt.Sprintf("[%d.%d]--%s", i+1, len(entries)+1, name), Streams: map[string]extractor.Stream{"best": stream}, Extra: extra})
 		}
@@ -302,12 +517,22 @@ func leduGetJSON(c *util.Client, host, path string, params map[string]string, he
 		q.Set(k, v)
 	}
 	u.RawQuery = q.Encode()
-	body, err := c.GetString(u.String(), headers)
+	reqHeaders := decorateLeduHeaders(host, path, "GET", params, nil, headers)
+	resp, err := c.Get(u.String(), reqHeaders)
 	if err != nil {
 		return nil, err
 	}
-	var payload any
-	if err := json.Unmarshal([]byte(body), &payload); err != nil {
+	defer resp.Body.Close()
+	applyLeduResponseHeaders(headers, reqHeaders, resp.Header)
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("ledu GET %s: HTTP %d", u.String(), resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	payload, err := leduParseJSON(body)
+	if err != nil {
 		return nil, fmt.Errorf("ledu parse %s: %w", u.String(), err)
 	}
 	return payload, nil
@@ -320,21 +545,60 @@ func leduPostJSON(c *util.Client, host, path string, body map[string]any, header
 	if err != nil {
 		return nil, err
 	}
-	h := map[string]string{"Content-Type": "application/json; charset=UTF-8"}
-	for k, v := range headers {
-		h[k] = v
-	}
+	h := decorateLeduHeaders(host, path, "POST", nil, body, headers)
+	h["Content-Type"] = "application/json; charset=UTF-8"
 	resp, err := c.Post(u, bytes.NewReader(raw), h)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	applyLeduResponseHeaders(headers, h, resp.Header)
 	if resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("ledu POST %s: HTTP %d", u, resp.StatusCode)
 	}
-	var payload any
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	payload, err := leduParseJSON(respBody)
+	if err != nil {
 		return nil, fmt.Errorf("ledu parse POST %s: %w", u, err)
+	}
+	return payload, nil
+}
+
+func leduPostEncryptedAppJSON(c *util.Client, path string, body map[string]any, headers map[string]string) (any, error) {
+	u := appHost + path
+	plain, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	enc, err := leduAppAESEncrypt(string(plain))
+	if err != nil {
+		return nil, err
+	}
+	wire, err := json.Marshal(map[string]any{"encContent": enc})
+	if err != nil {
+		return nil, err
+	}
+	h := decorateLeduHeaders(appHost, path, "POST", nil, body, headers)
+	h["Content-Type"] = "application/json; charset=UTF-8"
+	resp, err := c.Post(u, bytes.NewReader(wire), h)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	applyLeduResponseHeaders(headers, h, resp.Header)
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("ledu encrypted POST %s: HTTP %d", u, resp.StatusCode)
+	}
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	payload, err := leduParseJSON(respBody)
+	if err != nil {
+		return nil, fmt.Errorf("ledu parse encrypted POST %s: %w", u, err)
 	}
 	return payload, nil
 }
@@ -372,8 +636,33 @@ func initAuthTokens(payload any) (token string, initData map[string]any) {
 		initData = root
 	}
 	// Extract token from response headers field or initData
-	token = firstText(m["token"], root["token"])
+	token = firstText(m["token"], root["token"], initData["token"], initData["authToken"], initData["loginToken"], firstTextFromMaps(initData, "token", "authToken", "loginToken", "authorization"))
 	return token, initData
+}
+
+func applyLeduInitContext(headers map[string]string, initData map[string]any) {
+	if initData == nil {
+		return
+	}
+	course := anyMap(initData["course"])
+	live := anyMap(initData["live"])
+	classInfo := anyMap(initData["classInfo"])
+	teacher := anyMap(initData["teacher"])
+	task := anyMap(initData["task"])
+	set := func(k string, vals ...any) {
+		if v := firstText(vals...); v != "" {
+			headers[k] = v
+		}
+	}
+	set("stdSubject", live["stdSubject"], course["stdSubject"])
+	set("stdGrade", course["stdGrade"], live["stdGrade"])
+	set("stdCourseId", course["stdCourseId"], task["stdCourseId"])
+	set("stdClassId", classInfo["stdClassId"], classInfo["classId"])
+	set("branchId", course["branchId"], live["areaId"])
+	set("liveId", live["liveId"], task["liveId"])
+	set("liveType", live["liveTypeString"], live["liveType"], task["liveTypeString"])
+	set("lecturerId", teacher["lecturerId"])
+	set("tutorId", teacher["tutorId"])
 }
 
 // fetchCourseMaterials calls POST cloudlearnHost/homepage/lessonDetail/queryCourseMaterialListV0303.
@@ -386,6 +675,15 @@ func fetchCourseMaterials(c *util.Client, headers map[string]string, classID, cu
 		"registId":     registID,
 		"studentId":    studentID,
 		"studentUid":   studentUID,
+	}
+	h5Params := map[string]string{"classId": classID, "curriculumId": curriculumID, "registId": registID}
+	if curriculumNo != "" {
+		h5Params["curriculumNo"] = curriculumNo
+	}
+	if payload, err := leduGetJSON(c, appHost, h5CourseMaterialsPath, h5Params, headers); err == nil {
+		if items := extractMaterialItems(extractPayload(payload)); len(items) > 0 {
+			return items
+		}
 	}
 	payload, err := leduPostJSON(c, cloudlearnHost, courseMaterialsPath, body, headers)
 	if err != nil {
@@ -400,16 +698,20 @@ func extractMaterialItems(v any) []map[string]any {
 	var out []map[string]any
 	seen := map[string]bool{}
 	for _, node := range nestedMaps(v) {
-		murl := firstText(node["itemUrl"], node["fileUrl"], node["url"], node["downloadUrl"], node["resourceUrl"], node["attachmentUrl"])
-		if murl == "" || !(strings.HasPrefix(murl, "http") || strings.HasPrefix(murl, "//")) {
+		murl := firstText(node["itemUrl"], node["fileUrl"], node["url"], node["downloadUrl"], node["resourceUrl"], node["attachmentUrl"], node["highLightItemUrl"])
+		pid := firstText(node["paperId"], node["paper_id"])
+		noteID := firstText(node["noteId"], node["note_id"])
+		if murl == "" && pid == "" && noteID == "" {
+			continue
+		}
+		if murl != "" && !(strings.HasPrefix(murl, "http") || strings.HasPrefix(murl, "//")) && pid == "" && noteID == "" {
 			continue
 		}
 		name := firstText(node["itemName"], node["name"], node["title"], node["fileName"])
-		pid := firstText(node["paperId"], node["paper_id"])
-		if name == "" && pid == "" {
+		if name == "" && pid == "" && noteID == "" {
 			continue
 		}
-		key := murl + "|" + name
+		key := firstText(murl, pid, noteID) + "|" + name
 		if seen[key] {
 			continue
 		}
@@ -432,6 +734,18 @@ func fetchQueryLessons(c *util.Client, headers map[string]string, classID, curri
 		"studentId":    studentID,
 		"studentUid":   studentUID,
 	}
+	for _, h5Body := range []map[string]any{
+		{"classId": classID, "curriculumId": curriculumID, "curriculumNo": curriculumNo, "registId": registID, "stuId": studentID, "studentId": studentID, "studentUid": studentUID},
+		{"classId": classID, "curriculumId": curriculumID, "registId": registID},
+	} {
+		payload, err := leduPostJSON(c, appHost, h5CurriculumListPath, h5Body, headers)
+		if err != nil {
+			continue
+		}
+		if lessons := extractLessonList(extractPayload(payload)); len(lessons) > 0 {
+			return lessons
+		}
+	}
 	payload, err := leduPostJSON(c, cloudlearnHost, queryLessonsPath, body, headers)
 	if err != nil {
 		return nil
@@ -443,13 +757,26 @@ func fetchQueryLessons(c *util.Client, headers map[string]string, classID, curri
 // Returns detailed lesson info with scene objects containing video resources.
 func fetchLessonDetail(c *util.Client, headers map[string]string, classID, curriculumID, curriculumNo, registID, studentID, studentUID string) any {
 	body := map[string]any{
-		"classId":        classID,
-		"registClassId":  classID,
-		"curriculumId":   curriculumID,
-		"curriculumNo":   curriculumNo,
-		"registId":       registID,
-		"studentId":      studentID,
-		"studentUid":     studentUID,
+		"classId":       classID,
+		"registClassId": classID,
+		"curriculumId":  curriculumID,
+		"curriculumNo":  curriculumNo,
+		"registId":      registID,
+		"studentId":     studentID,
+		"studentUid":    studentUID,
+	}
+	for _, h5Body := range []map[string]any{
+		{"classId": classID, "registClassId": classID, "curriculumId": curriculumID, "curriculumNo": curriculumNo, "registId": registID, "stuId": studentID, "studentId": studentID, "studentUid": studentUID},
+		{"classId": classID, "curriculumId": curriculumID, "registId": registID},
+	} {
+		payload, err := leduPostJSON(c, appHost, h5LessonDetailPath, h5Body, headers)
+		if err != nil {
+			continue
+		}
+		data := extractPayload(payload)
+		if hasUsefulMap(data) {
+			return data
+		}
 	}
 	payload, err := leduPostJSON(c, cloudlearnHost, lessonDetailPath, body, headers)
 	if err != nil {
@@ -491,10 +818,86 @@ func fetchRecordResources(c *util.Client, headers map[string]string, resourceID 
 		params["cloudLearnVideoResourceId"] = resourceID
 	}
 	payload, err := leduGetJSON(c, onlineAPIHost, recordResourcesPath, params, headers)
+	if err == nil {
+		data := extractPayload(payload)
+		if hasMediaCandidates(data) {
+			return data
+		}
+		if u := firstTextFromMaps(data, "resourcesUrl", "resourceUrl"); u != "" && strings.HasPrefix(u, "http") {
+			if remote, e := leduGetJSONURL(c, u, headers); e == nil && hasMediaCandidates(remote) {
+				return extractPayload(remote)
+			}
+		}
+	}
+	if legacy, err := leduGetJSON(c, onlineAPIHost, legacyRecordPath, params, headers); err == nil {
+		return extractPayload(legacy)
+	}
+	return nil
+}
+
+func fetchRealRecordInit(c *util.Client, headers map[string]string, task map[string]any) any {
+	taskID := firstText(task["taskId"], task["task_id"])
+	coursewareID := firstText(task["coursewareId"], task["courseware_id"])
+	curriculumID := firstText(task["curriculumId"], task["curriculum_id"])
+	taskType := firstText(task["taskTypeString"], task["task_type_string"])
+	if taskID == "" && coursewareID == "" {
+		return nil
+	}
+	payload, err := leduGetJSON(c, onlineAPIHost, realRecordInitPath, map[string]string{
+		"versionUpgradeMark": "",
+		"coursewareId":       coursewareID,
+		"taskTypeString":     taskType,
+		"taskId":             taskID,
+		"curriculumId":       curriculumID,
+	}, headers)
 	if err != nil {
 		return nil
 	}
 	return extractPayload(payload)
+}
+
+func fetchPreviewMedia(c *util.Client, headers map[string]string, task map[string]any) any {
+	taskID := firstText(task["taskId"], task["task_id"], task["id"])
+	contentID := firstText(task["contentDetailId"], task["content_detail_id"], task["contentId"], task["content_id"])
+	if taskID == "" {
+		return nil
+	}
+	body := map[string]any{"taskId": taskID, "task_id": taskID, "studentId": headers["stuId"], "studentUid": firstText(cookieValue(headers["Cookie"], "puid"), cookieValue(headers["Cookie"], "pu_uid"))}
+	if payload, err := leduPostJSON(c, cloudlearnHost, previewBehaviorPath, body, headers); err == nil && hasMediaCandidates(extractPayload(payload)) {
+		return extractPayload(payload)
+	}
+	if contentID == "" {
+		return nil
+	}
+	body["contentDetailId"] = contentID
+	body["content_detail_id"] = contentID
+	if payload, err := leduPostJSON(c, cloudlearnHost, previewSourcePath, body, headers); err == nil {
+		return extractPayload(payload)
+	}
+	return nil
+}
+
+func hasMediaCandidates(v any) bool {
+	for _, node := range nestedMaps(v) {
+		if mediaURL(node) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func hasUsefulMap(v any) bool {
+	for _, node := range nestedMaps(v) {
+		if len(node) == 0 {
+			continue
+		}
+		for _, key := range []string{"sceneObject", "sceneList", "chapterId", "liveId", "taskId", "paperId", "materialList", "lessonList"} {
+			if node[key] != nil {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func chooseClass(classes []map[string]any, cid string) map[string]any {
@@ -524,12 +927,16 @@ func orderForType(t string) string {
 }
 
 func mediaURL(m map[string]any) string {
-	for _, k := range []string{"m3u8Url", "videoM3u8Url", "m3u8", "m3u8_url", "mp4Url", "trVideoUrl", "videoUrl", "encUrl", "fileUrl", "itemUrl", "downloadUrl", "resourceUrl", "attachmentUrl", "pdfUrl", "url", "src"} {
-		if s := firstText(m[k]); s != "" && (strings.HasPrefix(s, "http") || strings.HasPrefix(s, "//")) {
-			if strings.HasPrefix(s, "//") {
-				s = "https:" + s
-			}
-			if looksMedia(s) || isMaterial(m) {
+	keys := []string{"m3u8Url", "videoM3u8Url", "m3u8", "m3u8_url", "mp4", "mp4Url", "trVideoUrl", "videoUrl", "videoUrlList", "encUrl", "encUrls", "fileUrl", "itemUrl", "downloadUrl", "resourceUrl", "attachmentUrl", "pdfUrl", "src", "url"}
+	for _, k := range keys {
+		if s := firstMediaURL(m[k], k, m); s != "" {
+			return s
+		}
+	}
+	for k, v := range m {
+		lk := strings.ToLower(k)
+		if strings.HasPrefix(lk, "line") || strings.Contains(lk, "definition") || strings.Contains(lk, "quality") {
+			if s := firstMediaURL(v, k, m); s != "" {
 				return s
 			}
 		}
@@ -537,9 +944,51 @@ func mediaURL(m map[string]any) string {
 	return ""
 }
 
+func firstMediaURL(v any, key string, ctx map[string]any) string {
+	switch x := v.(type) {
+	case string:
+		u := normalizeLeduURL(x)
+		if u == "" {
+			return ""
+		}
+		if looksMedia(u) || isMaterial(ctx) || mediaKeyAllowsURL(key) {
+			return u
+		}
+	case []any:
+		for _, it := range x {
+			if u := firstMediaURL(it, key, ctx); u != "" {
+				return u
+			}
+		}
+	case []string:
+		for _, it := range x {
+			if u := firstMediaURL(it, key, ctx); u != "" {
+				return u
+			}
+		}
+	case map[string]any:
+		for _, k := range []string{"m3u8Url", "videoM3u8Url", "m3u8", "mp4Url", "trVideoUrl", "videoUrl", "encUrl", "url", "fileUrl", "downloadUrl"} {
+			if u := firstMediaURL(x[k], k, x); u != "" {
+				return u
+			}
+		}
+	}
+	return ""
+}
+
+func mediaKeyAllowsURL(key string) bool {
+	key = strings.ToLower(key)
+	for _, part := range []string{"m3u8", "mp4", "videourl", "trvideourl", "encurl", "fileurl", "itemurl", "downloadurl", "resourceurl", "attachmenturl", "pdfurl"} {
+		if strings.Contains(key, part) {
+			return true
+		}
+	}
+	return false
+}
+
 func looksMedia(s string) bool {
 	ls := strings.ToLower(s)
-	return strings.Contains(ls, ".m3u8") || strings.Contains(ls, ".mp4") || strings.Contains(ls, ".pdf") || strings.Contains(ls, ".ppt") || strings.Contains(ls, ".doc") || strings.Contains(ls, ".zip")
+	return strings.Contains(ls, ".m3u8") || strings.Contains(ls, ".mp4") || strings.Contains(ls, ".pdf") || strings.Contains(ls, ".ppt") || strings.Contains(ls, ".doc") || strings.Contains(ls, ".xls") || strings.Contains(ls, ".zip") || strings.Contains(ls, ".rar") || strings.Contains(ls, ".7z")
 }
 
 func isMaterial(m map[string]any) bool {
@@ -548,9 +997,19 @@ func isMaterial(m map[string]any) bool {
 
 func mediaFormat(s string, m map[string]any) string {
 	ls := strings.ToLower(strings.SplitN(strings.SplitN(s, "?", 2)[0], "#", 2)[0])
-	for _, ext := range []string{"m3u8", "mp4", "pdf", "pptx", "ppt", "docx", "doc", "zip", "rar"} {
+	for _, ext := range []string{"m3u8", "mp4", "pdf", "pptx", "ppt", "docx", "doc", "xlsx", "xls", "zip", "rar", "7z", "txt"} {
 		if strings.HasSuffix(ls, "."+ext) {
 			return ext
+		}
+	}
+	for _, key := range []string{"m3u8Url", "videoM3u8Url", "m3u8", "m3u8_url", "encUrl", "encUrls"} {
+		if firstMediaURL(m[key], key, m) == s || firstText(m[key]) == s {
+			return "m3u8"
+		}
+	}
+	for _, key := range []string{"mp4", "mp4Url", "trVideoUrl", "videoUrl", "videoUrlList"} {
+		if firstMediaURL(m[key], key, m) == s || firstText(m[key]) == s {
+			return "mp4"
 		}
 	}
 	if ft := strings.TrimPrefix(strings.ToLower(firstText(m["fileType"], m["type"], m["contentType"])), "."); ft != "" {

@@ -41,10 +41,12 @@ var dataStringRe = regexp.MustCompile(`"data"\s*:\s*"(.*?)"`)
 type Xuelang struct{}
 type course struct{ id, title string }
 type lesson struct{ title, roomID, playAuth string }
+type liveToken struct{ token, suffix string }
 type playMedia struct {
-	videoURL, audioURL, videoID, keyID string
-	size                               int64
+	videoURL, audioURL, videoID, keyID, m3u8Text, titleSuffix string
+	size                                                      int64
 }
+type fileResource struct{ name, token, url, format string }
 
 func init() {
 	extractor.Register(&Xuelang{}, extractor.SiteInfo{Name: "Xuelang", URL: "iyincaishijiao.com", NeedAuth: true})
@@ -89,8 +91,27 @@ func (s *Xuelang) Extract(rawURL string, opts *extractor.ExtractOpts) (*extracto
 			entries = append(entries, media(firstNonEmpty(l.title, "lesson"), pm, co, l))
 		}
 	}
+	for _, f := range fetchFiles(c, h, co.id) {
+		key := firstNonEmpty(f.url, f.token)
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		format := firstNonEmpty(f.format, xuelangFormat(f.url))
+		entries = append(entries, &extractor.MediaInfo{
+			Site:  "xuelang",
+			Title: firstNonEmpty(f.name, "资料"),
+			Streams: map[string]extractor.Stream{"default": {
+				Quality: "default",
+				URLs:    []string{f.url},
+				Format:  format,
+				Headers: map[string]string{"Referer": refererURL, "User-Agent": h["User-Agent"]},
+			}},
+			Extra: map[string]any{"course_id": co.id, "type": "file", "token": f.token},
+		})
+	}
 	if len(entries) == 0 {
-		return nil, fmt.Errorf("xuelang: no playable m3u8 URL resolved")
+		return nil, fmt.Errorf("xuelang: no playable m3u8 URL or course files resolved")
 	}
 	return &extractor.MediaInfo{Site: "xuelang", Title: firstNonEmpty(co.title, "xuelang_"+co.id), Entries: entries}, nil
 }
@@ -175,7 +196,8 @@ func resolveLesson(c *util.Client, h map[string]string, l lesson) []playMedia {
 	}
 	if len(out) == 0 && l.roomID != "" {
 		for _, tok := range getLiveTokens(c, h, l.roomID) {
-			if pm := getM3U8Info(c, h, tok); pm.videoURL != "" {
+			if pm := getM3U8Info(c, h, tok.token); pm.videoURL != "" {
+				pm.titleSuffix = tok.suffix
 				out = append(out, pm)
 			}
 		}
@@ -183,17 +205,18 @@ func resolveLesson(c *util.Client, h map[string]string, l lesson) []playMedia {
 	return out
 }
 
-func getLiveTokens(c *util.Client, h map[string]string, roomID string) []string {
+func getLiveTokens(c *util.Client, h map[string]string, roomID string) []liveToken {
 	root, err := postJSON(c, liveURL, map[string]any{"room_id": roomID}, h)
 	if err != nil {
 		return nil
 	}
-	out := []string{val(mapAt(root, "teacher_video_info"), "play_auth_token")}
+	var out []liveToken
 	infos := listFrom(root["external_video_infos"])
 	if len(infos) > 0 {
-		out = append(out, val(mapAt(infos[0], "video"), "play_auth_token"))
+		out = append(out, liveToken{token: val(mapAt(infos[0], "video"), "play_auth_token")})
 	}
-	return unique(out)
+	out = append(out, liveToken{token: val(mapAt(root, "teacher_video_info"), "play_auth_token"), suffix: "_老师"})
+	return uniqueLiveTokens(out)
 }
 
 func getM3U8Info(c *util.Client, h map[string]string, playInfo string) playMedia {
@@ -228,8 +251,15 @@ func getM3U8Info(c *util.Client, h map[string]string, playInfo string) playMedia
 	if pm.videoURL == "" {
 		pm.videoURL = firstMediaURL(root)
 	}
-	if pm.keyID != "" && pm.videoID != "" {
-		_ = decryptM3U8Key(c, h, pm.videoID, pm.keyID)
+	if strings.Contains(strings.ToLower(pm.videoURL), ".m3u8") {
+		key := ""
+		if pm.keyID != "" && pm.videoID != "" {
+			key = decryptM3U8Key(c, h, pm.videoID, pm.keyID)
+		}
+		if dataURL, text, ok := prepareXuelangM3U8(c, h, pm.videoURL, key); ok {
+			pm.videoURL = dataURL
+			pm.m3u8Text = text
+		}
 	}
 	return pm
 }
@@ -255,7 +285,7 @@ func decryptM3U8Key(c *util.Client, h map[string]string, vid, kid string) string
 	if len(parts) != 2 {
 		return ""
 	}
-	return parts[1]
+	return decryptXuelangKey(parts[0], parts[1])
 }
 
 func decodePlayToken(s string) string {
@@ -268,4 +298,74 @@ func decodePlayToken(s string) string {
 		}
 	}
 	return ""
+}
+
+func fetchFiles(c *util.Client, h map[string]string, cid string) []fileResource {
+	seenTokens := map[string]bool{}
+	seenFiles := map[string]bool{}
+	var out []fileResource
+	var walk func(token string, prefix []int)
+	walk = func(token string, prefix []int) {
+		if seenTokens[token] {
+			return
+		}
+		seenTokens[token] = true
+		u := fmt.Sprintf(sourceURL, url.QueryEscape(cid), url.QueryEscape(token))
+		body, err := c.GetString(u, h)
+		if err != nil {
+			return
+		}
+		root, err := parseJSON(body)
+		if err != nil {
+			return
+		}
+		data := mapAt(root, "data")
+		nodeIDs := xuelangNodeIDs(data["node_list"])
+		objects := mapAt(data, "object_map")
+		fileIndex, dirIndex := 1, 1
+		for _, id := range nodeIDs {
+			obj := mapAt(objects, id)
+			if len(obj) == 0 {
+				continue
+			}
+			objType := asString(obj["obj_type"])
+			name := firstNonEmpty(val(obj, "obj_name"), val(obj, "name"), "资料")
+			childToken := firstNonEmpty(val(obj, "token"), val(obj, "resource_token"))
+			if childToken == "" {
+				continue
+			}
+			if objType == "2" {
+				walk(childToken, append(append([]int{}, prefix...), dirIndex))
+				dirIndex++
+				continue
+			}
+			fileURL, format := getFileURL(c, h, cid, childToken)
+			if fileURL == "" || seenFiles[fileURL] {
+				continue
+			}
+			seenFiles[fileURL] = true
+			out = append(out, fileResource{name: fmt.Sprintf("(%s)-%s", joinIndexes(append(prefix, fileIndex)), cleanXuelangName(name)), token: childToken, url: fileURL, format: format})
+			fileIndex++
+		}
+	}
+	walk("", nil)
+	return out
+}
+
+func getFileURL(c *util.Client, h map[string]string, cid, token string) (string, string) {
+	u := fmt.Sprintf(fileURL, url.QueryEscape(token), url.QueryEscape(cid))
+	body, err := c.GetString(u, h)
+	if err != nil {
+		return "", ""
+	}
+	root, err := parseJSON(body)
+	if err != nil {
+		return "", ""
+	}
+	data := mapAt(root, "data")
+	file := mapAt(data, "data")
+	if len(file) == 0 {
+		file = data
+	}
+	return firstNonEmpty(val(file, "preview_url"), val(file, "file_url"), val(file, "url"), val(file, "download_url")), strings.TrimPrefix(strings.ToLower(firstNonEmpty(val(file, "file_ext"), val(file, "fileExt"), val(file, "format"))), ".")
 }

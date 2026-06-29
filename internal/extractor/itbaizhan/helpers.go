@@ -149,13 +149,15 @@ func (x *itbzCtx) getCourseList() []map[string]string {
 	return parseMineCourseList(body)
 }
 
+var perInfoSplitRe = regexp.MustCompile(`(?is)<div\b[^>]*class=["'][^"']*\bper_info\b[^"']*["'][^>]*>`)
+
 func parseMineCourseList(text string) []map[string]string {
 	var out []map[string]string
 	seen := map[string]bool{}
-	for _, block := range regexp.MustCompile(`(?is)<div\b[^>]*class=["'][^"']*\bper_info\b[^"']*["'][^>]*>(?P<body>.*?)(?=<div\b[^>]*class=["'][^"']*\bper_info\b|</div>\s*</div>\s*</div>)`).FindAllStringSubmatch(text, -1) {
-		body := block[1]
+	parts := perInfoSplitRe.Split(text, -1)
+	for _, body := range parts[1:] {
 		title := ""
-		if m := regexp.MustCompile(`(?is)<p\b[^>]*class=["'][^"']*\bper_info_title\b[^"']*["'][^>]*>(?P<title>.*?)</p>`).FindStringSubmatch(body); len(m) == 2 {
+		if m := regexp.MustCompile(`(?is)<p\b[^>]*class=["'][^"']*\bper_info_title\b[^"']*["'][^>]*>(.*?)</p>`).FindStringSubmatch(body); len(m) == 2 {
 			title = cleanTitle(regexp.MustCompile(`(?is)<.*?>`).ReplaceAllString(m[1], ""))
 		}
 		if title == "" {

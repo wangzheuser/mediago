@@ -28,6 +28,7 @@ const (
 	refererURL           = "https://chaogejiaoyu.com/"
 	originURL            = "https://chaogejiaoyu.com"
 	loginCheckURL        = "https://chaogejiaoyu.com/user/index/getLoginUserInfo"
+	myCoursePageLimit    = 200
 )
 
 var (
@@ -64,11 +65,14 @@ func (s *Chaoge) Extract(rawURL string, opts *extractor.ExtractOpts) (*extractor
 	if err := checkCookie(c, headers); err != nil {
 		return nil, err
 	}
+	myCourses := fetchMyCourseItems(c, headers, "0")
 	detail, title, err := fetchCourseDetail(c, cid, headers)
 	if err != nil {
 		return nil, err
 	}
 	items := collectCourseItems(detail, cid)
+	items = append(items, findCourseListMatches(myCourses, cid)...)
+	items = append(items, fetchMyCourseItems(c, headers, cid)...)
 	items = append(items, fetchCourseFiles(c, headers, cid)...)
 	items = append(items, fetchSeriesItems(c, headers, items)...)
 	if len(items) == 0 {
@@ -126,7 +130,7 @@ func checkCookie(c *util.Client, headers map[string]string) error {
 	if err := json.Unmarshal([]byte(body), &resp); err != nil {
 		return fmt.Errorf("chaoge login check parse: %w", err)
 	}
-	if resp.Status != 0 || len(resp.Data) == 0 {
+	if resp.Status != 0 {
 		return fmt.Errorf("chaoge login check failed: status=%d", resp.Status)
 	}
 	return nil
@@ -141,8 +145,98 @@ func fetchCourseDetail(c *util.Client, cid string, headers map[string]string) (m
 	if err := json.Unmarshal([]byte(body), &resp); err != nil {
 		return nil, "", fmt.Errorf("chaoge course detail parse: %w", err)
 	}
-	title := firstString(asMap(resp["data"]), "course_name", "title")
+	title := courseTitle(resp)
 	return resp, cleanTitle(title), nil
+}
+
+func fetchMyCourseItems(c *util.Client, headers map[string]string, coursePID string) []map[string]any {
+	if strings.TrimSpace(coursePID) == "" {
+		coursePID = "0"
+	}
+	var out []map[string]any
+	seenPage, seenCourse := map[string]bool{}, map[string]bool{}
+	page, pageLimit := 1, 1
+	for page <= pageLimit && page <= myCoursePageLimit {
+		u, err := url.Parse(courseListURL)
+		if err != nil {
+			return out
+		}
+		q := u.Query()
+		q.Set("course_pid", coursePID)
+		q.Set("is_follow", "")
+		q.Set("page", fmt.Sprint(page))
+		q.Set("is_delete", "0")
+		q.Set("exam_type", "")
+		u.RawQuery = q.Encode()
+		body, err := c.GetString(u.String(), headers)
+		if err != nil {
+			return out
+		}
+		var resp map[string]any
+		if json.Unmarshal([]byte(body), &resp) != nil || intValue(resp["status"], 0) != 0 {
+			return out
+		}
+		items := parseCourseListItems(resp)
+		if len(items) == 0 {
+			return out
+		}
+		var pageKey strings.Builder
+		for _, it := range items {
+			id := firstString(it, "course_id", "id")
+			pageKey.WriteString(id)
+			pageKey.WriteByte('|')
+			if id == "" || seenCourse[id] {
+				continue
+			}
+			seenCourse[id] = true
+			out = append(out, it)
+		}
+		if seenPage[pageKey.String()] {
+			break
+		}
+		seenPage[pageKey.String()] = true
+		if data := asMap(resp["data"]); len(data) > 0 {
+			pageLimit = minInt(myCoursePageLimit, maxInt(pageLimit, pageLimitFromString(firstNonEmpty(firstString(data, "pageStr"), firstString(data, "page_str")), page)))
+		}
+		page++
+	}
+	return out
+}
+
+func parseCourseListItems(resp map[string]any) []map[string]any {
+	var out []map[string]any
+	for _, raw := range listFromData(resp["data"]) {
+		if truthy(raw["is_expired"]) {
+			continue
+		}
+		cid := firstString(raw, "course_id", "id")
+		title := firstString(raw, "course_name", "title", "name")
+		if cid == "" || title == "" {
+			continue
+		}
+		out = append(out, map[string]any{
+			"raw":                raw,
+			"course_id":          cid,
+			"id":                 cid,
+			"title":              title,
+			"course_name":        title,
+			"group_status":       firstString(raw, "group_status"),
+			"course_pid":         firstString(raw, "course_pid", "pid", "parent_id"),
+			"course_period_disc": firstString(raw, "course_period_disc"),
+			"valid_off_time":     firstString(raw, "valid_off_time"),
+		})
+	}
+	return out
+}
+
+func findCourseListMatches(items []map[string]any, cid string) []map[string]any {
+	var out []map[string]any
+	for _, it := range items {
+		if firstString(it, "course_id", "id") == cid || firstString(it, "course_pid", "pid", "parent_id") == cid {
+			out = append(out, it)
+		}
+	}
+	return out
 }
 
 func fetchCourseFiles(c *util.Client, headers map[string]string, cid string) []map[string]any {
@@ -154,8 +248,11 @@ func fetchCourseFiles(c *util.Client, headers map[string]string, cid string) []m
 	if json.Unmarshal([]byte(body), &resp) != nil {
 		return nil
 	}
-	data := asMap(resp["data"])
 	var out []map[string]any
+	if arr := listFromData(resp["data"]); len(arr) > 0 {
+		out = append(out, arr...)
+	}
+	data := asMap(resp["data"])
 	for _, key := range []string{"file_seg_list", "file_list"} {
 		out = append(out, listFromData(data[key])...)
 	}
@@ -228,7 +325,7 @@ func resolveVideoEntry(c *util.Client, headers map[string]string, item map[strin
 		extra["m3u8_manifest"] = manifest
 	}
 	title := cleanTitle(firstNonEmpty(firstString(item, "course_name", "title", "name"), courseID))
-	return &extractor.MediaInfo{Site: "chaoge", Title: title, Streams: map[string]extractor.Stream{"default": {Quality: "best", URLs: []string{play.VideoURL}, Format: pickFormat(play.VideoURL), AudioURL: play.AudioURL, Headers: map[string]string{"Referer": referer}}}, Extra: extra}, nil
+	return &extractor.MediaInfo{Site: "chaoge", Title: title, Streams: csslStreams(play, referer), Extra: extra}, nil
 }
 
 func resolveFileEntry(item map[string]any) *extractor.MediaInfo {
@@ -283,6 +380,38 @@ func collectCourseItems(root map[string]any, cid string) []map[string]any {
 	return append([]map[string]any{{"id": cid, "course_id": cid}}, out...)
 }
 
+func courseTitle(resp map[string]any) string {
+	data := asMap(resp["data"])
+	for _, m := range []map[string]any{data, asMap(data["course_info"]), asMap(data["course"]), asMap(data["info"])} {
+		if title := firstString(m, "course_name", "title", "name"); title != "" {
+			return title
+		}
+	}
+	return ""
+}
+
+func csslStreams(play *shared.CssLcloudPlayInfo, referer string) map[string]extractor.Stream {
+	streams := map[string]extractor.Stream{}
+	list := play.VideoList
+	if len(list) == 0 && play.VideoURL != "" {
+		list = []shared.CssLcloudStreamInfo{{URL: play.VideoURL}}
+	}
+	for i, v := range list {
+		if v.URL == "" {
+			continue
+		}
+		key := fmt.Sprintf("definition_%d", v.Definition)
+		if v.Definition == 0 {
+			key = fmt.Sprintf("video_%d", i+1)
+		}
+		streams[key] = extractor.Stream{Quality: key, URLs: []string{v.URL}, Format: pickFormat(v.URL), AudioURL: play.AudioURL, Headers: map[string]string{"Referer": referer}}
+	}
+	if len(streams) == 0 && play.VideoURL != "" {
+		streams["default"] = extractor.Stream{Quality: "best", URLs: []string{play.VideoURL}, Format: pickFormat(play.VideoURL), AudioURL: play.AudioURL, Headers: map[string]string{"Referer": referer}}
+	}
+	return streams
+}
+
 func walkAny(v any, visit func(map[string]any)) {
 	switch x := v.(type) {
 	case map[string]any:
@@ -307,7 +436,7 @@ func listFromData(v any) []map[string]any {
 		return out
 	}
 	data := asMap(v)
-	for _, k := range []string{"course_list", "file_list", "list", "dataList", "rows", "items"} {
+	for _, k := range []string{"course_list", "courseList", "file_seg_list", "file_list", "list", "dataList", "rows", "items"} {
 		if arr, ok := data[k].([]any); ok {
 			return listFromData(arr)
 		}
@@ -358,6 +487,10 @@ func in(v string, set ...string) bool {
 	}
 	return false
 }
+func truthy(v any) bool {
+	s := strings.ToLower(strings.TrimSpace(fmt.Sprint(v)))
+	return s == "1" || s == "true" || s == "yes"
+}
 func cleanTitle(s string) string { return titleCleanRe.ReplaceAllString(strings.TrimSpace(s), "_") }
 func pickFormat(u string) string {
 	if strings.Contains(strings.ToLower(u), ".m3u8") {
@@ -394,4 +527,28 @@ func queryValue(raw string, keys ...string) string {
 		}
 	}
 	return ""
+}
+
+func pageLimitFromString(pageStr string, def int) int {
+	maxPage := def
+	for _, m := range regexp.MustCompile(`page=(\d+)`).FindAllStringSubmatch(pageStr, -1) {
+		if v := intValue(m[1], def); v > maxPage {
+			maxPage = v
+		}
+	}
+	return maxPage
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

@@ -57,6 +57,33 @@ func (i *Imooc) Extract(rawURL string, opts *extractor.ExtractOpts) (info *extra
 	c.SetCookieJar(opts.Cookies)
 	h := map[string]string{"Referer": host + "/"}
 
+	if mid == "" || opts.ListOnly {
+		title, entries, listErr := fetchImoocCourseEntries(c, h, host, cid, opts)
+		if len(entries) > 0 {
+			return &extractor.MediaInfo{Site: "imooc", Title: firstNonEmpty(title, "imooc_"+cid), Entries: entries}, nil
+		}
+		if mid == "" {
+			if listErr != nil {
+				return nil, listErr
+			}
+			return nil, fmt.Errorf("imooc: no course entries found for %s", cid)
+		}
+	}
+
+	return extractImoocVideo(c, h, host, cid, mid, "")
+}
+
+func extractImoocVideo(c *util.Client, h map[string]string, host, cid, mid, title string) (info *extractor.MediaInfo, err error) {
+	if mid == "" || cid == "" {
+		return nil, fmt.Errorf("imooc: missing cid or mid")
+	}
+	mediaCID := cid
+	if strings.Contains(host, "www.imooc.com") {
+		if mongoID := fetchFreeMongoID(c, h, mid); mongoID != "" {
+			mediaCID = mongoID
+		}
+	}
+
 	// startlearn heartbeat — class.imooc.com uses /course/startlearn, coding.imooc.com
 	// uses /lesson/ajaxstartlearn. Free imooc.com has no lifecycle endpoint.
 	startURL, endURL, hasLifecycle := lifecycleURLs(host)
@@ -74,7 +101,7 @@ func (i *Imooc) Extract(rawURL string, opts *extractor.ExtractOpts) (info *extra
 	// Fetch the m3u8 manifest. The response is either:
 	// (a) a JSON envelope with imooc_decode-encoded data in data.info or result, or
 	// (b) a raw #EXTM3U manifest (rare, free content).
-	apiURL := mediaURL(host, mid, cid)
+	apiURL := mediaURL(host, mid, mediaCID)
 	body, err := c.GetString(apiURL, h)
 	if err != nil {
 		return nil, fmt.Errorf("fetch m3u8 manifest: %w", err)
@@ -82,7 +109,7 @@ func (i *Imooc) Extract(rawURL string, opts *extractor.ExtractOpts) (info *extra
 
 	// Try raw m3u8 first.
 	if isM3U8(body) {
-		return buildResult(cid, body, host, nil), nil
+		return buildResultWithTitle(cid, title, body, host, nil), nil
 	}
 
 	// Try JSON with plain "result" field (some free content).
@@ -92,7 +119,7 @@ func (i *Imooc) Extract(rawURL string, opts *extractor.ExtractOpts) (info *extra
 	}
 	if json.Unmarshal([]byte(body), &freeEnv) == nil && freeEnv.Result != "" {
 		if isM3U8(freeEnv.Result) {
-			return buildResult(cid, freeEnv.Result, host, nil), nil
+			return buildResultWithTitle(cid, title, freeEnv.Result, host, nil), nil
 		}
 	}
 
@@ -107,7 +134,7 @@ func (i *Imooc) Extract(rawURL string, opts *extractor.ExtractOpts) (info *extra
 	videoURL := selectBestVariant(masterPlaylist, host)
 	if videoURL == "" {
 		// The master playlist IS the actual playlist (single quality).
-		return buildResult(cid, masterPlaylist, host, nil), nil
+		return buildResultWithTitle(cid, title, masterPlaylist, host, nil), nil
 	}
 
 	// Fetch the variant playlist.
@@ -130,7 +157,7 @@ func (i *Imooc) Extract(rawURL string, opts *extractor.ExtractOpts) (info *extra
 	// imooc_decode encoded in JSON envelopes).
 	hlsKeys := resolveHLSKeys(playlist, videoURL, c, h)
 
-	return buildResult(cid, playlist, host, hlsKeys), nil
+	return buildResultWithTitle(cid, title, playlist, host, hlsKeys), nil
 }
 
 // decryptJSONInfo parses a JSON response and decrypts the data.info field.
@@ -307,11 +334,51 @@ func parseURL(u string) (cid, mid, host string) {
 	case strings.Contains(u, "class.imooc.com"):
 		host = "https://class.imooc.com"
 	}
-	if m := regexp.MustCompile(`(?:class|sc|learn/list|learn|course/playlist)/(\d+)`).FindStringSubmatch(u); len(m) > 1 {
-		cid = m[1]
+
+	if parsed, err := url.Parse(u); err == nil {
+		q := parsed.Query()
+		cid = firstNonEmpty(q.Get("_id"), q.Get("cid"), q.Get("course_id"), q.Get("courseId"), q.Get("id"))
+		mid = firstNonEmpty(q.Get("mid"))
+		if parsed.Fragment != "" {
+			if fq, err := url.ParseQuery(parsed.Fragment); err == nil {
+				cid = firstNonEmpty(cid, fq.Get("_id"), fq.Get("cid"), fq.Get("course_id"), fq.Get("courseId"), fq.Get("id"))
+				mid = firstNonEmpty(mid, fq.Get("mid"))
+			}
+		}
 	}
-	if m := regexp.MustCompile(`(?:lesson/|video/|mid=)(\d+)`).FindStringSubmatch(u); len(m) > 1 {
-		mid = m[1]
+
+	if cid == "" {
+		for _, pat := range []string{`/learn/list/(\d+)`, `/class/(\d+)`, `/sc/(\d+)`, `/learn/(\d+)`, `/lesson/(\d+)`} {
+			if m := regexp.MustCompile(pat).FindStringSubmatch(u); len(m) > 1 {
+				cid = m[1]
+				break
+			}
+		}
+	}
+	if mid == "" {
+		for _, pat := range []string{`[?#&]mid=(\d+)`, `/video/(\d+)`, `/course/playlist/(\d+)`} {
+			if m := regexp.MustCompile(pat).FindStringSubmatch(u); len(m) > 1 {
+				mid = m[1]
+				break
+			}
+		}
+	}
+	if cid == "" {
+		if m := regexp.MustCompile(`/course/playlist/(\d+)`).FindStringSubmatch(u); len(m) > 1 {
+			cid = m[1]
+		}
+	}
+	if cid == "" && strings.Contains(host, "www.imooc.com") && mid != "" {
+		if parsed, err := url.Parse(u); err == nil {
+			if m := regexp.MustCompile(`(?:^|/)learn/(\d+)`).FindStringSubmatch(parsed.Path); len(m) > 1 {
+				cid = m[1]
+			}
+		}
+	}
+	if mid == "" && strings.Contains(u, "/lesson/") {
+		if m := regexp.MustCompile(`[?#&]mid=(\d+)`).FindStringSubmatch(u); len(m) > 1 {
+			mid = m[1]
+		}
 	}
 	return cid, mid, host
 }
@@ -337,15 +404,20 @@ func mediaURL(host, mid, cid string) string {
 }
 
 func buildResult(cid, m3u8, host string, hlsKeys map[string]string) *extractor.MediaInfo {
+	return buildResultWithTitle(cid, "", m3u8, host, hlsKeys)
+}
+
+func buildResultWithTitle(cid, title, m3u8, host string, hlsKeys map[string]string) *extractor.MediaInfo {
 	stream := extractor.Stream{
 		Quality: "default",
 		URLs:    []string{m3u8},
 		Format:  "m3u8",
 		Headers: map[string]string{"Referer": host + "/"},
 	}
+	stream.NeedMerge = true
 	result := &extractor.MediaInfo{
 		Site:  "imooc",
-		Title: "imooc_" + cid,
+		Title: firstNonEmpty(title, "imooc_"+cid),
 		Streams: map[string]extractor.Stream{
 			"hls": stream,
 		},
@@ -356,6 +428,15 @@ func buildResult(cid, m3u8, host string, hlsKeys map[string]string) *extractor.M
 		}
 	}
 	return result
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
 }
 
 func isM3U8(body string) bool {

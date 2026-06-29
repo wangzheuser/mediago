@@ -23,6 +23,7 @@
 | Cnmooc_Course._get_infos .das line 6801 | Extract line 58-92 | page traversal | ✓ |
 | Cnmooc_Course._request_item_detail .das line 7370 | requestItemDetail line 116 | POST /item/detail.mooc | ✓ |
 | Cnmooc_Course._resolve_video_url .das line 9134 | resolveItem line 98 | detail + candidates | ✓ |
+| Cnmooc_Course._resolve_file_url / _download_file_item | `resolveFileURL`, `fileMedia`, `isFileURL` | direct file/doc viewer unwrap | ✓ |
 
 ## JSON / HTML 字段映射
 
@@ -40,7 +41,7 @@
 | node flvUrl/flv_url/url/rsUrl/mediaUrl/fileUrl/downloadUrl | valuesFor(node, ...) | ✓ |
 | mediaResources currentUrl/url/videoUrl/mediaUrl/fileUrl/downloadUrl | valuesFor(mr, ...) | ✓ |
 | mediaResources.mediaUrls | mr["mediaUrls"].([]any) | ✓ |
-| direct link attrs data-url/src/href/rsurl/rs-url | extractLinks attrURLRe | ✓ |
+| direct link attrs data-url/src/href/rsurl/rs-url | extractLinks attrURLRe, routed to video or file entries | ✓ |
 
 ## 阻塞步骤 (如果有)
 

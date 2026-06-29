@@ -104,7 +104,51 @@ func TestExtractMock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new cookie jar: %v", err)
 	}
+	setYKBTestToken(t, jar)
 
 	media, err := (&Yikaobang{}).Extract("https://www.yikaobang.com.cn/course/1001", &extractor.ExtractOpts{Cookies: jar})
 	assertGoldenOutcome(t, media, err)
+	if err == nil {
+		if len(media.Entries) != 2 {
+			t.Fatalf("Entries = %d, want 2 video/file entries: %#v", len(media.Entries), media)
+		}
+		if media.Entries[0].Streams["best"].Format != "m3u8" {
+			t.Fatalf("first entry format = %q, want m3u8", media.Entries[0].Streams["best"].Format)
+		}
+		if media.Entries[1].Streams["file"].Format != "pdf" {
+			t.Fatalf("second entry format = %q, want pdf", media.Entries[1].Streams["file"].Format)
+		}
+	}
+}
+
+func setYKBTestToken(t *testing.T, jar http.CookieJar) {
+	t.Helper()
+	for _, raw := range []string{ykbHomeURL, ykbLegacyAPIBase, ykbNewAPIBase, ykbH5Base} {
+		u, err := url.Parse(raw)
+		if err != nil {
+			t.Fatalf("parse cookie origin %q: %v", raw, err)
+		}
+		jar.SetCookies(u, []*http.Cookie{{Name: "token", Value: "test-token"}})
+	}
+}
+
+func TestParseFixture(t *testing.T) {
+	fixture := loadGoldenFixture(t)
+	root, err := decodeYikaobangBody(string(fixture))
+	if err != nil {
+		t.Fatalf("decode fixture: %v", err)
+	}
+	result := parseYikaobangPayloads([]ykbPayload{{Source: "https://new-ykb.yikaobang.com.cn/course/center/catalogue", Root: root, Body: string(fixture)}}, ykbTarget{CourseID: "1001"})
+	if len(result.Courses) != 1 {
+		t.Fatalf("courses = %d, want 1: %#v", len(result.Courses), result.Courses)
+	}
+	if len(result.Videos) != 1 {
+		t.Fatalf("videos = %d, want 1: %#v", len(result.Videos), result.Videos)
+	}
+	if len(result.Files) != 1 {
+		t.Fatalf("files = %d, want 1: %#v", len(result.Files), result.Files)
+	}
+	if len(result.Chapters) == 0 {
+		t.Fatalf("expected chapters from fixture")
+	}
 }

@@ -8,6 +8,14 @@
 //
 // Sign + cid are pulled out of the URL ("/course/SIGN/CID" or "/learn[/space]/SIGN/.../CID").
 // Supports xuetangx.com, cmgemooc.com, gradsmartedu.cn.
+//
+// Python source input examples kept for source-alignment audit and route
+// regression coverage:
+//   - https://www.xuetangx.com/course/xjtu08301000528/12424483?channel=i.area.learn_title
+//   - https://next.xuetangx.com/course/szpt08071002217/26284632?channel=i.area.learn_title
+//   - https://next.xuetangx.com/live/live20191205/live20191205001/1480012/1150601
+//   - https://next.xuetangx.com/live/live20200611M001/live20200611M001/4127460/5786325?fromArray=home_live_ad
+//   - https://www.xuetangx.com/training/NLP080910033761/16862187
 package xuetang
 
 import (
@@ -73,15 +81,11 @@ func (x *Xuetang) Extract(rawURL string, opts *extractor.ExtractOpts) (*extracto
 	if parts.host == "" || parts.sign == "" {
 		return nil, fmt.Errorf("cannot parse xuetang URL: %s", rawURL)
 	}
-	base := "https://" + parts.host
+	base := xuetangOrigin(parts.host)
 
 	c := util.NewClient()
 	c.SetCookieJar(opts.Cookies)
-	h := map[string]string{
-		"Referer":  base + "/",
-		"X-Client": "web",
-		"xtbz":     "cloud",
-	}
+	h := xuetangHeaders(opts.Cookies, rawURL, base)
 
 	if parts.kind == xuetangURLLive {
 		return extractLive(c, base, h, parts)
@@ -107,68 +111,23 @@ func extractCourse(c *util.Client, base string, h map[string]string, sign, cid s
 		title = "xuetang_" + cid
 	}
 
-	chapBody, err := c.GetString(fmt.Sprintf("%s/api/v1/lms/learn/course/chapter?cid=%s&sign=%s", base, cid, sign), h)
+	chapterRoot, err := fetchCourseChapterPayload(c, base, h, sign, cid)
 	if err != nil {
-		return nil, fmt.Errorf("course/chapter: %w", err)
+		return nil, err
 	}
-	var chapResp struct {
-		Data struct {
-			ContentData []struct {
-				Name           string `json:"name"`
-				SectionLeafLst []struct {
-					Name     string `json:"name"`
-					LeafType int    `json:"leaf_type"`
-					ID       any    `json:"id"`
-					LeafList []struct {
-						Name     string `json:"name"`
-						LeafType int    `json:"leaf_type"`
-						ID       any    `json:"id"`
-					} `json:"leaf_list"`
-				} `json:"section_leaf_list"`
-			} `json:"content_data"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal([]byte(chapBody), &chapResp); err != nil {
-		return nil, fmt.Errorf("parse chapter: %w", err)
-	}
+	leafs := extractCourseLeaves(chapterRoot)
 
 	var entries []*extractor.MediaInfo
-	for ci, ch := range chapResp.Data.ContentData {
-		for si, sec := range ch.SectionLeafLst {
-			leafs := sec.LeafList
-			if len(leafs) == 0 && sec.LeafType == 0 {
-				leafs = append(leafs, struct {
-					Name     string `json:"name"`
-					LeafType int    `json:"leaf_type"`
-					ID       any    `json:"id"`
-				}{Name: sec.Name, LeafType: 0, ID: sec.ID})
-			}
-			for li, leaf := range leafs {
-				if leaf.LeafType != 0 {
-					continue
-				}
-				videoURL := getVideoURL(c, base, h, sign, cid, fmt.Sprint(leaf.ID))
-				if videoURL == "" {
-					continue
-				}
-				name := fmt.Sprintf("%02d.%02d.%02d %s", ci+1, si+1, li+1, sanitize(leaf.Name))
-				entries = append(entries, &extractor.MediaInfo{
-					Site:  "xuetang",
-					Title: name,
-					Streams: map[string]extractor.Stream{
-						"default": {
-							Quality: "best",
-							URLs:    []string{videoURL},
-							Format:  pickFormat(videoURL),
-							Headers: map[string]string{"Referer": base + "/"},
-						},
-					},
-				})
-			}
+	for _, leaf := range leafs {
+		src := resolveLeafSource(c, base, h, sign, cid, leaf.ID)
+		if src == nil || src.empty() {
+			continue
 		}
+		name := fmt.Sprintf("%02d.%02d.%02d %s", leaf.ChapterIndex, leaf.SectionIndex, leaf.LeafIndex, sanitize(firstNonEmpty(leaf.Name, src.Title, "Leaf "+leaf.ID)))
+		entries = append(entries, mediaFromSource(base, h, name, leaf.ID, src)...)
 	}
 	if len(entries) == 0 {
-		return nil, fmt.Errorf("no playable videos found (course locked or no purchase?)")
+		return nil, fmt.Errorf("no playable media found (course locked or no purchase?)")
 	}
 
 	return &extractor.MediaInfo{
@@ -260,58 +219,11 @@ func fetchTrainingClassroomID(c *util.Client, base string, h map[string]string, 
 //	leaf_info/{cid}/{leaf}/?sign={sign} → data.content_info.media.ccid
 //	service/playurl/{ccid}/?appid=10000 → data.sources.quality10/20 (mp4 URLs)
 func getVideoURL(c *util.Client, base string, h map[string]string, sign, cid, leafID string) string {
-	leafURL := fmt.Sprintf("%s/api/v1/lms/learn/leaf_info/%s/%s/?sign=%s", base, cid, leafID, sign)
-	body, err := c.GetString(leafURL, h)
-	if err != nil {
+	src := resolveLeafSource(c, base, h, sign, cid, leafID)
+	if src == nil {
 		return ""
 	}
-	var leaf struct {
-		Data struct {
-			ContentInfo struct {
-				Media struct {
-					CCID            any    `json:"ccid"`
-					LivePlaybackURL string `json:"live_palyback_url"`
-				} `json:"media"`
-			} `json:"content_info"`
-		} `json:"data"`
-	}
-	if json.Unmarshal([]byte(body), &leaf) != nil {
-		return ""
-	}
-	liveURL := strings.TrimSpace(leaf.Data.ContentInfo.Media.LivePlaybackURL)
-	if liveURL != "" {
-		if isDirectMediaURL(liveURL) {
-			return liveURL
-		}
-		return getLiveVideoURL(c, base, h, liveURL)
-	}
-	ccid := jsonScalarString(leaf.Data.ContentInfo.Media.CCID)
-	if ccid == "" || ccid == "0" {
-		return ""
-	}
-	playURL := fmt.Sprintf("%s/api/v1/lms/service/playurl/%s/?appid=10000", base, url.PathEscape(ccid))
-	playBody, err := c.GetString(playURL, h)
-	if err != nil {
-		return ""
-	}
-	var pr struct {
-		Data struct {
-			Sources struct {
-				Q10 []string `json:"quality10"`
-				Q20 []string `json:"quality20"`
-			} `json:"sources"`
-		} `json:"data"`
-	}
-	if json.Unmarshal([]byte(playBody), &pr) != nil {
-		return ""
-	}
-	if len(pr.Data.Sources.Q20) > 0 {
-		return pr.Data.Sources.Q20[0]
-	}
-	if len(pr.Data.Sources.Q10) > 0 {
-		return pr.Data.Sources.Q10[0]
-	}
-	return ""
+	return src.URL
 }
 
 func getLiveVideoURL(c *util.Client, base string, h map[string]string, signature string) string {
@@ -386,14 +298,27 @@ var sanitizeRe = regexp.MustCompile(`[\\/:*?"<>|\r\n\t]+`)
 func sanitize(s string) string { return sanitizeRe.ReplaceAllString(strings.TrimSpace(s), "_") }
 
 func pickFormat(u string) string {
-	if strings.Contains(u, ".m3u8") {
+	lower := strings.ToLower(u)
+	if strings.HasPrefix(lower, "data:text/html") {
+		return "html"
+	}
+	if strings.Contains(lower, ".m3u8") || strings.HasPrefix(lower, "data:application/vnd.apple.mpegurl") {
 		return "m3u8"
+	}
+	if strings.Contains(lower, ".mp3") || strings.Contains(lower, ".m4a") || strings.Contains(lower, ".aac") || strings.Contains(lower, ".wav") {
+		return "audio"
+	}
+	for _, ext := range []string{"pdf", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "zip", "rar", "7z", "txt", "csv"} {
+		if strings.Contains(lower, "."+ext) {
+			return ext
+		}
 	}
 	return "mp4"
 }
 
 func isDirectMediaURL(u string) bool {
-	return strings.Contains(u, ".mp4") || strings.Contains(u, ".m3u8")
+	lower := strings.ToLower(u)
+	return strings.Contains(lower, ".mp4") || strings.Contains(lower, ".m3u8") || strings.Contains(lower, ".mp3") || strings.Contains(lower, ".m4a") || strings.Contains(lower, ".aac") || strings.Contains(lower, ".wav")
 }
 
 func jsonScalarString(v any) string {

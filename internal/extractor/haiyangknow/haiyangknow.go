@@ -19,6 +19,7 @@ const (
 	referer        = "https://user.haiyangknow.com/"
 	origin         = "https://user.haiyangknow.com"
 	api_host       = "https://user.haiyangknow.com/prod-api"
+	userAgent      = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 	aliyun_vod_url = "https://vod.{}.aliyuncs.com/?{}"
 	aliyun_mts_url = "https://mts.{}.aliyuncs.com/?"
 )
@@ -46,6 +47,7 @@ type hyCtx struct {
 	platformType string
 	apiCourseID  string
 	selected     hyCourse
+	permission   map[string]any
 	courseList   []hyCourse
 	playCache    map[string]map[string]any
 	licenseCache map[string][]byte
@@ -107,6 +109,7 @@ func newCtx(jar http.CookieJar, quality string) (*hyCtx, error) {
 		"cookie":        cookie,
 		"Cookie":        cookie,
 		"Authorization": "Bearer " + token,
+		"User-Agent":    userAgent,
 	}
 	return &hyCtx{c: c, headers: headers, cookie: cookie, token: token, quality: quality, platformType: "1", playCache: map[string]map[string]any{}, licenseCache: map[string][]byte{}}, nil
 }
@@ -120,6 +123,7 @@ func (x *hyCtx) prepare(rawURL string) error {
 		if c := x.findCourse(x.cid); c.ID != "" {
 			x.applyCourse(c)
 		}
+		x.loadPermission()
 		if x.title == "" {
 			x.title = "海洋知道课程" + x.cid
 		}
@@ -130,6 +134,7 @@ func (x *hyCtx) prepare(rawURL string) error {
 		return fmt.Errorf("haiyangknow: empty course list")
 	}
 	x.applyCourse(courses[0])
+	x.loadPermission()
 	return nil
 }
 
@@ -262,12 +267,50 @@ func (x *hyCtx) applyCourse(c hyCourse) {
 	}
 }
 
+func (x *hyCtx) loadPermission() map[string]any {
+	if x.permission != nil {
+		return x.permission
+	}
+	if x.cid == "" {
+		x.permission = map[string]any{}
+		return x.permission
+	}
+	var first map[string]any
+	candidates := append(uniqueNonEmpty(x.platformType, x.selected.PlatformType, x.selected.RawPlatformType, x.loginType, "1", "2", "3"), "")
+	for _, platform := range candidates {
+		params := map[string]string{"id": x.cid}
+		if platform != "" {
+			params["platform"] = platform
+		}
+		data := x.requestAPIData("/curriculum/course/mini/applet/findLearningPermissions", params, map[string]any{})
+		m := asMap(data)
+		if len(m) == 0 {
+			continue
+		}
+		if len(first) == 0 {
+			first = m
+		}
+		if truthy(m["isCanWatch"]) || truthy(m["isPermission"]) {
+			x.permission = m
+			if platform != "" {
+				x.platformType = platform
+			}
+			return x.permission
+		}
+	}
+	if first == nil {
+		first = map[string]any{}
+	}
+	x.permission = first
+	return x.permission
+}
+
 func normalizeCourseInfo(course map[string]any) hyCourse {
 	id := firstString(course, "id", "courseId", "course_id")
 	if id == "" {
 		return hyCourse{}
 	}
-	return hyCourse{ID: id, DraftID: firstString(course, "draftId", "draft_id", "curriculumId"), Title: firstString(course, "title", "courseName", "name", "price"), PlatformType: firstString(course, "platformType", "platform"), RawPlatformType: firstString(course, "platform", "platformType"), Course: course, Purchased: true, Price: coursePrice(course)}
+	return hyCourse{ID: id, DraftID: firstString(course, "draftId", "draft_id", "curriculumId"), Title: firstNonEmpty(firstString(course, "title", "courseName", "name"), id), PlatformType: firstString(course, "platformType", "platform"), RawPlatformType: firstString(course, "platform", "platformType"), Course: course, Purchased: true, Price: coursePrice(course)}
 }
 
 func resolvePlatformType(c hyCourse) string {

@@ -62,6 +62,11 @@ func (b *Bilibili) Extract(rawURL string, opts *extractor.ExtractOpts) (*extract
 	client := util.NewClient()
 	if opts != nil && opts.Cookies != nil {
 		client.SetCookieJar(opts.Cookies)
+		if hasBilibiliLoginCookie(opts.Cookies) {
+			if err := validateBilibiliLogin(client); err != nil {
+				return nil, err
+			}
+		}
 	}
 	headers := biliHeaders()
 
@@ -555,8 +560,8 @@ func getVideoInfo(client *util.Client, bvid string, aid string) (*videoInfo, err
 		Code    int    `json:"code"`
 		Message string `json:"message"`
 		Data    struct {
-			BVid  string      `json:"bvid"`
-			Title string      `json:"title"`
+			BVid  string `json:"bvid"`
+			Title string `json:"title"`
 			Owner struct {
 				Name string `json:"name"`
 			} `json:"owner"`

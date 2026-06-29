@@ -3,8 +3,10 @@ package cctalk
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/Sophomoresty/mediago/internal/extractor"
@@ -21,10 +23,6 @@ const (
 	CCTALK_USER_AGENT        = "Mozilla/5.0 (Windows NT 6.2; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) QtWebEngine/5.9.7 Chrome/56.0.2924.122 Safari/537.36 CTPC/7.10.10.1"
 	CCTALK_OCS_USER_AGENT    = "Hujiang/OCS/PC/Qt/Win"
 	CCTALK_OCS_MATERIAL_HOST = "https://p1.ocs.hjfile.cn"
-
-	my_group_list_url = "https://m.cctalk.com/webapi/content/v1.1/user/my_group_list?start=%d&limit=%d&sortType=1&keyword=%s"
-	mycourse_url      = "https://m.cctalk.com/mycourse"
-	mobile_url        = "https://m.cctalk.com"
 )
 
 var patterns = []string{`(?:[\w-]+\.)?cctalk\.com/|^(?:cctalk|ocsplayer)://`}
@@ -50,11 +48,12 @@ func (c *CCTalk) Patterns() []string { return patterns }
 type ids struct{ CourseID, GroupID, SeriesID, VideoID string }
 
 var (
-	pathCourseRe = regexp.MustCompile(`/(?:m/|web/|school/)?course/(\d+)`)
-	pathGroupRe  = regexp.MustCompile(`/(?:m/|web/)?group/(\d+)`)
-	pathSeriesRe = regexp.MustCompile(`/(?:m/)?(?:program|series)/(\d+)|/group/(\d+)/series/(\d+)`)
-	pathVideoRe  = regexp.MustCompile(`/v/(\d+)`)
-	numberRe     = regexp.MustCompile(`(\d{6,})`)
+	pathCourseRe  = regexp.MustCompile(`/(?:m/|web/|school/)?course/(\d+)`)
+	pathGroupRe   = regexp.MustCompile(`/(?:m/|web/)?group/(\d+)`)
+	pathSeriesRe  = regexp.MustCompile(`/(?:m/)?(?:program|series)/(\d+)|/group/(\d+)/series/(\d+)`)
+	pathVideoRe   = regexp.MustCompile(`/v/(\d+)`)
+	numberRe      = regexp.MustCompile(`(\d{6,})`)
+	numberTokenRe = regexp.MustCompile(`\d+`)
 )
 
 func (ct *CCTalk) Extract(rawURL string, opts *extractor.ExtractOpts) (*extractor.MediaInfo, error) {
@@ -63,7 +62,7 @@ func (ct *CCTalk) Extract(rawURL string, opts *extractor.ExtractOpts) (*extracto
 	}
 	c := util.NewClient()
 	c.SetCookieJar(opts.Cookies)
-	ctx := &apiClient{c: c, headers: baseHeaders()}
+	ctx := &apiClient{c: c, headers: baseHeaders(), jar: opts.Cookies}
 	id := parseIDs(rawURL)
 
 	if id.VideoID != "" {
@@ -79,15 +78,34 @@ func (ct *CCTalk) Extract(rawURL string, opts *extractor.ExtractOpts) (*extracto
 	var structs any
 	switch {
 	case id.SeriesID != "":
-		title = "cctalk_" + id.SeriesID
+		if info := ctx.getSeriesInfo(id.SeriesID); len(info) > 0 {
+			title = firstNonEmpty(textValue(info, "courseName", "seriesName", "title", "name"), "cctalk_"+id.SeriesID)
+		} else {
+			title = "cctalk_" + id.SeriesID
+		}
 		structs = ctx.getSeriesStructs(id.SeriesID)
 	case id.GroupID != "":
-		title = "cctalk_" + id.GroupID
+		if info := ctx.getGroupInfo(id.GroupID); len(info) > 0 {
+			title = firstNonEmpty(textValue(info, "courseName", "groupName", "title", "name"), "cctalk_"+id.GroupID)
+		} else {
+			title = "cctalk_" + id.GroupID
+		}
 		structs = ctx.getGroupVideoList(id.GroupID, id.SeriesID)
+		if id.SeriesID == "" && len(walkMaps(structs)) == 0 {
+			structs = ctx.getGroupSeriesStructs(id.GroupID, ctx.getGroupSeries(id.GroupID))
+		}
 	case id.CourseID != "":
-		title = "cctalk_" + id.CourseID
+		if info := ctx.getCourseDetail(id.CourseID); len(info) > 0 {
+			title = firstNonEmpty(textValue(info, "courseName", "title", "name"), "cctalk_"+id.CourseID)
+		} else {
+			title = "cctalk_" + id.CourseID
+		}
 		structs = ctx.getCourseStructs(id.CourseID)
 	default:
+		courses := ctx.getSubscribeCourses()
+		if len(courses) > 0 {
+			return courseListMedia("cctalk_my_courses", courses), nil
+		}
 		return nil, fmt.Errorf("cannot parse cctalk course/group/series/video id from URL")
 	}
 
@@ -101,6 +119,7 @@ func (ct *CCTalk) Extract(rawURL string, opts *extractor.ExtractOpts) (*extracto
 type apiClient struct {
 	c       *util.Client
 	headers map[string]string
+	jar     http.CookieJar
 }
 
 func baseHeaders() map[string]string {
@@ -154,209 +173,6 @@ func (a *apiClient) requestJSON(u string, data map[string]string, method string)
 	return out
 }
 
-func (a *apiClient) getCourseDetail(courseID string) map[string]any {
-	if strings.TrimSpace(courseID) == "" {
-		return nil
-	}
-	endpoints := [][2]string{
-		{fmt.Sprintf("/course/%s/course_detail", courseID), "v1.1"},
-		{fmt.Sprintf("/course/%s/course_detail", courseID), "v1.2"},
-		{fmt.Sprintf("/course/%s/detail", courseID), "v1.1"},
-	}
-	for _, ep := range endpoints {
-		data := asMap(extractData(a.requestAPI(ep[0], nil, "", ep[1])))
-		if len(data) > 0 {
-			return data
-		}
-	}
-	// fallback: params-based detail
-	data := asMap(extractData(a.requestAPI("/course/detail", map[string]string{"courseId": courseID}, "", "v1.1")))
-	if len(data) > 0 {
-		return data
-	}
-	return nil
-}
-
-func (a *apiClient) getGroupInfo(groupID string) map[string]any {
-	if strings.TrimSpace(groupID) == "" {
-		return nil
-	}
-	for _, path := range []string{
-		fmt.Sprintf("/webapi/im/v1.3/group/%s/info?isRichInfo=true", groupID),
-		fmt.Sprintf("/webapi/im/v1.1/group/%s/baseinfo", groupID),
-	} {
-		data := asMap(extractData(a.requestJSON(CCTALK_BASE_URL+path, nil, "")))
-		if len(data) > 0 {
-			data["groupId"] = groupID
-			if _, ok := data["courseId"]; !ok {
-				data["courseId"] = groupID
-			}
-			if gn := textValue(data, "groupName"); gn != "" {
-				if _, ok := data["courseName"]; !ok {
-					data["courseName"] = gn
-				}
-			}
-			return data
-		}
-	}
-	return nil
-}
-
-func (a *apiClient) getSeriesInfo(seriesID string) map[string]any {
-	if strings.TrimSpace(seriesID) == "" {
-		return nil
-	}
-	for _, ep := range [][2]string{
-		{fmt.Sprintf("/series/%s/get_series_info", seriesID), "v1.1"},
-		{fmt.Sprintf("/series/%s/get_series_info", seriesID), "v1.2"},
-	} {
-		data := asMap(extractData(a.requestAPI(ep[0], nil, "", ep[1])))
-		if len(data) > 0 {
-			data["seriesId"] = seriesID
-			return data
-		}
-	}
-	return nil
-}
-
-func (a *apiClient) getGroupSeries(groupID string) []map[string]any {
-	if strings.TrimSpace(groupID) == "" {
-		return nil
-	}
-	var result []map[string]any
-	seen := map[string]bool{}
-	offset := 0
-	for i := 0; i < 20; i++ {
-		var page []any
-		for _, version := range []string{"v1.2", "v1.1"} {
-			data := extractData(a.requestAPI(
-				fmt.Sprintf("/series/group/%s/series", groupID),
-				map[string]string{"limit": "50", "start": fmt.Sprint(offset)},
-				"", version,
-			))
-			if list := extractList(data); len(list) > 0 {
-				page = list
-				break
-			}
-		}
-		for _, item := range page {
-			m := asMap(item)
-			if m == nil {
-				continue
-			}
-			m["groupId"] = groupID
-			if _, ok := m["courseId"]; !ok {
-				m["courseId"] = firstNonEmpty(textValue(m, "seriesId"), textValue(m, "id"))
-			}
-			if _, ok := m["courseName"]; !ok {
-				m["courseName"] = firstNonEmpty(textValue(m, "seriesName"), textValue(m, "name"), textValue(m, "title"))
-			}
-			key := firstNonEmpty(textValue(m, "seriesId"), textValue(m, "courseId"), textValue(m, "id"))
-			if key != "" && !seen[key] {
-				seen[key] = true
-				result = append(result, m)
-			}
-		}
-		if len(page) == 0 || len(page) < 50 {
-			break
-		}
-		offset += len(page)
-	}
-	return result
-}
-
-func (a *apiClient) getLessonInfo(lessonID string) map[string]any {
-	if strings.TrimSpace(lessonID) == "" {
-		return nil
-	}
-	for _, source := range []string{"0", "1", "2", ""} {
-		data := asMap(extractData(a.requestAPI("/course/get_lesson_info",
-			map[string]string{"lessonId": lessonID, "source": source, "withCourse": "true"},
-			"", "v1.1")))
-		if len(data) > 0 {
-			return data
-		}
-	}
-	return nil
-}
-
-func (a *apiClient) getSubscribeCourses() []map[string]any {
-	var result []map[string]any
-	seen := map[string]bool{}
-
-	// Phase 1: my_group_list
-	offset := 0
-	for i := 0; i < 20; i++ {
-		body, err := a.c.GetString(
-			fmt.Sprintf(my_group_list_url, offset, 20, ""),
-			mergeSS(a.headers, map[string]string{"Referer": mycourse_url, "Origin": mobile_url}),
-		)
-		if err != nil {
-			break
-		}
-		var raw map[string]any
-		if json.Unmarshal([]byte(body), &raw) != nil {
-			break
-		}
-		data := asMap(extractData(raw))
-		page := extractList(data)
-		for _, item := range page {
-			m := asMap(item)
-			if m == nil {
-				continue
-			}
-			key := firstNonEmpty(textValue(m, "courseId", "seriesId", "groupId", "id"))
-			if key != "" && !seen[key] {
-				seen[key] = true
-				result = append(result, m)
-			}
-		}
-		hasMore := false
-		if data != nil {
-			if np, ok := data["nextPage"]; ok {
-				if npInt, ok2 := np.(float64); ok2 && int(npInt) > offset {
-					offset = int(npInt)
-					hasMore = true
-				}
-			}
-		}
-		if len(page) == 0 || !hasMore {
-			break
-		}
-	}
-
-	// Phase 2: course_subscribe_list per type
-	for _, courseType := range []string{"1", "2", "0"} {
-		timeline := ""
-		for i := 0; i < 20; i++ {
-			params := map[string]string{"limit": "50", "timeline": timeline, "courseType": courseType}
-			data := asMap(extractData(a.requestAPI("/user/course_subscribe_list", params, "", "v1.1")))
-			page := extractList(data)
-			for _, item := range page {
-				m := asMap(item)
-				if m == nil {
-					continue
-				}
-				key := firstNonEmpty(textValue(m, "courseId", "seriesId", "groupId", "id"))
-				if key != "" && !seen[key] {
-					seen[key] = true
-					result = append(result, m)
-				}
-			}
-			nextTimeline := ""
-			if data != nil {
-				nextTimeline = firstNonEmpty(textValue(data, "nextTimeline", "next_timeline", "timeline"))
-			}
-			if len(page) == 0 || nextTimeline == "" || nextTimeline == timeline {
-				break
-			}
-			timeline = nextTimeline
-		}
-	}
-
-	return result
-}
-
 func (a *apiClient) getCourseStructs(courseID string) any {
 	for _, version := range []string{"v1.1", "v1.2"} {
 		data := extractData(a.requestAPI(fmt.Sprintf("/course/%s/course_structs", courseID), map[string]string{"orderType": "1"}, "", version))
@@ -392,10 +208,50 @@ func (a *apiClient) getSeriesStructs(seriesID string) any {
 }
 
 func (a *apiClient) getGroupVideoList(groupID, seriesID string) any {
-	data := extractData(a.requestAPI(fmt.Sprintf("/group/%s/new_video_list", groupID), map[string]string{
-		"start": "0", "seriesId": seriesID, "searchKey": "", "limit": "50", "groupId": groupID,
-	}, "", "v1.1"))
-	return extractList(data)
+	groupID = strings.TrimSpace(groupID)
+	seriesID = strings.TrimSpace(seriesID)
+	if groupID == "" {
+		return nil
+	}
+	var out []any
+	seen := map[string]bool{}
+	start := 0
+	for i := 0; i < 20; i++ {
+		data := extractData(a.requestAPI(fmt.Sprintf("/group/%s/new_video_list", groupID), map[string]string{
+			"start": fmt.Sprint(start), "seriesId": seriesID, "searchKey": "", "limit": "50", "groupId": groupID,
+		}, "", "v1.1"))
+		page := extractList(data)
+		if len(page) == 0 {
+			break
+		}
+		for _, item := range page {
+			m := asMap(item)
+			if m == nil {
+				out = append(out, item)
+				continue
+			}
+			m["groupId"] = groupID
+			if seriesID != "" {
+				if _, ok := m["seriesId"]; !ok {
+					m["seriesId"] = seriesID
+				}
+			}
+			key := firstNonEmpty(textValue(m, "contentId", "videoId", "lessonId", "id", "bizId"), textValue(m, "title", "name", "videoName", "lessonName"))
+			if key != "" {
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
+			}
+			out = append(out, m)
+		}
+		if len(page) < 50 {
+			break
+		}
+		start += len(page)
+	}
+	sortGroupVideoItems(out)
+	return out
 }
 
 func (a *apiClient) getVideoPlayInfo(videoID, seriesID string) map[string]any {
@@ -535,6 +391,10 @@ func walkMaps(v any) []map[string]any {
 			for _, it := range x {
 				walk(it)
 			}
+		case []map[string]any:
+			for _, it := range x {
+				walk(it)
+			}
 		case map[string]any:
 			out = append(out, x)
 			for _, k := range []string{"children", "childs", "nodes", "lessons", "lessonList", "items", "list", "contents", "contentList", "videoList", "videos", "recordList", "mediaList", "playList"} {
@@ -646,17 +506,6 @@ func pickFormat(s string) string {
 	return "mp4"
 }
 
-func mergeSS(base, extra map[string]string) map[string]string {
-	out := make(map[string]string, len(base)+len(extra))
-	for k, v := range base {
-		out[k] = v
-	}
-	for k, v := range extra {
-		out[k] = v
-	}
-	return out
-}
-
 func firstNonEmpty(values ...string) string {
 	for _, v := range values {
 		if strings.TrimSpace(v) != "" {
@@ -664,4 +513,50 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func sortGroupVideoItems(items []any) {
+	if len(items) <= 1 {
+		return
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		leftKind, leftValue := groupVideoSortKey(items[i], i)
+		rightKind, rightValue := groupVideoSortKey(items[j], j)
+		if leftKind != rightKind {
+			return leftKind < rightKind
+		}
+		if leftValue != rightValue {
+			return leftValue < rightValue
+		}
+		return i < j
+	})
+}
+
+func groupVideoSortKey(item any, fallback int) (int, int) {
+	m := asMap(item)
+	if m == nil {
+		return 3, fallback
+	}
+	for _, key := range []string{"showIndex", "sort", "sortIndex", "orderIndex", "index", "seq", "sequence"} {
+		if n := intFromAny(m[key]); n != 0 {
+			return 1, n
+		}
+	}
+	for _, key := range []string{"contentId", "videoId", "lessonId", "id", "bizId"} {
+		if n := intFromAny(m[key]); n != 0 {
+			return 2, n
+		}
+	}
+	if n := lastIntInString(textValue(m, "videoName", "contentName", "lessonName", "title", "name")); n != 0 {
+		return 2, n
+	}
+	return 3, fallback
+}
+
+func lastIntInString(s string) int {
+	matches := numberTokenRe.FindAllString(s, -1)
+	if len(matches) == 0 {
+		return 0
+	}
+	return intFromAny(matches[len(matches)-1])
 }

@@ -12,6 +12,7 @@ import (
 type luffySource struct {
 	URL, Type string
 	Size      int64
+	Extra     map[string]any
 }
 
 func luffyCookieString(jar http.CookieJar) string {
@@ -49,7 +50,10 @@ func luffyAPIURL(p string, params map[string]string) string {
 	if len(params) == 0 {
 		return p
 	}
-	u, _ := url.Parse(p)
+	u, err := url.Parse(p)
+	if err != nil || u == nil {
+		return ""
+	}
 	q := u.Query()
 	for k, v := range params {
 		if v != "" {
@@ -147,7 +151,10 @@ func luffyNormalizeURL(fileURL string, media bool) string {
 	if media {
 		return urlCDN + "/media/" + strings.TrimLeft(fileURL, "/")
 	}
-	u, _ := url.Parse(urlOrigin + "/")
+	u, err := url.Parse(urlOrigin + "/")
+	if err != nil || u == nil {
+		return ""
+	}
 	u.Path = path.Join(u.Path, fileURL)
 	return u.String()
 }

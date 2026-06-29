@@ -2,8 +2,10 @@
 package minshi
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/url"
 	"path"
 	"regexp"
@@ -28,6 +30,7 @@ const (
 	video_encrypted_api = "https://vip.minshiedu.com/api/learning/ext/course/videoEncryptedInfo/%s"
 	polyv_secure_url    = "https://player.polyv.net/secure/%s.json"
 	polyv_key_url       = "https://hls.videocc.net/playsafe/{path1}/{path2}/{vid}_{bitrate}.key?token={token}"
+	polyvIVHex          = "01020305070B0D1113171D0705030201"
 )
 
 var patterns = []string{`(?:[\w-]+\.)?minshiedu\.com/`}
@@ -100,12 +103,16 @@ func (s *Minshi) Extract(rawURL string, opts *extractor.ExtractOpts) (*extractor
 			continue
 		}
 		seen[vid] = true
-		streamURL, err := resolvePolyv(c, vid, h)
+		streamURL, manifest, err := resolvePolyv(c, vid, play.Token, h)
 		if err != nil || streamURL == "" {
 			continue
 		}
 		name := clean(fmt.Sprintf("[%d]--%s", i+1, first(le.Title, vid)))
-		entries = append(entries, &extractor.MediaInfo{Site: "minshi", Title: name, Streams: map[string]extractor.Stream{"best": {Quality: "best", URLs: []string{streamURL}, Format: formatOf(streamURL), Headers: h}}, Extra: map[string]any{"course_table_id": le.TableID, "video_id": vid, "playsafe": play.Token}})
+		extra := map[string]any{"course_table_id": le.TableID, "video_id": vid, "playsafe": play.Token}
+		if manifest != "" {
+			extra["m3u8_manifest"] = manifest
+		}
+		entries = append(entries, &extractor.MediaInfo{Site: "minshi", Title: name, Streams: map[string]extractor.Stream{"best": {Quality: "best", URLs: []string{streamURL}, Format: formatOf(streamURL), Headers: h}}, Extra: extra})
 	}
 	// Promote source materials / file artifacts to first-class entries.
 	fileEntries := collectFileEntries(c, cid, lessons, h)
@@ -137,26 +144,47 @@ func getPlayToken(c *util.Client, le lesson, cid string) playToken {
 	return playToken{}
 }
 
-func resolvePolyv(c *util.Client, vid string, h map[string]string) (string, error) {
+func resolvePolyv(c *util.Client, vid string, token string, h map[string]string) (string, string, error) {
+	if token != "" {
+		if manifest, sourceURL, err := getPolyvM3U8(c, vid, token, h); err == nil && sourceURL != "" {
+			return sourceURL, manifest, nil
+		}
+	}
 	sec, err := shared.PolyvResolveSecure(c, vid, h)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	m3u8, err := shared.PolyvPickBestManifest(sec)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if strings.HasPrefix(m3u8, "http") {
-		return m3u8, nil
+		return m3u8, "", nil
 	}
-	return m3u8, nil
+	return m3u8, "", nil
 }
 
 func requestAPI(c *util.Client, api, method string, data map[string]string, h map[string]string) (any, error) {
 	var body string
 	var err error
 	if method == "POST" {
-		body, err = c.PostForm(api, data, h)
+		payload, marshalErr := json.Marshal(data)
+		if marshalErr != nil {
+			return nil, marshalErr
+		}
+		resp, postErr := c.Post(api, bytes.NewReader(payload), h)
+		if postErr != nil {
+			return nil, postErr
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode >= 400 {
+			return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, api)
+		}
+		raw, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			return nil, readErr
+		}
+		body = string(raw)
 	} else {
 		body, err = c.GetString(api, h)
 	}
@@ -271,8 +299,8 @@ func normalizeFileFmt(raw, fileName, fileURL string) string {
 		raw = raw[i+1:]
 	}
 	mimeMap := map[string]string{
-		"vnd.openxmlformats-officedocument.wordprocessingml.document":    "docx",
-		"msword":    "doc",
+		"vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+		"msword": "doc",
 		"vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
 		"vnd.ms-powerpoint": "ppt",
 		"application/pdf":   "pdf",

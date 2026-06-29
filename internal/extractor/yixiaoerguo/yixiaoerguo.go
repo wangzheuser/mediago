@@ -3,6 +3,8 @@ package yixiaoerguo
 
 import (
 	"crypto/md5"
+	crand "crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -162,12 +164,22 @@ func (x *yxContext) apiHeaders(path string) map[string]string {
 		}
 	}
 	timestamp := fmt.Sprint(time.Now().UnixMilli())
-	nonce := fmt.Sprintf("%d", time.Now().UnixNano())
+	nonce := xscNonce()
 	saltSeed := nonce + timestamp
 	mid := len(saltSeed) / 2
 	salt := saltSeed[:2] + saltSeed[mid:mid+2] + saltSeed[len(saltSeed)-2:]
 	sum := md5.Sum([]byte(strings.ToUpper("salt=" + salt + "&path=" + uriPath)))
 	return map[string]string{"Accept": "application/json, text/plain, */*", "Authorization": x.token, "Content-Type": "application/json", "Origin": originURL, "Referer": refererURL, "XSC-API-VERSION": xscAPIVersion, "XSC-CLIENT": xscClient, "XSC-NONSTR": nonce, "XSC-TIMESTAMP": timestamp, "XSC-SIGN": hex.EncodeToString(sum[:])}
+}
+
+func xscNonce() string {
+	var b [16]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
 }
 
 func (x *yxContext) checkCookie() error {
@@ -286,15 +298,31 @@ func (x *yxContext) resolveEntry(v yxVideo) *extractor.MediaInfo {
 	if token == "" {
 		return nil
 	}
-	media := getQXRecordMedia(x.c, token)
-	playURL := firstString(media, "url", "cdn_url")
+	media := getQXRecordMedia(x.c, token, v.Duration)
+	playURLs := media.URLs
+	if len(playURLs) == 0 && media.URL != "" {
+		playURLs = []string{media.URL}
+	}
+	playURL := ""
+	if len(playURLs) > 0 {
+		playURL = playURLs[0]
+	}
 	if playURL == "" {
 		playURL = getQXHLSURL(x.c, token)
+		if playURL != "" {
+			playURLs = []string{playURL}
+		}
 	}
 	if playURL == "" {
 		return nil
 	}
-	return &extractor.MediaInfo{Site: "yixiaoerguo", Title: v.Title, Streams: map[string]extractor.Stream{"default": {Quality: "best", URLs: []string{playURL}, Format: pickFormat(playURL), Headers: map[string]string{"Referer": qxMediaReferer}}}, Extra: map[string]any{"section_id": v.SectionID, "qx_token": token}}
+	stream := extractor.Stream{Quality: "best", URLs: playURLs, Format: pickFormat(playURL), Size: media.SizeBytes, Headers: map[string]string{"Referer": qxMediaReferer}}
+	stream.NeedMerge = len(playURLs) > 1 || stream.Format == "m3u8"
+	extra := map[string]any{"section_id": v.SectionID, "qx_token": token, "qx_duration": media.Duration, "qx_size_mb": media.Size}
+	if len(media.Segments) > 0 {
+		extra["qx_segments"] = media.Segments
+	}
+	return &extractor.MediaInfo{Site: "yixiaoerguo", Title: v.Title, Streams: map[string]extractor.Stream{"default": stream}, Extra: extra}
 }
 
 func (x *yxContext) sectionPlayInfo(v yxVideo) map[string]any {
@@ -302,6 +330,8 @@ func (x *yxContext) sectionPlayInfo(v yxVideo) map[string]any {
 	typ, state := strings.ToUpper(v.Type), strings.ToUpper(v.State)
 	if typ == "LIVE" && !(state == "4" || state == "ENDED" || state == "FINISHED") {
 		order = []string{"live_info", "playback_info", "record_info"}
+	} else if typ == "RECORD" || typ == "VIDEO" {
+		order = []string{"record_info", "playback_info", "live_info"}
 	}
 	for _, kind := range order {
 		resp, err := x.requestAPI(fmt.Sprintf(sectionPlayInfoPathFmt, v.SectionID, kind), "GET", nil, nil)
@@ -329,7 +359,7 @@ func extractQXToken(v any) string {
 	return ""
 }
 
-func getQXRecordMedia(c *util.Client, token string) map[string]any {
+func getQXRecordMedia(c *util.Client, token string, expectedDuration string) qxMediaInfo {
 	for _, apiURL := range []string{qxRecordQueryURL, qxRecordQueryBackupURL, qxRecordQueryMuURL} {
 		body, err := c.GetString(apiURL+"?token="+url.QueryEscape(token), nil)
 		if err != nil {
@@ -341,7 +371,8 @@ func getQXRecordMedia(c *util.Client, token string) map[string]any {
 		}
 		dataURL := firstString(resp, "url")
 		if dataURL == "" && strings.HasPrefix(firstString(resp, "urlMedia"), "http") {
-			return map[string]any{"url": firstString(resp, "urlMedia")}
+			u := firstString(resp, "urlMedia")
+			return qxMediaInfo{URL: u, URLs: []string{u}, Raw: resp}
 		}
 		if dataURL == "" {
 			continue
@@ -354,11 +385,11 @@ func getQXRecordMedia(c *util.Client, token string) map[string]any {
 		if err != nil {
 			continue
 		}
-		if m := bestMedia(extractItems(mediaResp["data"])); len(m) > 0 {
-			return m
+		if info := buildQXMediaInfo(extractItems(mediaResp["data"]), expectedDuration); info.URL != "" || len(info.URLs) > 0 {
+			return info
 		}
 	}
-	return nil
+	return qxMediaInfo{}
 }
 
 func getQXHLSURL(c *util.Client, token string) string {
@@ -367,7 +398,7 @@ func getQXHLSURL(c *util.Client, token string) string {
 		if err != nil {
 			continue
 		}
-		resp, err := parseJSON(body)
+		resp, err := parseQXMaybeEncryptedJSON(body)
 		if err != nil {
 			continue
 		}
@@ -376,8 +407,77 @@ func getQXHLSURL(c *util.Client, token string) string {
 				return u
 			}
 		}
+		if address := findFirstStringDeep(resp, "cdn_url", "address", "playUrl", "url"); address != "" {
+			if decrypted := decryptQXHLSAddress(c, token, address); decrypted != "" {
+				return decrypted
+			}
+		}
 	}
 	_ = qxReplaySVRURL
-	_ = qxHLSEncryptURL
 	return ""
+}
+
+func decryptQXHLSAddress(c *util.Client, token, address string) string {
+	if token == "" || address == "" {
+		return ""
+	}
+	body, err := c.GetString(qxHLSEncryptURL+"?token="+url.QueryEscape(token), nil)
+	if err != nil {
+		return ""
+	}
+	servers := serverListFromQXEncrypt(body)
+	if len(servers) == 0 {
+		return ""
+	}
+	server := servers[0]
+	if !strings.HasPrefix(server, "http://") && !strings.HasPrefix(server, "https://") {
+		server = "https://" + server
+	}
+	payloadBytes, _ := json.Marshal(map[string]string{"address": address})
+	payload := base64.StdEncoding.EncodeToString(payloadBytes)
+	resp, err := c.Post(server+"/hls_address?token="+url.QueryEscape(token), strings.NewReader(qxJunkEncode(payload, 3, 1)), nil)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return ""
+	}
+	decoded := decodeQXBase64JSON(qxJunkDecode(string(b), 3, 1))
+	if decoded == nil {
+		return ""
+	}
+	if content := asMap(decoded["content"]); len(content) > 0 {
+		if u := firstString(content, "address", "url"); u != "" {
+			return u
+		}
+	}
+	return firstString(decoded, "address", "url")
+}
+
+func serverListFromQXEncrypt(body string) []string {
+	decoded := decodeQXBase64JSON(qxJunkDecode(body, 3, 1))
+	if decoded == nil {
+		return nil
+	}
+	list := firstNonNil(decoded["serverlist"], digAny(decoded, "data", "serverlist"))
+	var out []string
+	switch t := list.(type) {
+	case []any:
+		for _, it := range t {
+			if m := asMap(it); len(m) > 0 {
+				if addr := firstString(m, "addr", "url"); addr != "" {
+					out = append(out, addr)
+				}
+			} else if s := strings.TrimSpace(fmt.Sprint(it)); s != "" && s != "<nil>" {
+				out = append(out, s)
+			}
+		}
+	case map[string]any:
+		if addr := firstString(t, "addr", "url"); addr != "" {
+			out = append(out, addr)
+		}
+	}
+	return out
 }

@@ -70,6 +70,9 @@ func (k *Koolearn) Extract(rawURL string, opts *extractor.ExtractOpts) (*extract
 	// Mirrors Koolearn_App._select_my_course / _get_course_list which calls
 	// _get_course_list() + _get_course_list('hide') and filters by course-type.
 	classID := parseClassID(rawURL)
+	if classID == "" && isStudyCourseURL(rawURL) {
+		return extractStudyCourse(c, opts.Cookies, rawURL)
+	}
 	if classID == "" {
 		return discoverMyCourses(c, opts.Cookies, rawURL)
 	}

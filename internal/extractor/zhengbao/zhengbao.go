@@ -120,8 +120,20 @@ func (s *Zhengbao) Extract(rawURL string, opts *extractor.ExtractOpts) (*extract
 	for i := range wares {
 		wares[i].Index = i + 1
 		v, lookup := ctx.parseVideoTree(wares[i])
+		if len(v) == 0 {
+			v = directVideosFromCware(wares[i])
+			for _, item := range v {
+				if item.VideoID != "" {
+					lookup[item.VideoID] = item
+				}
+			}
+		}
 		videos = append(videos, v...)
-		files = append(files, ctx.parseMaterialTree(wares[i], lookup)...)
+		materials := ctx.parseMaterialTree(wares[i], lookup)
+		if len(materials) == 0 {
+			materials = directFilesFromCware(wares[i])
+		}
+		files = append(files, materials...)
 	}
 
 	entries := make([]*extractor.MediaInfo, 0, len(videos)+len(files))
@@ -312,7 +324,7 @@ func isRecordedCware(m map[string]any) bool {
 	formName := firstString(m, "courseFormName")
 	form := firstString(m, "courseForm")
 	dir := normalizeURL(firstString(m, "cwDirURL", "dirURL"))
-	return strings.Contains(formName, "录播") || form == "2" || strings.Contains(dir, "videoList") || strings.Contains(dir, "courseView") || firstString(m, "cwareId", "cwareID", "cwId") != ""
+	return strings.Contains(formName, "录播") || form == "2" || strings.Contains(dir, "videoList") || strings.Contains(dir, "courseView") || firstString(m, "cwareId", "cwareID", "cwId") != "" || directVideoURL(m) != "" || directFileURL(m) != ""
 }
 
 func (x *zbContext) doormanRequest(resourcePath string, params map[string]any) map[string]any {
@@ -382,7 +394,7 @@ func encryptParams(params map[string]any, serverTime int64) string {
 		body[k] = v
 	}
 	body["time"] = serverTime
-	plain, _ := json.Marshal(body)
+	plain := marshalCompactJSON(body)
 	block, err := aes.NewCipher([]byte(doormanAESKey))
 	if err != nil {
 		return ""
@@ -423,7 +435,7 @@ func pkcs7Pad(data []byte, blockSize int) []byte {
 }
 
 func (x *zbContext) postJSON(api string, payload map[string]any, referer string) map[string]any {
-	buf, _ := json.Marshal(payload)
+	buf := marshalCompactJSON(payload)
 	h := copyHeaders(x.headers)
 	h["Origin"] = memberOrigin
 	h["Content-Type"] = "application/json;charset=UTF-8"
@@ -560,7 +572,11 @@ func (x *zbContext) resolveVideo(v zbVideo, index int) (*extractor.MediaInfo, er
 		return nil, fmt.Errorf("zhengbao: no videoPath resolved")
 	}
 	name := cleanTitle(firstNonEmpty(v.Title, fmt.Sprintf("[%02d]--%s", index, v.VideoID)))
-	return &extractor.MediaInfo{Site: "zhengbao", Title: name, Streams: map[string]extractor.Stream{"default": {Quality: "source", URLs: []string{playURL}, Format: format, NeedMerge: format == "m3u8", Headers: map[string]string{"Referer": elearningHomeURL, "User-Agent": x.headers["User-Agent"]}}}, Extra: extra}, nil
+	var subtitles []extractor.Subtitle
+	if sub := firstNonEmpty(fmt.Sprint(extra["subtitle"])); sub != "" && sub != "<nil>" {
+		subtitles = append(subtitles, extractor.Subtitle{Language: "zh", URL: sub, Format: pickFormat(sub)})
+	}
+	return &extractor.MediaInfo{Site: "zhengbao", Title: name, Streams: map[string]extractor.Stream{"default": {Quality: "source", URLs: []string{playURL}, Format: format, NeedMerge: format == "m3u8", Headers: map[string]string{"Referer": elearningHomeURL, "User-Agent": x.headers["User-Agent"]}}}, Subtitles: subtitles, Extra: extra}, nil
 }
 
 func parseH5Vars(body string) map[string]any {
@@ -584,7 +600,7 @@ func parseH5Vars(body string) map[string]any {
 func fileEntry(f zbFile, index int) *extractor.MediaInfo {
 	u := firstNonEmpty(f.TokenURL, f.DirectURL)
 	name := cleanTitle(firstNonEmpty(f.Title, fmt.Sprintf("[%02d]--资料", index)))
-	return &extractor.MediaInfo{Site: "zhengbao", Title: name, Streams: map[string]extractor.Stream{"default": {Quality: "source", URLs: []string{u}, Format: f.Format, Headers: map[string]string{"Referer": elearningHomeURL}}}}
+	return &extractor.MediaInfo{Site: "zhengbao", Title: name, Streams: map[string]extractor.Stream{"default": {Quality: "source", URLs: []string{u}, Format: f.Format, Headers: map[string]string{"Referer": elearningHomeURL}}}, Extra: map[string]any{"type": "file"}}
 }
 
 func buildMaterialURL(fileToken, fileName, fmtHint string) string {

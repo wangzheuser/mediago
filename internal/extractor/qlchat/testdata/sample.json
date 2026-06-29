@@ -78,5 +78,12 @@
     "data": {
       "list": []
     }
+  },
+  "member_info": {
+    "code": 0,
+    "data": {
+      "name": "fixture user",
+      "uid": "u-1"
+    }
   }
 }

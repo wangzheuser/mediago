@@ -39,8 +39,8 @@ var moocCourseDocAPIs = []namedAPI{
 
 var (
 	patterns = []string{
-		`\s*((https?://www\.icourses\.cn/sCourse/course_(?P<cid1>\d+)\.html)|(https?://www\.icourses\.cn/web/sword/portal/shareDetails\?.*?cId=(?P<cid2>\d+))|(https?://www\.icourses\.cn/shareCourseDetailModule/.*?courseId=(?P<cid3>\d+))|(https?://www\.icourses\.cn/shareCourseDetail\?.*?courseId=(?P<cid4>\d+)))`,
-		`\s*((https?://www\.icourses\.cn/web/sword/portal/videoDetail\?.*?courseId=(?P<cid1>[\w-]*))|(https?://www\.icourses\.cn/videoCourseDetail\?.*?courseId=(?P<cid2>[\w-]+))|(https?://www\.icourses\.cn/videoCoursePlayer\?.*?courseId=(?P<cid3>[\w-]+)))`,
+		`\s*((https?://(?:[\w-]+\.)?icourses\.cn/sCourse/course_(?P<cid1>\d+)\.html)|(https?://(?:[\w-]+\.)?icourses\.cn/web/sword/portal/shareDetails\?.*?cId=(?P<cid2>\d+))|(https?://(?:[\w-]+\.)?icourses\.cn/shareCourseDetailModule/.*?courseId=(?P<cid3>\d+))|(https?://(?:[\w-]+\.)?icourses\.cn/shareCourseDetail\?.*?courseId=(?P<cid4>\d+)))`,
+		`\s*((https?://(?:[\w-]+\.)?icourses\.cn/web/sword/portal/videoDetail\?.*?courseId=(?P<cid1>[\w-]*))|(https?://(?:[\w-]+\.)?icourses\.cn/videoCourseDetail\?.*?courseId=(?P<cid2>[\w-]+))|(https?://(?:[\w-]+\.)?icourses\.cn/videoCoursePlayer\?.*?courseId=(?P<cid3>[\w-]+)))`,
 	}
 
 	sCourseRe  = regexp.MustCompile(`(?i)/sCourse/course_(\d+)\.html`)

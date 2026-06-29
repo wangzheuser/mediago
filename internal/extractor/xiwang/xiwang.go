@@ -22,7 +22,7 @@ type brandConfig struct {
 	name       string // "xiwang" / "xiwang.suyang" / "xiwang.youke"
 	referer    string
 	checkLogin string
-	courseURL   string
+	courseURL  string
 	infoURL    string
 	videoPlay  string
 	livePlay   string
@@ -40,7 +40,7 @@ var xiwangBrand = brandConfig{
 	name:       "xiwang",
 	referer:    "https://www.xiwang.com",
 	checkLogin: "https://api.xue.xiwang.com/login/V1/Web/checkLogin?X-Businessline-Id=30",
-	courseURL:   "https://i.bcc.xiwang.com/icenter-go/App/StudyCenter/MyCourse/stuCourseList",
+	courseURL:  "https://i.bcc.xiwang.com/icenter-go/App/StudyCenter/MyCourse/stuCourseList",
 	infoURL:    "https://i.bcc.xiwang.com/icenter-go/App/StudyCenter/MyPlans/planListV2",
 	videoPlay:  "https://studentlive.bcc.xiwang.com/v1/student/classroom/playback/enter",
 	livePlay:   "https://lecturepie.bcc.xiwang.com/v1/student/classroom/playback/enter",
@@ -57,7 +57,7 @@ var suyangBrand = brandConfig{
 	name:       "xiwang.suyang",
 	referer:    "https://www.xiwang.com",
 	checkLogin: "https://api.xue.xi-xue.com/login/V1/Web/checkLogin?X-Businessline-Id=40",
-	courseURL:   "https://i.bcc.xiwang.com/icenter-go/App/StudyCenter/MyCourse/stuCourseList",
+	courseURL:  "https://i.bcc.xiwang.com/icenter-go/App/StudyCenter/MyCourse/stuCourseList",
 	infoURL:    "https://i.bcc.xiwang.com/icenter-go/App/StudyCenter/MyPlans/planListV2",
 	videoPlay:  "https://studentlive.bcc.xiwang.com/v1/student/classroom/playback/enter",
 	livePlay:   "https://lecturepie.bcc.xiwang.com/v1/student/classroom/playback/enter",
@@ -74,7 +74,7 @@ var youkeBrand = brandConfig{
 	name:       "xiwang.youke",
 	referer:    "https://www.xiwang.com",
 	checkLogin: "https://api.xue.wen-su.com/login/V1/Web/checkLogin?X-Businessline-Id=30",
-	courseURL:   "https://i.bcc.wen-su.com/icenter-go/App/StudyCenter/MyCourse/stuCourseList",
+	courseURL:  "https://i.bcc.wen-su.com/icenter-go/App/StudyCenter/MyCourse/stuCourseList",
 	infoURL:    "https://i.bcc.wen-su.com/icenter-go/App/StudyCenter/MyPlans/planListV2",
 	videoPlay:  "https://studentlive.bcc.wen-su.com/v1/student/classroom/playback/enter",
 	livePlay:   "https://lecturepie.bcc.wen-su.com/v1/student/classroom/playback/enter",

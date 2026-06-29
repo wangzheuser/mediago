@@ -63,6 +63,12 @@ func TestExtractMock(t *testing.T) {
 	}
 }
 
+func TestKeqqPageTitleNilPage(t *testing.T) {
+	if got := keqqPageTitle(nil, "", "123"); got != "keqq_123" {
+		t.Fatalf("keqqPageTitle(nil) = %q, want %q", got, "keqq_123")
+	}
+}
+
 func loadSampleFixture(t *testing.T) []byte {
 	t.Helper()
 	data, err := os.ReadFile(filepath.Join("testdata", "sample.json"))

@@ -63,11 +63,18 @@ func (r *Renrenjiang) Extract(rawURL string, opts *extractor.ExtractOpts) (*extr
 	}
 	if courseType == "activity" {
 		detail, _ := requestJSON(c, "GET", fmt.Sprintf(activity_detail_api, cid), map[string]string{"u": auth.UserID}, nil, h)
-		entry, err := resolveActivity(c, h, auth.UserID, cid, first(textAt(unwrapMap(detail), "title", "name"), "renrenjiang_"+cid))
+		title := first(textAt(unwrapMap(detail), "title", "name"), "renrenjiang_"+cid)
+		entry, err := resolveActivity(c, h, auth.UserID, cid, title)
 		if err != nil {
 			return nil, err
 		}
-		entry.Extra = mergeExtra(entry.Extra, map[string]any{"activity_detail": detail, "documents": getDocuments(c, h, auth.UserID, cid, false)})
+		docs := getDocuments(c, h, auth.UserID, cid, false)
+		entry.Extra = mergeExtra(entry.Extra, map[string]any{"activity_detail": detail, "documents": docs})
+		docEntries := documentEntries(docs, entry.Title, h)
+		if len(docEntries) > 0 {
+			entries := append([]*extractor.MediaInfo{entry}, docEntries...)
+			return &extractor.MediaInfo{Site: "renrenjiang", Title: sanitize(title), Entries: dedupeEntries(entries), Extra: map[string]any{"activity_detail": detail, "documents": docs}}, nil
+		}
 		return entry, nil
 	}
 	detail, _ := requestJSON(c, "GET", fmt.Sprintf(column_detail_api, cid), map[string]string{"u": auth.UserID}, nil, h)
@@ -83,16 +90,20 @@ func (r *Renrenjiang) Extract(rawURL string, opts *extractor.ExtractOpts) (*extr
 			continue
 		}
 		name := sanitize(fmt.Sprintf("[%d]--%s", i+1, first(textAt(lesson, "title", "name"), id)))
+		docs := getDocuments(c, h, auth.UserID, id, false)
 		entry, err := resolveActivity(c, h, auth.UserID, id, name)
 		if err == nil && entry != nil {
-			entry.Extra = mergeExtra(entry.Extra, map[string]any{"activity": lesson, "documents": getDocuments(c, h, auth.UserID, id, false)})
+			entry.Extra = mergeExtra(entry.Extra, map[string]any{"activity": lesson, "documents": docs})
 			entries = append(entries, entry)
 		}
+		entries = append(entries, documentEntries(docs, name, h)...)
 	}
+	courseDocs := getDocuments(c, h, auth.UserID, cid, true)
+	entries = append(entries, documentEntries(courseDocs, "课程资料", h)...)
 	if len(entries) == 0 {
-		return nil, fmt.Errorf("renrenjiang: no playable activity streams found")
+		return nil, fmt.Errorf("renrenjiang: no playable activity streams or documents found")
 	}
-	return &extractor.MediaInfo{Site: "renrenjiang", Title: sanitize(title), Entries: entries, Extra: map[string]any{"course_id": cid, "course_type": courseType, "documents": getDocuments(c, h, auth.UserID, cid, true)}}, nil
+	return &extractor.MediaInfo{Site: "renrenjiang", Title: sanitize(title), Entries: dedupeEntries(entries), Extra: map[string]any{"course_id": cid, "course_type": courseType, "documents": courseDocs}}, nil
 }
 
 type authInfo struct{ Token, UserID string }
@@ -171,8 +182,15 @@ func resolveActivity(c *util.Client, h map[string]string, userID, activityID, ti
 	return &extractor.MediaInfo{Site: "renrenjiang", Title: sanitize(title), Streams: map[string]extractor.Stream{"best": {Quality: "best", URLs: []string{play.URL}, Format: pickFormat(play.URL), Size: play.Size, Headers: map[string]string{"Referer": REFERER, "Origin": ORIGIN}}}, Extra: map[string]any{"activity_id": activityID}}, nil
 }
 func resolveActivityStream(c *util.Client, h map[string]string, userID, id string) playInfo {
-	for _, api := range []string{fmt.Sprintf(activity_stream_api, id), fmt.Sprintf(activity_stream_url_api, id)} {
-		resp, err := requestJSON(c, "GET", api, map[string]string{"u": userID, "leak": "0"}, nil, h)
+	endpoints := []struct {
+		api    string
+		params map[string]string
+	}{
+		{fmt.Sprintf(activity_stream_api, id), map[string]string{"u": userID, "leak": "0"}},
+		{fmt.Sprintf(activity_stream_url_api, id), map[string]string{"u": userID}},
+	}
+	for _, endpoint := range endpoints {
+		resp, err := requestJSON(c, "GET", endpoint.api, endpoint.params, nil, h)
 		if err != nil {
 			continue
 		}
@@ -233,14 +251,31 @@ func pickQCloudURL(v any) playInfo {
 }
 func getDocuments(c *util.Client, h map[string]string, userID, id string, column bool) []map[string]any {
 	api, params := activity_docs_api, map[string]string{"product_id": id, "u": userID}
-	if column {
-		api, params = column_docs_api, map[string]string{"product_id": id, "u": userID, "page": "1", "pageSize": "100"}
+	if !column {
+		resp, err := requestJSON(c, "GET", api, params, nil, h)
+		if err != nil {
+			return nil
+		}
+		return dedupeDocuments(extractItems(resp, "list", "documents", "data"))
 	}
-	resp, err := requestJSON(c, "GET", api, params, nil, h)
-	if err != nil {
-		return nil
+	api = column_docs_api
+	var out []map[string]any
+	for page := 1; page <= 20; page++ {
+		params = map[string]string{"product_id": id, "u": userID, "page": fmt.Sprint(page), "pageSize": "100"}
+		resp, err := requestJSON(c, "GET", api, params, nil, h)
+		if err != nil {
+			break
+		}
+		items := extractItems(resp, "list", "documents", "data")
+		if len(items) == 0 {
+			break
+		}
+		out = append(out, items...)
+		if len(items) < 100 {
+			break
+		}
 	}
-	return extractItems(resp, "list", "documents", "data")
+	return dedupeDocuments(out)
 }
 func requestJSON(c *util.Client, method, path string, params, data, h map[string]string) (any, error) {
 	u := path

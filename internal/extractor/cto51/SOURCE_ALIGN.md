@@ -1,34 +1,45 @@
 # cto51 源码对齐对照
 
-## URL 常量
+Python 参考:
 
-| .cdc.py 行 | cto51.go 行/名 | 一致? |
+- `/home/sophomores/code/xwz-downloader-source-release/restored_source/Mooc/Courses/Cto51/Cto51_Course.py`
+- `/mnt/e/LEL/dis_all_output/` 中的 Cto51 函数级反编译输出
+
+## 入口与路由
+
+| Python 逻辑 | Go 实现 | 覆盖点 |
 |---|---|---|
-| `Cto51_Base.pyc.1shot.cdc.py:31-32` `referer/study_url` | `helpers.go:29`, `cto51.go:22` | ✓ |
-| `Cto51_Course.pyc.1shot.cdc.py:55-65` course/lesson/API/qcloud URL | `cto51.go:26-36` | ✓ |
-| `Cto51_Course.pyc.1shot.cdc.py:66-73` training/order URL | `cto51.go:37-44` | ✓ |
-| `Cto51_Course.pyc.1shot.cdc.py:75-79` regex for lesson/train/aliplayparam | `cto51.go:60-69` | ✓ |
+| `_COURSE_RE`, `_LESSON_RE`, `_TRAIN_RE`, `_TRAIN_LESSON_RE` | `parseRoute`, `courseIDFromURL`, `lessonIDFromURL`, `trainCourseIDFromURL` | 普通课程, 单课, 训练营, `id=trainCourse_lesson` 组合课时 |
+| `_get_course_list` | `resolveMyCourses`, `fetchMyCoursePayloads`, `courseRefsFromPayloads`, `courseRefsFromHTML` | 课程列表 API, 类型分页, 订单兜底, study HTML 兜底 |
+| 单课/课程/训练营分发 | `Extract`, `resolveCourse`, `resolveLesson`, `resolveTraining`, `resolveTrainingLesson` | `ListOnly` 与实际下载解析分离 |
 
-## HTTP 调用
+## 课程目录与章节
 
-| 源码方法 | Go 函数 | method | 一致? |
-|---|---|---|---|
-| `_request_json_get` `1497-1510` | `fetchJSONPayloads` `190-205` | GET + JSON | ✓ |
-| `_request_text` `1517-1531` | `resolveLesson/resolveCourse` `130-149`, `93-128` | GET HTML | ✓ |
-| `_fetch_lesson_page_payloads` `3342-3379` | `resolveCourse` `93-128` + `urlLessonListAPI` | GET + JSON | ✓ |
-| training fetch `_fetch_training_course_payloads` `2164-2191` | `resolveTraining` `152-172` | GET + JSON | ✓ |
-| `_request_qcloud_play_info` / `qcloud_play_api` | `resolveAuth` `259-272` | GET qcloud playinfo | ✓ |
-
-## JSON 字段映射
-
-| 源码 key 链 | Go parse | 一致? |
+| Python 逻辑 | Go 实现 | 覆盖点 |
 |---|---|---|
-| `data.lessonList` / `lesson_list` / nested lesson nodes | `collectMedia` recursive maps | ✓ |
-| `lesson_id/lessonId`, `lesson_name/lessonName`, `title/name` | `collectMedia` title and route extraction | ✓ |
-| `var aliplayparam = {...}` | `parseAliPlayParam` | ✓ |
-| `app_id/appId`, `file_id/fileId/fileID/vid`, `psign/pSign/playAuth/sign/token` | `authFromMap` + `decodePlayAuth` | ✓ |
-| `play_url/playUrl`, `video_url/videoUrl`, `m3u8`, `file_url/fileUrl`, `path` | `collectMedia` + `mediaFromText` | ✓ |
+| `_fetch_lesson_page_payloads` | `fetchCoursePayloads`, `fetchPagedJSONPayloads` | `lesson-list`, `index-api`, 多页去重 |
+| `_extract_lesson_list_from_payloads`, `_extract_outline_from_json` | `lessonsFromPayloads`, `lessonsFromAny`, `lessonRefFromMap` | `lesson_id/lessonId/id`, chapter title 继承, live/replay, training lesson |
+| HTML 目录兜底 | `parseLessonLinks` | `/lesson/{id}.html` 链接兜底 |
 
-## 阻塞步骤
+## 视频源
 
-无。
+| Python 逻辑 | Go 实现 | 覆盖点 |
+|---|---|---|
+| `_ALIPLAYPARAM_RE`, `_request_vod_play_auth` | `parseAliPlayParam`, `requestVodPlayAuth`, `authFromVodPayload` | `sign/vod_video_id_auth/playAuth`, 多参数候选, 响应 auth 覆盖请求 auth |
+| `_request_qcloud_play_info`, `_rsa_encrypt_overlay` | `qcloudPlayParams`, `rsaEncryptOverlay`, `resolveAuth` | QCloud `getplayinfo/v4`, `cipheredOverlayKey/Iv`, `keyId`, `psign` |
+| `_request_aliyun_play_info_by_rand` | `resolveAuth` + `shared.AliyunResolvePlayInfo` | Aliyun STS GetPlayInfo, `Rand`, m3u8 拉取, AliyunVoDEncryption key rewrite |
+| 直接 URL/播放页兜底 | `collectMedia`, `resolvePlayPage`, `mediaFromText`, `videoFromText` | m3u8/mp4/flv/audio, live/play/replay 页面 |
+
+## 文件资料
+
+| Python 逻辑 | Go 实现 | 覆盖点 |
+|---|---|---|
+| `_fetch_lesson_file_list_payloads`, `_fetch_course_file_list_payloads` | `fetchCoursePayloads`, `fetchTrainingPayloads` | 课程资料, 课时资料, 训练营资料分页 |
+| `_extract_files_from_json` | `filesFromPayloads`, `filesFromAny`, `fileRefsFromMap` | `fileUrl/downloadUrl/downUrl/attachUrl`, pack file, lesson/chapter metadata |
+| `_extract_file_entries_from_html` | `filesFromHTML` | HTML anchor 与裸文件 URL |
+| 下载项构造 | `fileEntry` | 文件 stream, format, size, headers, `Extra.type=file` |
+
+## 验证
+
+- `go test -count=1 ./internal/extractor/cto51/...`
+- `go vet ./internal/extractor/cto51/...`

@@ -87,8 +87,10 @@ func (s *Enetedu) Extract(rawURL string, opts *extractor.ExtractOpts) (*extracto
 	if media := findMediaURL(detail); media != "" {
 		entries = append(entries, mediaInfo(title, media, headers))
 	}
+	entries = append(entries, fileEntries(parseNoticeFiles(data), headers)...)
+	entries = append(entries, fileEntries(parseCourseFiles(c, headers, courseID), headers)...)
 	if len(entries) == 0 {
-		return nil, fmt.Errorf("enetedu: no playable video URL for course %s", courseID)
+		return nil, fmt.Errorf("enetedu: no playable video URL or course file for course %s", courseID)
 	}
 	return &extractor.MediaInfo{Site: "enetedu", Title: util.SanitizeFilename(title), Entries: dedupe(entries)}, nil
 }
@@ -110,6 +112,19 @@ func parseLearningTree(c *util.Client, headers map[string]string, courseID strin
 	}
 	var out []videoInfo
 	walkLearningPayload(dataOfAny(payload), &out)
+	return out
+}
+
+func parseCourseFiles(c *util.Client, headers map[string]string, courseID string) []fileInfo {
+	if courseID == "" {
+		return nil
+	}
+	payload, err := requestJSON(c, course_file_path, map[string]string{"courseId": courseID}, nil, "GET", headers)
+	if err != nil {
+		return nil
+	}
+	var out []fileInfo
+	walkFilePayload(dataOfAny(payload), &out)
 	return out
 }
 
@@ -233,14 +248,26 @@ func requestHeaders(jar http.CookieJar, raw string) map[string]string {
 		"Referer": firstNonEmpty(raw, referer),
 		"Origin":  origin,
 	}
+	cookieParts := []string{}
+	seenCookies := map[string]bool{}
 	for _, host := range []string{"www.enetedu.com", "enetedu.com"} {
 		u := &url.URL{Scheme: "https", Host: host, Path: "/"}
 		for _, cookie := range jar.Cookies(u) {
+			key := cookie.Name + "=" + cookie.Value
+			if !seenCookies[key] {
+				seenCookies[key] = true
+				cookieParts = append(cookieParts, key)
+			}
 			if cookie.Name == token_key || strings.EqualFold(cookie.Name, "token") {
 				headers[token_key] = cookie.Value
 				headers["Authorization"] = cookie.Value
 			}
 		}
+	}
+	if len(cookieParts) > 0 {
+		cookieHeader := strings.Join(cookieParts, "; ")
+		headers["Cookie"] = cookieHeader
+		headers["cookie"] = cookieHeader
 	}
 	return headers
 }

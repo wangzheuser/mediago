@@ -65,8 +65,8 @@ func (a activityItem) name() string {
 //	course_list -> category/list -> studentUnitList -> studentUnitActivityList
 //	  type 4/5 (video) -> recordClass/get or getLessonRecordInfo -> m3u8 token
 //	  type 1 (homework) -> homework/get -> file/getDownInfo
-func (ci *Classin) extractCourseTree(c *util.Client, in ids, headers map[string]string) (*extractor.MediaInfo, error) {
-	courses := listCourses(c)
+func (ci *Classin) extractCourseTree(c *util.Client, in ids, headers map[string]string, auth classinAuth) (*extractor.MediaInfo, error) {
+	courses := listCourses(c, auth)
 	if len(courses) == 0 {
 		return nil, fmt.Errorf("classin: course_list returned no courses")
 	}
@@ -86,7 +86,7 @@ func (ci *Classin) extractCourseTree(c *util.Client, in ids, headers map[string]
 	var entries []*extractor.MediaInfo
 	for _, course := range selected {
 		sid := firstNonEmpty(course.SchoolUID, in.SID)
-		node := ci.buildCourseEntry(c, sid, course, headers)
+		node := ci.buildCourseEntry(c, sid, course, headers, auth)
 		if node != nil {
 			entries = append(entries, node)
 		}
@@ -100,18 +100,18 @@ func (ci *Classin) extractCourseTree(c *util.Client, in ids, headers map[string]
 	return &extractor.MediaInfo{Site: "classin", Title: "ClassIn课程", Entries: entries}, nil
 }
 
-func (ci *Classin) buildCourseEntry(c *util.Client, sid string, course courseItem, headers map[string]string) *extractor.MediaInfo {
+func (ci *Classin) buildCourseEntry(c *util.Client, sid string, course courseItem, headers map[string]string, auth classinAuth) *extractor.MediaInfo {
 	title := util.SanitizeFilename(firstNonEmpty(course.CourseName, "ClassIn课程"))
-	categories := listCategories(c, sid, course.CourseID)
+	categories := listCategories(c, sid, course.CourseID, auth)
 
 	var children []*extractor.MediaInfo
 	if len(categories) == 0 {
 		// No category layer: enumerate units with an empty categoryId.
-		children = append(children, ci.buildUnitEntries(c, sid, course.CourseID, "", headers)...)
+		children = append(children, ci.buildUnitEntries(c, sid, course.CourseID, "", headers, auth)...)
 	} else {
 		for _, cat := range categories {
 			catName := firstNonEmpty(cat.Name, cat.CategoryName, cat.Title)
-			units := ci.buildUnitEntries(c, sid, course.CourseID, cat.CategoryID, headers)
+			units := ci.buildUnitEntries(c, sid, course.CourseID, cat.CategoryID, headers, auth)
 			if len(units) == 0 {
 				continue
 			}
@@ -138,12 +138,12 @@ func (ci *Classin) buildCourseEntry(c *util.Client, sid string, course courseIte
 	return &extractor.MediaInfo{Site: "classin", Title: title, Entries: children}
 }
 
-func (ci *Classin) buildUnitEntries(c *util.Client, sid, courseID, categoryID string, headers map[string]string) []*extractor.MediaInfo {
-	units, uuid := listUnits(c, sid, courseID, categoryID)
+func (ci *Classin) buildUnitEntries(c *util.Client, sid, courseID, categoryID string, headers map[string]string, auth classinAuth) []*extractor.MediaInfo {
+	units, uuid := listUnits(c, sid, courseID, categoryID, auth)
 	var out []*extractor.MediaInfo
 	for _, unit := range units {
-		acts := listUnitActivities(c, sid, courseID, unit.UnitID, uuid)
-		entries := ci.resolveActivities(c, sid, courseID, acts, headers)
+		acts := listUnitActivities(c, sid, courseID, unit.UnitID, uuid, auth)
+		entries := ci.resolveActivities(c, sid, courseID, acts, headers, auth)
 		if len(entries) == 0 {
 			continue
 		}
@@ -161,14 +161,14 @@ func (ci *Classin) buildUnitEntries(c *util.Client, sid, courseID, categoryID st
 	return out
 }
 
-func (ci *Classin) resolveActivities(c *util.Client, sid, courseID string, acts []activityItem, headers map[string]string) []*extractor.MediaInfo {
+func (ci *Classin) resolveActivities(c *util.Client, sid, courseID string, acts []activityItem, headers map[string]string, auth classinAuth) []*extractor.MediaInfo {
 	var out []*extractor.MediaInfo
 	for _, act := range acts {
 		switch act.Type {
 		case 4, 5:
-			out = append(out, resolveVideoActivity(c, sid, courseID, act, headers)...)
+			out = append(out, resolveVideoActivity(c, sid, courseID, act, headers, auth)...)
 		case 1:
-			out = append(out, resolveHomeworkActivity(c, sid, courseID, act, headers)...)
+			out = append(out, resolveHomeworkActivity(c, sid, courseID, act, headers, auth)...)
 		}
 	}
 	return out
@@ -178,19 +178,19 @@ func (ci *Classin) resolveActivities(c *util.Client, sid, courseID string, acts 
 // recorded class (recordClass/get returns a `video` JSON string list); type 4 is
 // a live replay (getLessonRecordInfo, keyed by clientClassId/bizId). Both feed
 // the same playable collector + m3u8 token exchange already in classin.go.
-func resolveVideoActivity(c *util.Client, sid, courseID string, act activityItem, headers map[string]string) []*extractor.MediaInfo {
+func resolveVideoActivity(c *util.Client, sid, courseID string, act activityItem, headers map[string]string, auth classinAuth) []*extractor.MediaInfo {
 	title := util.SanitizeFilename(act.name())
 	forms := []map[string]string{
 		{"getStuStatistic": "1", "activityId": firstNonEmpty(act.ActivityID, act.BizID), "courseId": courseID, "classRole": "1", "clusterRole": "0", "SID": sid},
-		{"flag": "1", "memberUid": classinUID, "clientClassId": firstNonEmpty(act.BizID, act.ClassID, act.ActivityID), "clientCourseId": courseID, "SID": sid},
+		{"flag": "1", "memberUid": auth.normalized().UID, "clientClassId": firstNonEmpty(act.BizID, act.ClassID, act.ActivityID), "clientCourseId": courseID, "SID": sid},
 	}
 	var plays []playable
 	for _, form := range forms {
-		payload, err := postFormJSON(c, formAPIForVideo(form), form)
+		payload, err := postFormJSON(c, formAPIForVideo(form), form, auth)
 		if err != nil {
 			continue
 		}
-		plays = append(plays, collectPlayables(c, payload)...)
+		plays = append(plays, collectPlayables(c, payload, auth)...)
 		if len(plays) > 0 {
 			break
 		}
@@ -209,7 +209,7 @@ func formAPIForVideo(form map[string]string) string {
 // resolveHomeworkActivity downloads the file list attached to a homework/material
 // activity. homework/get returns file arrays under docs/image/audio/video and
 // their th* mirrors; each fileId is resolved to a CDN URL via file/getDownInfo.
-func resolveHomeworkActivity(c *util.Client, sid, courseID string, act activityItem, headers map[string]string) []*extractor.MediaInfo {
+func resolveHomeworkActivity(c *util.Client, sid, courseID string, act activityItem, headers map[string]string, auth classinAuth) []*extractor.MediaInfo {
 	activityID := firstNonEmpty(act.ActivityID, act.BizID)
 	if activityID == "" {
 		return nil
@@ -218,7 +218,7 @@ func resolveHomeworkActivity(c *util.Client, sid, courseID string, act activityI
 		"activityId": activityID,
 		"courseId":   courseID,
 		"SID":        sid,
-	})
+	}, auth)
 	if err != nil || !env.ok() || len(env.Data) == 0 {
 		return nil
 	}
@@ -229,7 +229,7 @@ func resolveHomeworkActivity(c *util.Client, sid, courseID string, act activityI
 
 	var out []*extractor.MediaInfo
 	for _, f := range files {
-		downURL := resolveFileURL(c, f)
+		downURL := resolveFileURL(c, f, auth)
 		if downURL == "" {
 			continue
 		}
@@ -278,7 +278,7 @@ func parseHomeworkFiles(data json.RawMessage) []homeworkFile {
 // resolveFileURL turns a homework file into a downloadable URL. A direct http
 // URL is used as-is; an `upload/`-rooted path is joined to the CDN base;
 // otherwise file/getDownInfo is queried for data.src/filePath/url.
-func resolveFileURL(c *util.Client, f homeworkFile) string {
+func resolveFileURL(c *util.Client, f homeworkFile, auth classinAuth) string {
 	if u := strings.TrimSpace(f.FileURL); u != "" {
 		if strings.HasPrefix(u, "http") {
 			return u
@@ -290,7 +290,7 @@ func resolveFileURL(c *util.Client, f homeworkFile) string {
 	if f.FileID == "" {
 		return ""
 	}
-	env, err := postFormMap(c, urlFileDownInfo, map[string]string{"fileId": f.FileID})
+	env, err := postFormMap(c, urlFileDownInfo, map[string]string{"fileId": f.FileID}, auth)
 	if err != nil || !env.ok() || len(env.Data) == 0 {
 		return ""
 	}
@@ -308,14 +308,14 @@ func resolveFileURL(c *util.Client, f homeworkFile) string {
 	return classinCDNBase + "/" + strings.TrimLeft(src, "/")
 }
 
-func listCourses(c *util.Client) []courseItem {
+func listCourses(c *util.Client, auth classinAuth) []courseItem {
 	var out []courseItem
 	seen := map[string]bool{}
 	for page := 1; page <= 50; page++ {
 		env, err := postJSONMap(c, urlCourseList, map[string]string{
 			"page":     strconv.Itoa(page),
 			"pageSize": "40",
-		})
+		}, auth)
 		if err != nil || !env.ok() {
 			break
 		}
@@ -336,22 +336,22 @@ func listCourses(c *util.Client) []courseItem {
 	return out
 }
 
-func listCategories(c *util.Client, sid, courseID string) []categoryItem {
+func listCategories(c *util.Client, sid, courseID string, auth classinAuth) []categoryItem {
 	env, err := postFormMap(c, urlCategoryList, map[string]string{
 		"SID":         sid,
 		"classRole":   "0",
 		"clusterRole": "0",
 		"courseId":    courseID,
-	})
+	}, auth)
 	if err != nil || !env.ok() {
 		return nil
 	}
 	return decodeList[categoryItem](env.Data)
 }
 
-func listUnits(c *util.Client, sid, courseID, categoryID string) ([]unitItem, string) {
-	data := courseFilterPayload(sid, courseID, categoryID)
-	env, err := postFormMap(c, urlUnitList, data)
+func listUnits(c *util.Client, sid, courseID, categoryID string, auth classinAuth) ([]unitItem, string) {
+	data := courseFilterPayload(sid, courseID, categoryID, auth)
+	env, err := postFormMap(c, urlUnitList, data, auth)
 	if err != nil || !env.ok() || len(env.Data) == 0 {
 		return nil, ""
 	}
@@ -363,17 +363,17 @@ func listUnits(c *util.Client, sid, courseID, categoryID string) ([]unitItem, st
 	return units, holder.UUID
 }
 
-func listUnitActivities(c *util.Client, sid, courseID, unitID, uuid string) []activityItem {
+func listUnitActivities(c *util.Client, sid, courseID, unitID, uuid string, auth classinAuth) []activityItem {
 	if unitID == "" {
 		return nil
 	}
 	// unitIds is sent as a bracketed string ("[id]"), the form the ClassIn app
 	// uses; uuid pins the studentUnitList response the ids came from.
-	data := mergeMap(courseFilterPayload(sid, courseID, ""), map[string]string{
+	data := mergeMap(courseFilterPayload(sid, courseID, "", auth), map[string]string{
 		"unitIds": "[" + unitID + "]",
 		"uuid":    uuid,
 	})
-	env, err := postFormMap(c, urlUnitActivity, data)
+	env, err := postFormMap(c, urlUnitActivity, data, auth)
 	if err != nil || !env.ok() || len(env.Data) == 0 {
 		return nil
 	}
@@ -382,12 +382,12 @@ func listUnitActivities(c *util.Client, sid, courseID, unitID, uuid string) []ac
 
 // courseFilterPayload mirrors _build_course_filter_payload: the constant student
 // filter fields plus optional categoryId. unitIds/uuid are layered on by callers.
-func courseFilterPayload(sid, courseID, categoryID string) map[string]string {
+func courseFilterPayload(sid, courseID, categoryID string, auth classinAuth) map[string]string {
 	data := map[string]string{
 		"sort":        "asc",
 		"isSearch":    "0",
 		"isUpcoming":  "0",
-		"studentId":   classinUID,
+		"studentId":   auth.normalized().UID,
 		"role":        "student",
 		"courseId":    courseID,
 		"classRole":   "1",

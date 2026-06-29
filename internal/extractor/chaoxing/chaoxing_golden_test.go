@@ -266,3 +266,95 @@ func assertChaoxingFixtureServed(t *testing.T, baseURL string, want []byte) {
 		t.Fatalf("mock fixture mismatch: got %s want %s", got, want)
 	}
 }
+
+func TestResolvePortalCourseResources(t *testing.T) {
+	mux := http.NewServeMux()
+	portalPage := `<html><head><title>课程门户首页</title></head><body>
+<input id="courseId" value="1"><input id="courseEnc" value="ce"><input id="portalEnc" value="pe"><input id="t" value="123">
+</body></html>`
+	mux.HandleFunc("/course-ans/courseportal/portal/1", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(portalPage))
+	})
+	mux.HandleFunc("/course-ans/courseportal/portal-basic-info", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("courseId") != "1" || r.URL.Query().Get("courseEnc") != "ce" || r.URL.Query().Get("t") != "123" {
+			t.Fatalf("unexpected portal basic query: %s", r.URL.RawQuery)
+		}
+		w.Write([]byte(`{"dataInfo":{"courseName":"Portal Course"}}`))
+	})
+	mux.HandleFunc("/course-ans/courseportal/portal-node-resource", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("courseId") != "1" || r.URL.Query().Get("showResourceCount") != "true" {
+			t.Fatalf("unexpected portal resource query: %s", r.URL.RawQuery)
+		}
+		w.Write([]byte(`{"fileArray":[{"nodeId":"n1","fileName":"Portal Doc.pdf","fileExtension":"pdf","statusUrl":"/status/doc"}]}`))
+	})
+	mux.HandleFunc("/status/doc", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"download":"https://cdn.example/portal-doc.pdf"}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	ctx := &chaoxingContext{c: util.NewClient(), courseURL: srv.URL, headers: map[string]string{"Referer": srv.URL + "/"}, downpath: "https://cs-ans.chaoxing.com"}
+	info, _, err := ctx.resolveCourse(srv.URL + "/course-ans/courseportal/portal/1?courseid=1")
+	if err != nil {
+		t.Fatalf("resolveCourse returned error: %v", err)
+	}
+	if info.Title != "Portal Course" {
+		t.Fatalf("course title = %q, want Portal Course", info.Title)
+	}
+	if len(info.Entries) != 1 {
+		t.Fatalf("entries = %d, want 1: %#v", len(info.Entries), info.Entries)
+	}
+	assertEntryURL(t, info.Entries, "https://cdn.example/portal-doc.pdf")
+}
+
+func TestResolvePublicCourseFallback(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/detail/1", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`<html><head><title>Public Course</title></head><body>公开课</body></html>`))
+	})
+	mux.HandleFunc("/course-ans/moocstatistics/chapterlist", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("courseId") != "1" {
+			t.Fatalf("chapterlist courseId = %q, want 1", r.URL.Query().Get("courseId"))
+		}
+		w.Write([]byte(`
+<ul class="chapter-list">
+  <li class="chapter"><div><a>第一章</a></div><ul class="section-list">
+    <li><p onclick="jumpKnowledge(101)"><a>1.1 公开视频</a></p></li>
+  </ul></li>
+</ul>`))
+	})
+	mux.HandleFunc("/nodedetailcontroller/visitnodedetail", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("courseId") != "1" || r.URL.Query().Get("knowledgeId") != "101" {
+			t.Fatalf("unexpected public knowledge query: %s", r.URL.RawQuery)
+		}
+		w.Write([]byte(`<script>mArg = {"attachments":[{"property":{"name":"Public.mp4","objectid":"oid-public","type":".mp4"}}]};</script>`))
+	})
+	mux.HandleFunc("/ananas/status/oid-public", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"filename":"Public.mp4","download":"https://cdn.example/public.mp4"}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	ctx := &chaoxingContext{
+		c:               util.NewClient(),
+		courseURL:       srv.URL,
+		newCourseURL:    srv.URL,
+		publicCourseURL: srv.URL,
+		headers:         map[string]string{"Referer": srv.URL + "/"},
+		downpath:        "https://cs-ans.chaoxing.com",
+	}
+	info, _, err := ctx.resolveCourse(srv.URL + "/detail/1?courseid=1")
+	if err != nil {
+		t.Fatalf("resolveCourse returned error: %v", err)
+	}
+	if info.Title != "Public Course" {
+		t.Fatalf("course title = %q, want Public Course", info.Title)
+	}
+	if len(info.Entries) != 1 {
+		t.Fatalf("entries = %d, want 1: %#v", len(info.Entries), info.Entries)
+	}
+	assertEntryURL(t, info.Entries, "https://cdn.example/public.mp4")
+	if got := info.Entries[0].Extra["source"]; got != "public-course" {
+		t.Fatalf("entry source = %#v, want public-course", got)
+	}
+}

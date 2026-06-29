@@ -4,34 +4,39 @@ package plaso
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
 
 	"github.com/Sophomoresty/mediago/internal/extractor"
-	"github.com/Sophomoresty/mediago/internal/extractor/shared"
 	"github.com/Sophomoresty/mediago/internal/util"
 )
 
 const (
-	referer           = "https://www.plaso.cn"
-	course_url        = "https://www.plaso.cn/gt/servlet/group/getGroupsByActive"
-	course_list_url   = "https://www.plaso.cn/course/api/v1/m/package/student/list"
-	package_list_url  = "https://www.plaso.cn/course/api/v1/m/package/list"
-	history_list_url  = "https://www.plaso.cn/liveclassgo/api/v1/history/listRecord"
-	homework_list_url = "https://www.plaso.cn/homework/student/studentHomeworks"
-	share_url         = "https://www.plaso.cn/sc/nc/newGetShareInfo"
-	file_url          = "https://www.plaso.cn/yxt/servlet/file/preview/getfileinfo"
-	file_info_url     = "https://www.plaso.cn/yxt/servlet/file/getfileinfo"
-	info_url          = "https://www.plaso.cn/cs/xfilegroup/getXFileGroupInfo"
-	package_url       = "https://www.plaso.cn/course/api/v1/nct/m/package/task/list"
-	dir_info_url      = "https://www.plaso.cn/yxt/servlet/bigDir/getXfgTask"
-	m3u8_url          = "https://www.plaso.cn/yxt/servlet/ali/getPlayInfo"
-	poly_sign_url     = "https://www.plaso.cn/yxt/servlet/file/preview/getPolyvVidInfoV2"
-	m3u8_sign_url     = "https://www.plaso.cn/yxt/servlet/org/nc/polyvViewSign"
-	poly_video_url    = "https://api.polyv.net/v2/video/5153980715/get-video-info"
-	sts_url           = "https://www.plaso.cn/yxt/servlet/stsHelper/stsInfo"
-	sts_preview_url   = "https://www.plaso.cn/yxt/servlet/stsHelper/preview/stsInfo"
+	plasoDefaultBase = "https://www.plaso.cn"
+	polyVideoURL     = "https://api.polyv.net/v2/video/5153980715/get-video-info"
+	plasoPlayerURL   = "https://wwwr.plaso.cn/static/yxt/?appType=player&noUser=1&fileId="
+)
+
+const (
+	checkCookiePath  = "/gt/servlet/group/getTeacherWillExpireGroupNum"
+	coursePath       = "/gt/servlet/group/getGroupsByActive"
+	courseListPath   = "/course/api/v1/m/package/student/list"
+	packageListPath  = "/course/api/v1/m/package/list"
+	historyListPath  = "/liveclassgo/api/v1/history/listRecord"
+	homeworkListPath = "/homework/student/studentHomeworks"
+	sharePath        = "/sc/nc/newGetShareInfo"
+	filePath         = "/yxt/servlet/file/preview/getfileinfo"
+	fileInfoPath     = "/yxt/servlet/file/getfileinfo"
+	infoPath         = "/cs/xfilegroup/getXFileGroupInfo"
+	packagePath      = "/course/api/v1/nct/m/package/task/list"
+	dirInfoPath      = "/yxt/servlet/bigDir/getXfgTask"
+	m3u8Path         = "/yxt/servlet/ali/getPlayInfo"
+	polySignPath     = "/yxt/servlet/file/preview/getPolyvVidInfoV2"
+	m3u8SignPath     = "/yxt/servlet/org/nc/polyvViewSign"
+	stsPath          = "/yxt/servlet/stsHelper/stsInfo"
+	stsPreviewPath   = "/yxt/servlet/stsHelper/preview/stsInfo"
 )
 
 var patterns = []string{
@@ -47,220 +52,453 @@ type Plaso struct{}
 
 func (s *Plaso) Patterns() []string { return patterns }
 
-type fileItem struct{ ID, MyID, Location, LocationPath, Name, Type, URL, Vid string }
-type courseInfo struct{ ID, Title string }
+type plasoEndpoints struct {
+	base     string
+	platform string
+}
+
+type plasoSession struct {
+	client  *util.Client
+	eps     plasoEndpoints
+	headers map[string]string
+	quality string
+}
+
+type fileItem struct {
+	ID           string
+	MyID         string
+	Location     string
+	LocationPath string
+	Name         string
+	Type         string
+	URL          string
+	Vid          string
+	VideoID      string
+	StorageID    string
+	Chapter      string
+	Index        []int
+	Size         int64
+	Raw          map[string]any
+}
+
+type courseInfo struct {
+	ID       string
+	Title    string
+	Source   string
+	History  bool
+	Homework bool
+	Class    bool
+	Origin   bool
+}
+
+type plasoSource struct {
+	URL        string
+	Format     string
+	Quality    string
+	SourceType string
+	M3U8Text   string
+	AudioURL   string
+	NeedMerge  bool
+	Size       int64
+	Extra      map[string]any
+}
 
 var (
-	sfidRe  = regexp.MustCompile(`[?&](?:sfId|sfid|fileId|fid)=([\w-]+)`)
-	mediaRe = regexp.MustCompile(`https?://[^"'\s]+\.(?:m3u8|mp4|mp3)(?:\?[^"'\s]*)?`)
+	cidRe   = regexp.MustCompile(`[?&](?:sfId|sfid|shareKey|fileId|fid|id|packageId|courseId|groupId|fileGroupId|dirId)=([\w.-]+)`)
+	mediaRe = regexp.MustCompile(`https?://[^"'\s<>]+\.(?:m3u8|mp4|mp3)(?:\?[^"'\s<>]*)?`)
 )
 
 func (s *Plaso) Extract(rawURL string, opts *extractor.ExtractOpts) (*extractor.MediaInfo, error) {
 	if opts == nil || opts.Cookies == nil {
 		return nil, fmt.Errorf("plaso requires login cookies")
 	}
-	if isBlockedPlasoVariant(rawURL) {
-		return nil, fmt.Errorf("plaso variant blocked: needs host-specific API mapping for Aiwenyun/Jhpy source")
+	sess := newPlasoSession(rawURL, opts)
+	if err := sess.checkCookie(); err != nil {
+		return nil, err
 	}
-	c := util.NewClient()
-	c.SetCookieJar(opts.Cookies)
-	h := headers()
 	cid := parseCID(rawURL)
-	title := "plaso_" + first(cid, "course")
+	cidKind, resolvedCID := splitPlasoCourseID(cid)
+	title := "plaso_" + firstNonEmpty(cid, "course")
+
 	var files []fileItem
-	if cid != "" {
-		if sharedItem, _ := fetchShareOrFile(c, h, cid); sharedItem.ID != "" || sharedItem.Location != "" || sharedItem.Vid != "" {
-			files = append(files, sharedItem)
-			title = first(sharedItem.Name, title)
+	if resolvedCID != "" {
+		shareFiles, shareTitle := sess.fetchShareOrFile(resolvedCID)
+		if len(shareFiles) > 0 {
+			files = append(files, shareFiles...)
+			title = firstNonEmpty(shareTitle, files[0].Name, title)
 		}
 	}
+
 	if len(files) == 0 {
-		courses := fetchCourseList(c, h)
+		courses := sess.fetchCourseList()
 		if cid == "" && len(courses) > 0 {
 			cid = courses[0].ID
+			cidKind, resolvedCID = splitPlasoCourseID(cid)
 		}
 		for _, co := range courses {
-			if co.ID == cid {
-				title = first(co.Title, title)
+			if sameID(co.ID, cid) {
+				title = firstNonEmpty(co.Title, title)
 				break
 			}
 		}
-		files = append(files, fetchPackageFiles(c, h, cid)...)
+		files = append(files, sess.fetchPackageFiles(resolvedCID)...)
 	}
 	if len(files) == 0 {
 		return nil, fmt.Errorf("plaso: no file/task records found from share/package APIs")
 	}
-	var entries []*extractor.MediaInfo
+
+	entries := make([]*extractor.MediaInfo, 0, len(files))
 	seen := map[string]bool{}
-	blockedLocalLocation := false
+	unresolved := 0
 	for i, f := range files {
-		if (f.Location != "" || f.LocationPath != "") && f.ID == "" && f.URL == "" && f.Vid == "" {
-			blockedLocalLocation = true
-		}
-		mi := resolveFile(c, h, f, i+1)
+		mi := sess.resolveFile(f, i+1)
 		if mi == nil {
+			unresolved++
 			continue
 		}
 		u := firstStreamURL(mi)
-		if u == "" || seen[u] {
+		key := firstNonEmpty(u, mi.Title)
+		if key == "" || seen[key] {
 			continue
 		}
-		seen[u] = true
+		seen[key] = true
 		entries = append(entries, mi)
 	}
 	if len(entries) == 0 {
-		if blockedLocalLocation {
-			return nil, fmt.Errorf("plaso local location playback blocked: needs STS/plist sandbox flow from Plaso_Local source")
-		}
-		return nil, fmt.Errorf("plaso: no playable m3u8/mp4/file URLs resolved from file records")
+		return nil, fmt.Errorf("plaso: no playable video/material URLs resolved from %d file records", unresolved)
 	}
-	return &extractor.MediaInfo{Site: "plaso", Title: clean(title), Entries: entries, Extra: map[string]any{"course_id": cid}}, nil
+	extra := map[string]any{"course_id": cid, "resolved_id": resolvedCID, "platform": sess.eps.platform}
+	if cidKind != "" {
+		extra["course_kind"] = cidKind
+	}
+	if unresolved > 0 {
+		extra["unresolved_count"] = unresolved
+	}
+	return &extractor.MediaInfo{Site: "plaso", Title: clean(title), Entries: entries, Extra: extra}, nil
 }
 
-func fetchCourseList(c *util.Client, h map[string]string) []courseInfo {
-	var out []courseInfo
-	apis := []struct {
-		URL  string
-		Data map[string]string
-	}{
-		{course_url, map[string]string{}},
-		{course_list_url, map[string]string{"pageSize": "200", "pageNum": "1"}},
-		{package_list_url, map[string]string{"pageSize": "200", "pageNum": "1", "search": ""}},
-		{history_list_url, map[string]string{"pageSize": "200", "indexStart": "0"}},
+func newPlasoSession(rawURL string, opts *extractor.ExtractOpts) *plasoSession {
+	c := util.NewClient()
+	c.SetCookieJar(opts.Cookies)
+	eps := newPlasoEndpoints(rawURL)
+	return &plasoSession{client: c, eps: eps, headers: eps.headers(opts.Cookies), quality: opts.Quality}
+}
+
+func newPlasoEndpoints(rawURL string) plasoEndpoints {
+	host := ""
+	if u, err := url.Parse(rawURL); err == nil {
+		host = strings.ToLower(u.Hostname())
 	}
-	seen := map[string]bool{}
-	for _, api := range apis {
-		v, err := postJSON(c, api.URL, api.Data, h)
-		if err != nil {
+	switch {
+	case strings.Contains(host, "aiwenyun.cn"):
+		return plasoEndpoints{base: "https://www.aiwenyun.cn", platform: "aiwenyun"}
+	case strings.Contains(host, "jhpy.plaso.cn"):
+		return plasoEndpoints{base: "https://jhpy.plaso.cn", platform: "jhpy"}
+	default:
+		return plasoEndpoints{base: plasoDefaultBase, platform: "plaso"}
+	}
+}
+
+func (e plasoEndpoints) url(path string) string { return e.base + path }
+
+func (e plasoEndpoints) headers(jar http.CookieJar) map[string]string {
+	h := map[string]string{
+		"Accept":     "application/json, text/plain, */*",
+		"Origin":     e.base,
+		"Referer":    e.base,
+		"referer":    e.base,
+		"User-Agent": plasoUserAgent(),
+	}
+	if jar == nil {
+		return h
+	}
+	baseURL, err := url.Parse(e.base)
+	if err != nil {
+		return h
+	}
+	cookies := jar.Cookies(baseURL)
+	parts := make([]string, 0, len(cookies))
+	for _, ck := range cookies {
+		if ck == nil || ck.Name == "" {
 			continue
 		}
-		walk(v, func(m map[string]any) {
-			id := firstText(m, "id", "originId", "packageId", "fileGroupId", "fileId")
-			title := firstText(m, "title", "groupName", "name", "packageName")
-			if id != "" && title != "" && !seen[id] {
-				seen[id] = true
-				out = append(out, courseInfo{ID: id, Title: title})
-			}
-		})
+		parts = append(parts, ck.Name+"="+ck.Value)
+		if strings.EqualFold(ck.Name, "access_token") && ck.Value != "" {
+			h["access-token"] = ck.Value
+		}
 	}
-	return out
+	if len(parts) > 0 {
+		h["Cookie"] = strings.Join(parts, "; ")
+	}
+	return h
 }
 
-func fetchPackageFiles(c *util.Client, h map[string]string, cid string) []fileItem {
-	if cid == "" {
+func (s *plasoSession) checkCookie() error {
+	v, err := s.postJSON(s.eps.url(checkCookiePath), map[string]string{})
+	if err != nil {
 		return nil
 	}
-	var out []fileItem
-	for _, req := range []struct {
-		u string
-		d map[string]string
-	}{
-		{package_url, map[string]string{"packageId": cid, "id": cid, "fileGroupId": cid}},
-		{info_url, map[string]string{"fileGroupId": cid, "id": cid}},
-		{dir_info_url, map[string]string{"fileGroupId": cid, "id": cid, "hiddenTask": "false", "sourceWay": "course"}},
-	} {
-		v, err := postJSON(c, req.u, req.d, h)
-		if err != nil {
-			continue
-		}
-		walk(v, func(m map[string]any) {
-			if item := buildFileItem(m); item.ID != "" || item.Location != "" || item.URL != "" || item.Vid != "" {
-				out = append(out, item)
-			}
-		})
-		if len(out) > 0 {
-			break
-		}
-	}
-	return dedupe(out)
-}
-
-func fetchShareOrFile(c *util.Client, h map[string]string, id string) (fileItem, error) {
-	for _, req := range []struct {
-		u string
-		d map[string]string
-	}{
-		{share_url, map[string]string{"sfId": id, "shareKey": id}},
-		{file_url, map[string]string{"fileId": id, "id": id}},
-		{file_info_url, map[string]string{"fileId": id, "id": id}},
-	} {
-		v, err := postJSON(c, req.u, req.d, h)
-		if err != nil {
-			continue
-		}
-		best := fileItem{}
-		walk(v, func(m map[string]any) {
-			if best.ID == "" && (firstText(m, "fileId", "id", "_id", "originId", "location", "vid") != "") {
-				best = buildFileItem(m)
-			}
-		})
-		if best.ID != "" || best.Location != "" || best.Vid != "" {
-			return best, nil
-		}
-	}
-	return fileItem{}, fmt.Errorf("plaso share/file id not found")
-}
-
-func resolveFile(c *util.Client, h map[string]string, f fileItem, idx int) *extractor.MediaInfo {
-	name := clean(first(f.Name, fmt.Sprintf("plaso_%d", idx)))
-	candidates := []string{f.URL}
-	if f.ID != "" {
-		candidates = append(candidates, fetchAliPlayURL(c, h, f.ID), fetchPolyvURL(c, h, f.ID, f.Vid))
-	}
-	if f.Location != "" || f.LocationPath != "" {
-		if f.ID == "" && f.URL == "" && f.Vid == "" {
-			return nil
-		}
-	}
-	for _, u := range candidates {
-		u = normalizeURL(u)
-		if u == "" {
-			continue
-		}
-		if strings.HasPrefix(u, "http") && (looksMedia(u) || f.Type != "") {
-			return &extractor.MediaInfo{Site: "plaso", Title: name, Streams: map[string]extractor.Stream{"best": {Quality: "best", URLs: []string{u}, Format: formatOf(u), Headers: h}}, Extra: map[string]any{"file_id": f.ID, "my_id": f.MyID, "location": f.Location, "file_type": f.Type}}
-		}
+	code := findFirst(v, "code")
+	if code != "" && code != "0" {
+		return fmt.Errorf("plaso cookie validation failed: code=%s", code)
 	}
 	return nil
 }
 
-func fetchAliPlayURL(c *util.Client, h map[string]string, fileID string) string {
-	v, err := postJSON(c, m3u8_url, map[string]string{"fileId": fileID, "id": fileID}, h)
-	if err != nil {
-		return ""
+func (s *plasoSession) fetchCourseList() []courseInfo {
+	apis := []struct {
+		name  string
+		url   string
+		data  map[string]string
+		paged bool
+	}{
+		{"course", s.eps.url(coursePath), map[string]string{"groupId": "", "search": ""}, false},
+		{"student_package", s.eps.url(courseListPath), map[string]string{"pageSize": "200", "pageNum": "1", "search": ""}, true},
+		{"package", s.eps.url(packageListPath), map[string]string{"pageSize": "200", "pageNum": "1", "search": ""}, true},
+		{"history", s.eps.url(historyListPath), map[string]string{"dateFrom": "0", "dateTo": "2000000000000", "pageSize": "999", "pageNum": "1"}, false},
+		{"homework", s.eps.url(homeworkListPath), map[string]string{"pageSize": "999", "pageNum": "1", "status": "5", "search": ""}, false},
 	}
-	return first(findFirst(v, "hdPlayUrl"), findFirst(v, "sdPlayUrl"), findFirst(v, "ldPlayUrl"), findFirst(v, "playUrl"), findFirst(v, "m3u8Url"))
-}
-
-func fetchPolyvURL(c *util.Client, h map[string]string, fileID, vid string) string {
-	if vid == "" {
-		v, _ := postJSON(c, poly_sign_url, map[string]string{"fileId": fileID, "id": fileID}, h)
-		vid = findFirst(v, "vid")
-	}
-	if vid != "" {
-		if sec, err := shared.PolyvResolveSecure(c, vid, h); err == nil {
-			if u, e := shared.PolyvPickBestManifest(sec); e == nil {
-				return u
+	seen := map[string]bool{}
+	var out []courseInfo
+	for _, api := range apis {
+		for page := 1; page <= 5; page++ {
+			data := cloneStringMap(api.data)
+			if api.paged {
+				data["pageNum"] = fmt.Sprint(page)
+			}
+			v, err := s.postJSON(api.url, data)
+			if err != nil {
+				break
+			}
+			added := 0
+			walk(v, func(m map[string]any) {
+				co := courseInfoFromMap(api.name, m)
+				if co.ID == "" || co.Title == "" || seen[api.name+":"+co.ID] {
+					return
+				}
+				seen[api.name+":"+co.ID] = true
+				out = append(out, co)
+				added++
+			})
+			if !api.paged || added == 0 {
+				break
 			}
 		}
 	}
-	body, err := c.PostForm(poly_video_url, map[string]string{"vid": vid}, h)
-	if err != nil {
-		return ""
-	}
-	if m := mediaRe.FindString(body); m != "" {
-		return strings.ReplaceAll(m, `\/`, `/`)
-	}
-	v, _ := postJSON(c, m3u8_sign_url, map[string]string{"fileId": fileID, "vid": vid}, h)
-	return findFirst(v, "playUrl", "m3u8Url", "url")
+	return out
 }
 
-func buildFileItem(m map[string]any) fileItem {
-	return fileItem{ID: firstText(m, "fileId", "id", "originId", "_id"), MyID: firstText(m, "myid", "myId", "my_id"), Location: firstText(m, "location"), LocationPath: firstText(m, "locationPath", "location_path"), Name: firstText(m, "name", "title", "file_name"), Type: strings.ToLower(firstText(m, "type", "file_type")), URL: firstText(m, "url", "file_url", "downloadUrl", "playUrl", "m3u8Url"), Vid: firstText(m, "vid")}
+func courseInfoFromMap(source string, m map[string]any) courseInfo {
+	id := firstText(m,
+		"fileGroupId", "file_group_id", "xFileGroupId", "x_file_group_id",
+		"packageId", "package_id", "originId", "origin_id", "courseId", "course_id",
+		"groupId", "group_id", "id", "fileId", "file_id")
+	title := firstText(m,
+		"packageName", "package_name", "groupName", "group_name", "courseName", "course_name",
+		"className", "class_name", "subjectName", "subject_name", "homeworkName", "homework_name",
+		"title", "name")
+	if id == "" || title == "" || hasAnyKey(m, "url", "URL", "playUrl", "PlayURL", "m3u8Url", "vid", "polyvVid", "videoId") {
+		return courseInfo{}
+	}
+	co := courseInfo{ID: id, Title: title, Source: source}
+	switch source {
+	case "history":
+		co.ID = "history_" + strings.TrimPrefix(id, "history_")
+		co.History = true
+		co.Title = prefixTitle("历史课堂_", title)
+	case "homework":
+		co.ID = "homework_" + strings.TrimPrefix(id, "homework_")
+		co.Homework = true
+		co.Title = prefixTitle("课后巩固_", title)
+	case "course":
+		co.Class = true
+	default:
+		co.Origin = truthy(m["is_origin"]) || truthy(m["isOrigin"]) || truthy(m["origin"])
+	}
+	return co
 }
 
-func postJSON(c *util.Client, api string, data map[string]string, h map[string]string) (any, error) {
-	body, err := c.PostForm(api, data, h)
+func (s *plasoSession) fetchPackageFiles(cid string) []fileItem {
+	if strings.TrimSpace(cid) == "" {
+		return nil
+	}
+	requests := []struct {
+		url  string
+		data map[string]string
+	}{
+		{s.eps.url(packagePath), map[string]string{"packageId": cid, "id": cid, "fileGroupId": cid, "taskNum": "0"}},
+		{s.eps.url(infoPath), map[string]string{"fileGroupId": cid, "id": cid, "packageId": cid}},
+		{s.eps.url(dirInfoPath), map[string]string{"fileGroupId": cid, "id": cid, "dirId": cid, "hiddenTask": "false", "sourceWay": "course"}},
+		{s.eps.url(filePath), map[string]string{"fileId": cid, "id": cid}},
+		{s.eps.url(fileInfoPath), map[string]string{"fileId": cid, "id": cid}},
+	}
+	var out []fileItem
+	for _, req := range requests {
+		v, err := s.postJSON(req.url, req.data)
+		if err != nil {
+			continue
+		}
+		out = append(out, collectFileItems(v)...)
+	}
+	return s.expandFileDetails(dedupeFiles(out))
+}
+
+func (s *plasoSession) fetchShareOrFile(id string) ([]fileItem, string) {
+	requests := []struct {
+		url  string
+		data map[string]string
+	}{
+		{s.eps.url(sharePath), map[string]string{"sfId": id, "shareKey": id, "fileId": id, "id": id}},
+		{s.eps.url(filePath), map[string]string{"fileId": id, "id": id}},
+		{s.eps.url(fileInfoPath), map[string]string{"fileId": id, "id": id}},
+	}
+	for _, req := range requests {
+		v, err := s.postJSON(req.url, req.data)
+		if err != nil {
+			continue
+		}
+		files := collectFileItems(v)
+		if len(files) == 0 {
+			continue
+		}
+		files = s.expandFileDetails(dedupeFiles(files))
+		title := firstNonEmpty(findFirst(v, "shareName", "courseName", "packageName", "name", "title"), files[0].Name)
+		return files, title
+	}
+	return nil, ""
+}
+
+func (s *plasoSession) expandFileDetails(files []fileItem) []fileItem {
+	if len(files) == 0 {
+		return nil
+	}
+	out := make([]fileItem, 0, len(files))
+	cache := map[string]fileItem{}
+	for _, f := range files {
+		id := firstNonEmpty(f.ID, f.MyID)
+		if needsFileDetail(f) && id != "" {
+			if detail, ok := cache[id]; ok {
+				f = mergeFileItem(f, detail)
+			} else if detail, ok := s.fetchFileDetail(f); ok {
+				cache[id] = detail
+				f = mergeFileItem(f, detail)
+			}
+		}
+		out = append(out, f)
+	}
+	return dedupeFiles(out)
+}
+
+func (s *plasoSession) fetchFileDetail(f fileItem) (fileItem, bool) {
+	for _, api := range []string{s.eps.url(filePath), s.eps.url(fileInfoPath)} {
+		v, err := s.postJSON(api, s.playRequestData(f))
+		if err != nil {
+			continue
+		}
+		for _, detail := range collectFileItems(v) {
+			if sameID(detail.ID, f.ID) || sameID(detail.MyID, f.MyID) || firstNonEmpty(detail.URL, detail.Location, detail.LocationPath, detail.Vid, detail.VideoID) != "" {
+				return detail, true
+			}
+		}
+	}
+	return fileItem{}, false
+}
+
+func (s *plasoSession) resolveFile(f fileItem, idx int) *extractor.MediaInfo {
+	name := clean(firstNonEmpty(f.Name, fmt.Sprintf("[%02d]--plaso", idx)))
+	if f.Chapter != "" && !strings.Contains(name, f.Chapter) {
+		name = clean(f.Chapter + "--" + name)
+	}
+	for _, src := range s.resolveSources(f) {
+		if src.URL == "" {
+			continue
+		}
+		return s.sourceMediaInfo(name, f, src)
+	}
+	return nil
+}
+
+func (s *plasoSession) resolveSources(f fileItem) []plasoSource {
+	var out []plasoSource
+	for _, raw := range []string{f.URL, f.Location, f.LocationPath} {
+		if src := s.directSource(f, raw); src.URL != "" {
+			out = append(out, src)
+		}
+	}
+	if src := s.fetchAliPlaySource(f); src.URL != "" {
+		out = append(out, src)
+	}
+	if src := s.fetchPolyvSource(f); src.URL != "" {
+		out = append(out, src)
+	}
+	if src := s.fetchPlistSource(f); src.URL != "" {
+		out = append(out, src)
+	}
+	if src := s.buildDirectDocumentSource(f); src.URL != "" {
+		out = append(out, src)
+	}
+	if src := s.buildPlayerSource(f); src.URL != "" {
+		out = append(out, src)
+	}
+	return out
+}
+
+func (s *plasoSession) directSource(f fileItem, raw string) plasoSource {
+	u := s.normalizeMediaURL(raw, "")
+	if u == "" || !strings.HasPrefix(u, "http") {
+		return plasoSource{}
+	}
+	lu := strings.ToLower(u)
+	if isLikelyPlistURL(u) && !strings.Contains(lu, ".m3u8") && !strings.Contains(lu, ".mp4") && !strings.Contains(lu, ".mp3") && !strings.Contains(lu, "format=m3u8") {
+		return plasoSource{}
+	}
+	fmtv := formatOf(u, f.Type)
+	if !looksDownloadable(u) && f.Type == "" {
+		return plasoSource{}
+	}
+	return plasoSource{URL: u, Format: fmtv, Quality: "best", SourceType: "direct", NeedMerge: fmtv == "m3u8", Size: f.Size}
+}
+
+func (s *plasoSession) sourceMediaInfo(title string, f fileItem, src plasoSource) *extractor.MediaInfo {
+	u := s.normalizeMediaURL(src.URL, "")
+	if u == "" {
+		return nil
+	}
+	fmtv := firstNonEmpty(src.Format, formatOf(u, f.Type))
+	extra := map[string]any{
+		"file_id":       f.ID,
+		"my_id":         f.MyID,
+		"location":      f.Location,
+		"location_path": f.LocationPath,
+		"storage_id":    f.StorageID,
+		"chapter":       f.Chapter,
+		"index":         f.Index,
+		"file_type":     f.Type,
+		"source_type":   firstNonEmpty(src.SourceType, "direct"),
+		"platform":      s.eps.platform,
+	}
+	for k, v := range src.Extra {
+		extra[k] = v
+	}
+	if src.M3U8Text != "" {
+		extra["m3u8_text"] = src.M3U8Text
+		extra["source_type"] = "m3u8_text"
+	}
+	stream := extractor.Stream{
+		Quality:   firstNonEmpty(src.Quality, "best"),
+		URLs:      []string{u},
+		Format:    fmtv,
+		Size:      firstPositive(src.Size, f.Size),
+		NeedMerge: src.NeedMerge || fmtv == "m3u8",
+		AudioURL:  src.AudioURL,
+		Headers:   streamHeaders(s.headers),
+		Extra:     cloneAnyMap(extra),
+	}
+	return &extractor.MediaInfo{Site: "plaso", Title: title, Streams: map[string]extractor.Stream{"best": stream}, Extra: extra}
+}
+
+func (s *plasoSession) postJSON(api string, data map[string]string) (any, error) {
+	body, err := s.client.PostForm(api, data, s.headers)
 	if err != nil {
 		return nil, err
 	}
@@ -269,115 +507,4 @@ func postJSON(c *util.Client, api string, data map[string]string, h map[string]s
 		return nil, err
 	}
 	return v, nil
-}
-
-func parseCID(rawURL string) string {
-	if m := sfidRe.FindStringSubmatch(rawURL); m != nil {
-		return m[1]
-	}
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return ""
-	}
-	return first(u.Query().Get("sfId"), u.Query().Get("sfid"), u.Query().Get("fileId"), u.Query().Get("fid"), u.Query().Get("id"), u.Query().Get("packageId"))
-}
-
-func headers() map[string]string {
-	return map[string]string{"Referer": referer, "Origin": referer, "Accept": "application/json, text/plain, */*"}
-}
-func isBlockedPlasoVariant(rawURL string) bool {
-	l := strings.ToLower(rawURL)
-	return strings.Contains(l, "aiwenyun.cn/") || strings.Contains(l, "jhpy.plaso.cn/")
-}
-func walk(v any, fn func(map[string]any)) {
-	switch t := v.(type) {
-	case map[string]any:
-		fn(t)
-		for _, x := range t {
-			walk(x, fn)
-		}
-	case []any:
-		for _, x := range t {
-			walk(x, fn)
-		}
-	}
-}
-func firstText(m map[string]any, keys ...string) string {
-	for _, k := range keys {
-		if v, ok := m[k]; ok && v != nil {
-			s := strings.TrimSpace(fmt.Sprint(v))
-			if s != "" && s != "<nil>" {
-				return s
-			}
-		}
-	}
-	return ""
-}
-func findFirst(v any, keys ...string) string {
-	out := ""
-	walk(v, func(m map[string]any) {
-		if out == "" {
-			out = firstText(m, keys...)
-		}
-	})
-	return out
-}
-func first(vals ...string) string {
-	for _, v := range vals {
-		if strings.TrimSpace(v) != "" {
-			return strings.TrimSpace(v)
-		}
-	}
-	return ""
-}
-func clean(s string) string {
-	return strings.Trim(strings.Map(func(r rune) rune {
-		if strings.ContainsRune(`<>:"/\|?*`, r) {
-			return '_'
-		}
-		return r
-	}, s), " .")
-}
-func normalizeURL(u string) string {
-	u = strings.TrimSpace(strings.ReplaceAll(u, `\/`, `/`))
-	if strings.HasPrefix(u, "//") {
-		return "https:" + u
-	}
-	return u
-}
-func looksMedia(u string) bool {
-	l := strings.ToLower(u)
-	return strings.Contains(l, ".m3u8") || strings.Contains(l, ".mp4") || strings.Contains(l, ".mp3")
-}
-func formatOf(u string) string {
-	l := strings.ToLower(u)
-	if strings.Contains(l, ".m3u8") {
-		return "m3u8"
-	}
-	if strings.Contains(l, ".mp3") {
-		return "mp3"
-	}
-	return "mp4"
-}
-func firstStreamURL(mi *extractor.MediaInfo) string {
-	if mi == nil {
-		return ""
-	}
-	if st, ok := mi.Streams["best"]; ok && len(st.URLs) > 0 {
-		return st.URLs[0]
-	}
-	return ""
-}
-func dedupe(in []fileItem) []fileItem {
-	seen := map[string]bool{}
-	out := in[:0]
-	for _, f := range in {
-		k := f.ID + "|" + f.Location + "|" + f.URL + "|" + f.Vid
-		if k == "|||" || seen[k] {
-			continue
-		}
-		seen[k] = true
-		out = append(out, f)
-	}
-	return out
 }

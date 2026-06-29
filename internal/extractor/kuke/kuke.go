@@ -104,7 +104,7 @@ func (s *Kuke) Extract(rawURL string, opts *extractor.ExtractOpts) (*extractor.M
 			subID := firstText(sub["goodsMasterId"])
 			subBuyID := firstText(sub["id"], sub["userBuyUnitGoodsId"])
 			if d, err := kukeFetchCourseDetail(c, headers, token, subID, subBuyID); err == nil {
-				details = append(details, kukeDetailWithTitle{Detail: d, Title: firstText(sub["courseName"])})
+				details = append(details, kukeDetailWithTitle{Detail: d, Title: firstText(sub["courseName"]), GoodsMasterID: subID})
 			}
 		}
 	}
@@ -113,7 +113,7 @@ func (s *Kuke) Extract(rawURL string, opts *extractor.ExtractOpts) (*extractor.M
 		if err != nil {
 			return nil, err
 		}
-		details = append(details, kukeDetailWithTitle{Detail: d})
+		details = append(details, kukeDetailWithTitle{Detail: d, GoodsMasterID: cid})
 		if dt := kukeTitleFromDetail(d); dt != "" && strings.HasPrefix(title, "库课课程_") {
 			title = dt
 		}
@@ -121,12 +121,12 @@ func (s *Kuke) Extract(rawURL string, opts *extractor.ExtractOpts) (*extractor.M
 
 	var entries []*extractor.MediaInfo
 	for _, detail := range details {
-		items := kukeBuildItems(detail.Detail, cid, detail.Title)
+		items := kukeBuildItems(detail.Detail, firstText(detail.GoodsMasterID, cid), detail.Title)
 		for _, item := range items {
 			var entry *extractor.MediaInfo
 			var err error
 			if item.Kind == "video" {
-				entry, err = kukeBuildVideoEntry(c, headers, item)
+				entry, err = kukeBuildVideoEntry(c, headers, item, opts.Quality)
 			} else {
 				entry = kukeBuildFileEntry(item)
 			}
@@ -162,12 +162,18 @@ type kukeNodeInfoData struct {
 	KKSdkString string `json:"kkSdkString"`
 }
 type kukeDetailWithTitle struct {
-	Detail map[string]any
-	Title  string
+	Detail        map[string]any
+	Title         string
+	GoodsMasterID string
 }
 type kukeItem struct {
 	Kind, Name, Chapter, NodeID, GoodsMasterID, PolyvVideoID, FileURL, FileFmt string
 	Duration                                                                   int
+}
+type kukePolyvInfo struct {
+	PlaySafe string
+	VideoID  string
+	Raw      map[string]any
 }
 
 func kukeHeaders(cookie, token string) map[string]string {
@@ -269,7 +275,7 @@ func kukeFetchCourseList(c *util.Client, headers map[string]string, token string
 	filtered := make([]map[string]any, 0, len(out))
 	for _, course := range out {
 		content := mapAny(course["content"])
-		if intOf(content["totalCourseCount"]) != 0 && intOf(content["goodsType"]) == 5 {
+		if intOf(content["totalCourseCount"]) != 0 {
 			filtered = append(filtered, course)
 		}
 	}

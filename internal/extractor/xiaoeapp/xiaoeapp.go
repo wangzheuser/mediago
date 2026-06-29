@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"crypto/md5"
 	"crypto/sha1"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -24,11 +25,12 @@ const (
 	courseListAPI      = "/app/my.all.course.lists.get/2.0.0"
 	videoInfoAPI       = "/app/goods/xe.goods.detail.get/1.0.3"
 	lookbackURLAPI     = "/app/alive/xe.alive.lookbackurl.get/1.0.0"
+	h5LoginAPI         = "/app/xe.user.h5login/1.0.0"
 	courseListPageSize = 200
 	appUA              = "okhttp/3.12.0;xet-android-app 6.1.1"
 )
 
-var patterns = []string{`(?:[\w-]+\.)?xiaoeknow\.com/`}
+var patterns = []string{`(?:^|://)(?:app|xiaoeapp-server)\.xiaoeknow\.com/`}
 var idRe = regexp.MustCompile(`(?i)(?:/(?:p/course/(?:camp|alive|ebook|text|audio|video|ecourse|member|big_column|column)|v3/course/alive)/|[?&](?:activity_id|resource_id|goods_id|course_id)=)([A-Za-z0-9_\-]+)`) // source _get_h5_course_url url forms
 
 func init() {
@@ -76,12 +78,25 @@ func (x *Xiaoeapp) Extract(rawURL string, opts *extractor.ExtractOpts) (*extract
 			continue
 		}
 		seenItem[it.id] = true
+		var delegateErr error
+		if shouldDelegateToH5(it) {
+			if info, err := resolveDelegateInfo(c, sess, it, opts.Cookies); err == nil {
+				if appended := appendDelegateEntries(&entries, seen, info, it); appended > 0 {
+					continue
+				}
+			} else {
+				delegateErr = err
+			}
+		}
 		u, extra := resolveItemURL(c, sess, it)
 		if reason := val(extra, "blocked_reason"); reason != "" {
 			blockedReasons = append(blockedReasons, reason)
 			continue
 		}
 		if u == "" || seen[u] {
+			if delegateErr != nil {
+				blockedReasons = append(blockedReasons, "delegate: "+delegateErr.Error())
+			}
 			continue
 		}
 		seen[u] = true
@@ -141,6 +156,9 @@ func fetchCourseList(c *util.Client, sess xeSession) ([]xeItem, error) {
 func resolveItemURL(c *util.Client, sess xeSession, it xeItem) (string, map[string]any) {
 	if isLiveType(it.typ) {
 		if containsPrivateXiaoeFlow(it.raw) {
+			if u := firstPrivateXiaoeMediaURL(it.raw); u != "" {
+				return appendXiaoeURLParams(u, [][2]string{{"time", fmt.Sprintf("%d", time.Now().UnixMilli())}, {"uuid", firstNonEmpty(it.cUserID, sess.cUserID)}}), map[string]any{"resource_id": it.id, "resource_type": it.typ, "app_id": it.appID, "private_decoded": true}
+			}
 			return "", map[string]any{"blocked_reason": "blocked: needs xiaoe private lookback m3u8 decrypt", "resource_id": it.id, "resource_type": it.typ, "app_id": it.appID}
 		}
 		if u := pickURL(it.raw); u != "" {
@@ -152,6 +170,9 @@ func resolveItemURL(c *util.Client, sess xeSession, it xeItem) (string, map[stri
 		}
 		if root, err := postAppAPI(c, sess, lookbackURLAPI, body); err == nil && code(root) == "0" {
 			if containsPrivateXiaoeFlow(root["data"]) {
+				if u := firstPrivateXiaoeMediaURL(root["data"]); u != "" {
+					return appendXiaoeURLParams(u, [][2]string{{"time", fmt.Sprintf("%d", time.Now().UnixMilli())}, {"uuid", firstNonEmpty(it.cUserID, sess.cUserID)}}), map[string]any{"resource_id": it.id, "resource_type": it.typ, "app_id": it.appID, "api": lookbackURLAPI, "private_decoded": true}
+				}
 				return "", map[string]any{"blocked_reason": "blocked: needs xiaoe private lookback m3u8 decrypt", "resource_id": it.id, "resource_type": it.typ, "app_id": it.appID, "api": lookbackURLAPI}
 			}
 			if u := pickURL(root["data"]); u != "" {
@@ -160,6 +181,9 @@ func resolveItemURL(c *util.Client, sess xeSession, it xeItem) (string, map[stri
 		}
 	}
 	if containsPrivateXiaoeFlow(it.raw) {
+		if u := firstPrivateXiaoeMediaURL(it.raw); u != "" {
+			return u, map[string]any{"resource_id": it.id, "resource_type": it.typ, "app_id": it.appID, "private_decoded": true}
+		}
 		return "", map[string]any{"blocked_reason": "blocked: needs xiaoe private lookback m3u8 decrypt", "resource_id": it.id, "resource_type": it.typ, "app_id": it.appID}
 	}
 	if u := pickURL(it.raw); u != "" {
@@ -179,6 +203,9 @@ func resolveItemURL(c *util.Client, sess xeSession, it xeItem) (string, map[stri
 	}
 	data := root["data"]
 	if containsPrivateXiaoeFlow(data) {
+		if u := firstPrivateXiaoeMediaURL(data); u != "" {
+			return u, map[string]any{"resource_id": it.id, "resource_type": it.typ, "goods_type": goodsType, "api": videoInfoAPI, "private_decoded": true}
+		}
 		return "", map[string]any{"blocked_reason": "blocked: needs xiaoe private lookback m3u8 decrypt", "resource_id": it.id, "resource_type": it.typ, "goods_type": goodsType, "api": videoInfoAPI}
 	}
 	if u := pickURL(data); u != "" {
@@ -190,6 +217,179 @@ func resolveItemURL(c *util.Client, sess xeSession, it xeItem) (string, map[stri
 		}
 	}
 	return "", nil
+}
+
+func shouldDelegateToH5(it xeItem) bool {
+	switch typeMap(it.typ) {
+	case "train", "ecourse", "clock":
+		return true
+	default:
+		return false
+	}
+}
+
+func resolveDelegateInfo(c *util.Client, sess xeSession, it xeItem, jar http.CookieJar) (*extractor.MediaInfo, error) {
+	appID := strings.ToLower(firstNonEmpty(it.appID, firstVal(it.raw, "app_id", "content_app_id"), sess.appID))
+	cUserID := firstNonEmpty(it.cUserID, firstVal(it.raw, "c_user_id", "user_id"), sess.cUserID)
+	if appID == "" || it.id == "" {
+		return nil, fmt.Errorf("missing app_id or course_id")
+	}
+	h5URL := delegateH5URL(it, appID)
+	if h5URL == "" {
+		return nil, fmt.Errorf("missing h5 url")
+	}
+	token := h5Token(c, sess, appID, cUserID)
+	if token == "" {
+		return nil, fmt.Errorf("missing h5 token")
+	}
+	installDelegateCookies(jar, appID, token)
+	ext, site, err := extractor.MatchWithSite(h5URL)
+	if err != nil {
+		return nil, err
+	}
+	if strings.EqualFold(site.Name, "Xiaoeapp") {
+		return nil, fmt.Errorf("h5 url matched xiaoeapp instead of h5 delegate")
+	}
+	info, err := ext.Extract(h5URL, &extractor.ExtractOpts{Cookies: jar})
+	if err != nil {
+		return nil, err
+	}
+	if info == nil {
+		return nil, fmt.Errorf("empty delegate result")
+	}
+	if info.Extra == nil {
+		info.Extra = map[string]any{}
+	}
+	info.Extra["delegate"] = true
+	info.Extra["delegate_url"] = h5URL
+	info.Extra["delegate_site"] = site.Name
+	return info, nil
+}
+
+func appendDelegateEntries(entries *[]*extractor.MediaInfo, seen map[string]bool, info *extractor.MediaInfo, it xeItem) int {
+	if info == nil {
+		return 0
+	}
+	before := len(*entries)
+	var add func(*extractor.MediaInfo)
+	add = func(mi *extractor.MediaInfo) {
+		if mi == nil {
+			return
+		}
+		if len(mi.Entries) > 0 {
+			for _, child := range mi.Entries {
+				add(child)
+			}
+			return
+		}
+		u := firstStreamURL(mi)
+		if u == "" || seen[u] {
+			return
+		}
+		seen[u] = true
+		if mi.Extra == nil {
+			mi.Extra = map[string]any{}
+		}
+		mi.Extra["delegate"] = true
+		mi.Extra["delegate_parent_id"] = it.id
+		mi.Extra["delegate_parent_type"] = typeMap(it.typ)
+		if mi.Title == "" {
+			mi.Title = firstNonEmpty(it.title, it.id)
+		}
+		*entries = append(*entries, mi)
+	}
+	add(info)
+	return len(*entries) - before
+}
+
+func firstStreamURL(mi *extractor.MediaInfo) string {
+	if mi == nil {
+		return ""
+	}
+	for _, stream := range mi.Streams {
+		for _, u := range stream.URLs {
+			if strings.TrimSpace(u) != "" {
+				return u
+			}
+		}
+	}
+	return ""
+}
+
+func h5Token(c *util.Client, sess xeSession, appID, cUserID string) string {
+	body := map[string]any{"app_id": appID}
+	if cUserID != "" {
+		body["c_user_id"] = cUserID
+	}
+	root, err := postAppAPI(c, sess, h5LoginAPI, body)
+	if err != nil || code(root) != "0" {
+		return ""
+	}
+	return val(root["data"], "token")
+}
+
+func installDelegateCookies(jar http.CookieJar, appID, token string) {
+	if jar == nil || appID == "" || token == "" {
+		return
+	}
+	for _, raw := range []string{
+		"https://" + appID + ".h5.xiaoeknow.com",
+		"https://" + appID + ".h5.xet.citv.cn",
+		"https://www.xiaoeknow.com",
+		"https://study.xiaoe-tech.com",
+	} {
+		if u, err := url.Parse(raw); err == nil {
+			jar.SetCookies(u, []*http.Cookie{
+				{Name: "app_id", Value: appID, Path: "/"},
+				{Name: "ko_token", Value: token, Path: "/"},
+			})
+		}
+	}
+}
+
+func delegateH5URL(it xeItem, appID string) string {
+	if it.id == "" || appID == "" {
+		return ""
+	}
+	domain := appID + ".h5.xiaoeknow.com"
+	for _, k := range []string{"h5_url", "url", "jump_url"} {
+		if u := normalizeDelegateURL(val(it.raw, k), domain); u != "" {
+			return u
+		}
+	}
+	switch typeMap(it.typ) {
+	case "clock":
+		return fmt.Sprintf("https://%s/p/t/v1/clock/e_clock/clock_h5/clockIntroduce?activity_id=%s", domain, url.QueryEscape(it.id))
+	case "live":
+		return fmt.Sprintf("https://%s/v3/course/alive/%s?app_id=%s&type=2", domain, url.PathEscape(it.id), url.QueryEscape(appID))
+	case "book":
+		return fmt.Sprintf("https://%s/p/course/ebook/%s", domain, url.PathEscape(it.id))
+	case "text", "audio", "video", "ecourse", "member", "column":
+		return fmt.Sprintf("https://%s/p/course/%s/%s", domain, typeMap(it.typ), url.PathEscape(it.id))
+	case "bigcolumn":
+		return fmt.Sprintf("https://%s/p/course/big_column/%s", domain, url.PathEscape(it.id))
+	case "train":
+		if strings.HasPrefix(it.id, "term_") {
+			return fmt.Sprintf("https://%s/p/course/camp/%s", domain, url.PathEscape(it.id))
+		}
+		return fmt.Sprintf("https://%s/p/course/ecourse/%s", domain, url.PathEscape(it.id))
+	default:
+		return ""
+	}
+}
+
+func normalizeDelegateURL(raw, domain string) string {
+	raw = normalizeURL(raw)
+	if raw == "" {
+		return ""
+	}
+	if strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://") {
+		return raw
+	}
+	if strings.HasPrefix(raw, "/") {
+		return "https://" + domain + raw
+	}
+	return "https://" + domain + "/" + strings.TrimLeft(raw, "/")
 }
 
 func postAppAPI(c *util.Client, sess xeSession, path string, body map[string]any) (map[string]any, error) {
@@ -411,6 +611,7 @@ func code(root map[string]any) string { return fmt.Sprint(root["code"]) }
 func toInt(s string) int              { var n int; fmt.Sscanf(s, "%d", &n); return n }
 func normalizeURL(u string) string {
 	u = strings.TrimSpace(strings.ReplaceAll(u, `\/`, "/"))
+	u = strings.ReplaceAll(u, `\u002F`, "/")
 	if strings.HasPrefix(u, "//") {
 		return "https:" + u
 	}
@@ -441,4 +642,69 @@ func containsPrivateXiaoeFlow(v any) bool {
 		}
 	}
 	return false
+}
+
+func firstPrivateXiaoeMediaURL(v any) string {
+	for _, m := range mapsUnder(v) {
+		for _, k := range []string{"aliveVideoUrlEncrypt", "private_m3u8", "aliveVideoUrl", "alive_video_url", "aliveVideoMp4Url", "miniAliveVideoUrl", "aliveReviewUrl", "video_m3u8_url", "video_url", "url", "m3u8_url"} {
+			raw := val(m, k)
+			if raw == "" {
+				continue
+			}
+			u := normalizeURL(decryptXiaoePrivateURL(raw))
+			if isXiaoePlayableURL(u) {
+				return u
+			}
+		}
+	}
+	return ""
+}
+
+func decryptXiaoePrivateURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if strings.HasPrefix(raw, "http") && strings.Contains(strings.ToLower(raw), ".m3u8") {
+		return raw
+	}
+	if !strings.Contains(raw, "__ba") {
+		return raw
+	}
+	s := strings.ReplaceAll(raw, "__ba", "")
+	s = strings.NewReplacer("@", "1", "#", "2", "$", "3", "%", "4").Replace(s)
+	s = strings.ReplaceAll(strings.ReplaceAll(s, "-", "+"), "_", "/")
+	s = regexp.MustCompile(`[^A-Za-z0-9+/]`).ReplaceAllString(s, "")
+	if pad := len(s) % 4; pad != 0 {
+		s += strings.Repeat("=", 4-pad)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return ""
+	}
+	return string(decoded)
+}
+
+func appendXiaoeURLParams(raw string, params [][2]string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return raw
+	}
+	q := parsed.Query()
+	for _, kv := range params {
+		if kv[0] == "" || kv[1] == "" || q.Has(kv[0]) {
+			continue
+		}
+		q.Set(kv[0], kv[1])
+	}
+	parsed.RawQuery = q.Encode()
+	return parsed.String()
+}
+
+func isXiaoePlayableURL(raw string) bool {
+	u := strings.ToLower(strings.TrimSpace(raw))
+	if !(strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://")) {
+		return false
+	}
+	return strings.Contains(u, ".m3u8") || strings.Contains(u, ".mp4") || strings.Contains(u, ".mp3") || strings.Contains(u, ".m4a") || strings.Contains(u, ".pdf") || strings.Contains(u, ".epub")
 }

@@ -42,6 +42,14 @@ const (
 	// Source: Eoffcn_Course._get_m3u8_info (line 330) / _get_file (line 697).
 	aesKey = "1234567898882222"
 	aesIV  = "8NONwyJtHesysWpM"
+
+	// Whiteboard playback is rendered by the restored Python local player with
+	// wboffcn.js under pcvod.offcncloud.com. Full canvas rendering is browser
+	// work; the extractor keeps the playable media URL when present and exposes
+	// enough metadata for a renderer/downloader to recover the board timeline.
+	eoffcnBoardReferer  = "https://pcvod.offcncloud.com/"
+	eoffcnWbOffcnJSURL  = "https://vod-live.offcncloud.com/base/wb1004/wboffcn.js"
+	eoffcnWbOffcnMemURL = "https://vod-live.offcncloud.com/base/wb1004/wboffcn.js.mem"
 )
 
 var patterns = []string{`(?:[\w-]+\.)?(?:eoffcn|offcncloud)\.com/`}
@@ -230,54 +238,91 @@ func resolveLesson(c *util.Client, headers map[string]string, p eoffcnParams, fa
 	if err := json.Unmarshal([]byte(body), &payload); err != nil {
 		return nil, fmt.Errorf("parse eoffcn lesson detail: %w", err)
 	}
-	// findMediaURL tries both plain URLs and AES-CBC decryption of live_url/video_url
-	// using the static key from source (Eoffcn_Course._get_m3u8_info line 330).
-	mediaURL := findMediaURL(payload)
-	if mediaURL == "" {
-		// Source: Eoffcn_Course._get_m3u8_info for video_type 6 first extracts
-		// k= and account= from live_url, then calls _decrypt_video_key(k, account)
-		// which uses the RSA flow. _request_watch_demand_data does the same for
-		// watch_demand content types with a live_url containing query params.
-		ids := collectWatchIDs(payload)
-		if ids.LiveURL != "" || ids.VideoID != "" || ids.RoomID != "" {
-			if watched := requestWatchDemand(c, headers, ids); watched != "" {
-				mediaURL = watched
-			}
-		}
-	}
-	if mediaURL == "" {
+	playback := resolveEoffcnPlayback(c, headers, payload)
+	if playback.URL == "" {
 		return nil, fmt.Errorf("eoffcn: no live_url/video_url in lesson %s (RSA watch_demand attempted but returned no media)", p.LessonID)
 	}
 	title := util.SanitizeFilename(firstNonEmpty(pickTitle(payload), fallbackTitle, "eoffcn_"+p.LessonID))
-	return mediaInfo(title, mediaURL, headers), nil
+	return mediaInfoWithExtra(title, playback.URL, eoffcnStreamHeaders(headers, playback.URL, playback.Extra), playback.Extra), nil
 }
 
 type watchIDs struct{ VideoID, RoomID, Account, K, LiveURL string }
 
-// requestWatchDemand implements the full RSA-encrypted watch_demand flow.
+type eoffcnPlayback struct {
+	URL        string
+	Extra      map[string]any
+	Whiteboard eoffcnWhiteboardInfo
+}
+
+type eoffcnWhiteboardInfo struct {
+	Whiteboard bool
+	APIURL     string
+	Params     map[string]string
+	Source     string
+}
+
+func resolveEoffcnPlayback(c *util.Client, headers map[string]string, payload any) eoffcnPlayback {
+	whiteboard := detectEoffcnWhiteboard(payload)
+
+	// findMediaURL tries both plain URLs and AES-CBC decryption of live_url/video_url
+	// using the static key from source (Eoffcn_Course._get_m3u8_info line 330).
+	playback := eoffcnPlayback{URL: findMediaURL(payload), Whiteboard: whiteboard}
+	ids := collectWatchIDs(payload)
+	if playback.URL == "" || (whiteboard.Whiteboard && whiteboard.APIURL == "" && (ids.LiveURL != "" || ids.VideoID != "" || ids.RoomID != "")) {
+		// Source: Eoffcn_Course._get_m3u8_info for video_type 6 first extracts
+		// k= and account= from live_url, then calls _decrypt_video_key(k, account)
+		// which uses the RSA flow. _request_watch_demand_data does the same for
+		// watch_demand content types with a live_url containing query params.
+		if ids.LiveURL != "" || ids.VideoID != "" || ids.RoomID != "" {
+			watched := requestWatchDemandPlayback(c, headers, ids)
+			whiteboard = mergeEoffcnWhiteboardInfo(whiteboard, watched.Whiteboard)
+			if playback.URL == "" && watched.URL != "" {
+				playback.URL = watched.URL
+			}
+			playback.Extra = mergeEoffcnExtra(playback.Extra, watched.Extra)
+		}
+	}
+
+	playback.Whiteboard = whiteboard
+	if playback.URL == "" && whiteboard.Whiteboard && whiteboard.APIURL != "" {
+		playback.URL = whiteboard.APIURL
+	}
+	playback.Extra = mergeEoffcnExtra(playback.Extra, eoffcnWhiteboardExtra(whiteboard))
+	return playback
+}
+
+// requestWatchDemand keeps the original string-returning helper contract.
+func requestWatchDemand(c *util.Client, headers map[string]string, ids watchIDs) string {
+	return requestWatchDemandPlayback(c, headers, ids).URL
+}
+
+// requestWatchDemandPlayback implements the full RSA-encrypted watch_demand flow.
 //
 // Source: Eoffcn_Course._request_watch_demand_data (line 496) and
 // _decrypt_video_key (line 292). The flow is:
-//   1. GET pub_key_url -> JSON data field is the RSA public key, AES-encrypted
-//      with static key/IV "wwwoffcncloudcom".
-//   2. AES-decrypt to get the raw RSA public key body (base64 PEM body without
-//      headers).
-//   3. Generate a 16-char random alphanumeric key.
-//   4. RSA-encrypt "offcn|||" + randomKey with the public key (PKCS1v15).
-//   5. POST to encrypt_url with {account, k, encry_key: <rsa_encrypted>}.
-//   6. Server returns AES-encrypted JSON; decrypt with key=randomKey, iv=randomKey.
-//   7. Parse the decrypted JSON for media URLs.
-func requestWatchDemand(c *util.Client, headers map[string]string, ids watchIDs) string {
+//  1. GET pub_key_url -> JSON data field is the RSA public key, AES-encrypted
+//     with static key/IV "wwwoffcncloudcom".
+//  2. AES-decrypt to get the raw RSA public key body (base64 PEM body without
+//     headers).
+//  3. Generate a 16-char random alphanumeric key.
+//  4. RSA-encrypt "offcn|||" + randomKey with the public key (PKCS1v15).
+//  5. POST to encrypt_url with {account, k, encry_key: <rsa_encrypted>}.
+//  6. Server returns AES-encrypted JSON; decrypt with key=randomKey, iv=randomKey.
+//  7. Parse the decrypted JSON for media URLs and whiteboard metadata.
+func requestWatchDemandPlayback(c *util.Client, headers map[string]string, ids watchIDs) eoffcnPlayback {
+	if c == nil {
+		return eoffcnPlayback{}
+	}
 	// Step 1: Fetch the encrypted public key.
 	pubKeyEncrypted := getPubKey(c, headers)
 	if pubKeyEncrypted == "" {
-		return ""
+		return eoffcnPlayback{}
 	}
 
 	// Step 2: AES-decrypt the public key.
 	decryptedPubKey := aesDecryptWithStatic(pubKeyEncrypted, pubKeyAESKey, pubKeyAESIV)
 	if decryptedPubKey == "" {
-		return ""
+		return eoffcnPlayback{}
 	}
 
 	// Step 3: Generate 16-char random key.
@@ -289,7 +334,7 @@ func requestWatchDemand(c *util.Client, headers map[string]string, ids watchIDs)
 	pemKey := "-----BEGIN RSA PUBLIC KEY-----\n" + decryptedPubKey + "\n-----END RSA PUBLIC KEY-----\n"
 	encrypted, err := util.RSAEncryptPKCS1([]byte(encryptPrefix+randomKey), pemKey)
 	if err != nil {
-		return ""
+		return eoffcnPlayback{}
 	}
 
 	// Step 5: Build POST data and send.
@@ -310,27 +355,27 @@ func requestWatchDemand(c *util.Client, headers map[string]string, ids watchIDs)
 
 	body, err := c.PostForm(encrypt_url, form, headers)
 	if err != nil {
-		return ""
+		return eoffcnPlayback{}
 	}
 
 	// Step 6: Parse and AES-decrypt the response.
 	var payload map[string]any
 	if json.Unmarshal([]byte(body), &payload) != nil {
-		return ""
+		return eoffcnPlayback{}
 	}
 	respData, _ := payload["data"].(string)
 	if respData == "" {
-		return ""
+		return eoffcnPlayback{}
 	}
 
 	// AES-decrypt with randomKey as both key and IV.
 	decrypted := aesDecryptWithStatic(respData, randomKey, randomKey)
 	if decrypted == "" {
-		return ""
+		return eoffcnPlayback{}
 	}
 
-	// Step 7: Parse the decrypted data for media URLs.
-	return extractWatchDemandURL(decrypted)
+	// Step 7: Parse the decrypted data for media URLs and whiteboard metadata.
+	return extractWatchDemandPlayback(decrypted)
 }
 
 // getPubKey fetches the RSA public key from the server.
@@ -402,25 +447,37 @@ func parseLiveURLParams(liveURL string) (k, account string) {
 // Source: Eoffcn_Course._normalize_watch_demand_data (line 528) extracts URLs
 // from many possible field names.
 func extractWatchDemandURL(decrypted string) string {
+	return extractWatchDemandPlayback(decrypted).URL
+}
+
+func extractWatchDemandPlayback(decrypted string) eoffcnPlayback {
 	// Try parsing as JSON.
 	var data any
 	if json.Unmarshal([]byte(decrypted), &data) == nil {
+		whiteboard := detectEoffcnWhiteboard(data)
 		if u := findMediaURL(data); u != "" {
-			return u
+			return eoffcnPlayback{URL: u, Whiteboard: whiteboard, Extra: eoffcnWhiteboardExtra(whiteboard)}
 		}
 		// Also check for watch_demand-specific fields.
 		if u := findWatchDemandFields(data); u != "" {
-			return u
+			return eoffcnPlayback{URL: u, Whiteboard: whiteboard, Extra: eoffcnWhiteboardExtra(whiteboard)}
+		}
+		if whiteboard.Whiteboard && whiteboard.APIURL != "" {
+			return eoffcnPlayback{URL: whiteboard.APIURL, Whiteboard: whiteboard, Extra: eoffcnWhiteboardExtra(whiteboard)}
 		}
 	}
+	whiteboard := detectEoffcnWhiteboard(decrypted)
 	// Try extracting "vod":"..." pattern (used by _decrypt_video_key).
 	if m := vodURLRe.FindStringSubmatch(decrypted); len(m) > 1 {
 		u := strings.ReplaceAll(m[1], `\`, "")
 		if isMediaURL(u) {
-			return u
+			return eoffcnPlayback{URL: u, Whiteboard: whiteboard, Extra: eoffcnWhiteboardExtra(whiteboard)}
 		}
 	}
-	return ""
+	if whiteboard.Whiteboard && whiteboard.APIURL != "" {
+		return eoffcnPlayback{URL: whiteboard.APIURL, Whiteboard: whiteboard, Extra: eoffcnWhiteboardExtra(whiteboard)}
+	}
+	return eoffcnPlayback{}
 }
 
 var vodURLRe = regexp.MustCompile(`"vod"\s*:\s*"(.*?)"`)
@@ -458,6 +515,12 @@ func findWatchDemandFields(v any) string {
 		}
 		for _, k := range watchDemandKeys {
 			if s := normalizeURL(valueString(x, k)); isMediaURL(s) {
+				return s
+			}
+		}
+		for _, k := range watchDemandKeys {
+			s := normalizeURL(valueString(x, k))
+			if isEoffcnWhiteboardKey(k) && isHTTPURL(s) {
 				return s
 			}
 		}
@@ -688,6 +751,288 @@ func collectWatchIDs(v any) watchIDs {
 	return ids
 }
 
+func detectEoffcnWhiteboard(v any) eoffcnWhiteboardInfo {
+	info := eoffcnWhiteboardInfo{Params: map[string]string{}}
+	var walk func(any, string)
+	walk = func(x any, key string) {
+		if isEoffcnWhiteboardKey(key) {
+			info.Whiteboard = true
+			if info.Source == "" {
+				info.Source = key
+			}
+		}
+		switch t := x.(type) {
+		case map[string]any:
+			for k, child := range t {
+				if strings.EqualFold(k, "video_type") && strings.TrimSpace(fmt.Sprint(child)) == "6" {
+					info.Whiteboard = true
+					if info.Source == "" {
+						info.Source = "video_type=6"
+					}
+				}
+				if isEoffcnBoardParamKey(k) {
+					addEoffcnWhiteboardParam(info.Params, k, fmt.Sprint(child))
+				}
+				if s, ok := child.(string); ok {
+					considerEoffcnWhiteboardURL(&info, s, k, isEoffcnWhiteboardKey(k))
+				}
+				walk(child, k)
+			}
+		case []any:
+			for _, child := range t {
+				walk(child, key)
+			}
+		case string:
+			s := normalizeURL(t)
+			if looksLikeEoffcnWhiteboardString(s) {
+				info.Whiteboard = true
+				if info.Source == "" {
+					info.Source = key
+				}
+			}
+			considerEoffcnWhiteboardURL(&info, s, key, isEoffcnWhiteboardKey(key))
+			if nested, ok := parseNestedJSON(s); ok {
+				walk(nested, key)
+			}
+		case float64, int, int64, json.Number:
+			if strings.EqualFold(key, "video_type") && strings.TrimSpace(fmt.Sprint(t)) == "6" {
+				info.Whiteboard = true
+				if info.Source == "" {
+					info.Source = "video_type=6"
+				}
+			}
+		}
+	}
+	walk(v, "")
+	if len(info.Params) == 0 {
+		info.Params = nil
+	}
+	return info
+}
+
+func mergeEoffcnWhiteboardInfo(a, b eoffcnWhiteboardInfo) eoffcnWhiteboardInfo {
+	out := a
+	if b.Whiteboard {
+		out.Whiteboard = true
+	}
+	if out.APIURL == "" || eoffcnWhiteboardURLScore(b.APIURL) > eoffcnWhiteboardURLScore(out.APIURL) {
+		out.APIURL = b.APIURL
+	}
+	if out.Source == "" {
+		out.Source = b.Source
+	}
+	if len(b.Params) > 0 {
+		if out.Params == nil {
+			out.Params = map[string]string{}
+		}
+		for k, v := range b.Params {
+			if _, ok := out.Params[k]; !ok && strings.TrimSpace(v) != "" {
+				out.Params[k] = v
+			}
+		}
+	}
+	return out
+}
+
+func eoffcnWhiteboardExtra(info eoffcnWhiteboardInfo) map[string]any {
+	if !info.Whiteboard {
+		return nil
+	}
+	extra := map[string]any{
+		"whiteboard":          true,
+		"whiteboard_renderer": "eoffcn_wboffcn",
+		"whiteboard_referer":  eoffcnBoardReferer,
+		"wboffcn_js_url":      eoffcnWbOffcnJSURL,
+		"wboffcn_mem_url":     eoffcnWbOffcnMemURL,
+		"render_required":     true,
+	}
+	if info.APIURL != "" {
+		extra["whiteboard_api_url"] = info.APIURL
+	}
+	if len(info.Params) > 0 {
+		extra["whiteboard_params"] = info.Params
+	}
+	if info.Source != "" {
+		extra["whiteboard_source"] = info.Source
+	}
+	return extra
+}
+
+func mergeEoffcnExtra(dst, src map[string]any) map[string]any {
+	if len(dst) == 0 && len(src) == 0 {
+		return nil
+	}
+	out := map[string]any{}
+	for k, v := range dst {
+		out[k] = v
+	}
+	for k, v := range src {
+		out[k] = v
+	}
+	return out
+}
+
+func considerEoffcnWhiteboardURL(info *eoffcnWhiteboardInfo, raw, source string, fromBoardKey bool) {
+	s := normalizeURL(raw)
+	if s == "" {
+		return
+	}
+	collectEoffcnWhiteboardParams(info.Params, s)
+	if !isHTTPURL(s) {
+		return
+	}
+	if fromBoardKey || isEoffcnWhiteboardURL(s) {
+		info.Whiteboard = true
+		if info.Source == "" {
+			info.Source = source
+		}
+		if info.APIURL == "" || eoffcnWhiteboardURLScore(s) > eoffcnWhiteboardURLScore(info.APIURL) {
+			info.APIURL = s
+		}
+	}
+}
+
+func collectEoffcnWhiteboardParams(params map[string]string, raw string) {
+	if params == nil {
+		return
+	}
+	u, err := url.Parse(normalizeURL(raw))
+	if err == nil {
+		for key, values := range u.Query() {
+			if len(values) > 0 && isEoffcnBoardParamKey(key) {
+				addEoffcnWhiteboardParam(params, key, values[0])
+			}
+		}
+	}
+	for _, key := range []string{"room_num", "roomNum", "room_id", "roomId", "account", "k", "video_id", "videoId", "vid", "live_id", "liveId", "package_id", "packageId"} {
+		re := regexp.MustCompile(`(?i)(?:^|[?&#])` + regexp.QuoteMeta(key) + `=([^&#]+)`)
+		if m := re.FindStringSubmatch(raw); len(m) > 1 {
+			if v, err := url.QueryUnescape(m[1]); err == nil {
+				addEoffcnWhiteboardParam(params, key, v)
+			} else {
+				addEoffcnWhiteboardParam(params, key, m[1])
+			}
+		}
+	}
+}
+
+func addEoffcnWhiteboardParam(params map[string]string, key, value string) {
+	if params == nil {
+		return
+	}
+	key = strings.TrimSpace(key)
+	value = strings.TrimSpace(value)
+	if key == "" || value == "" || value == "<nil>" {
+		return
+	}
+	if len(value) > 2048 {
+		return
+	}
+	if _, ok := params[key]; !ok {
+		params[key] = value
+	}
+}
+
+func isEoffcnBoardParamKey(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "room_num", "roomnum", "room_id", "roomid", "account", "k", "video_id", "videoid", "vid", "live_id", "liveid", "package_id", "packageid":
+		return true
+	default:
+		return false
+	}
+}
+
+func isEoffcnWhiteboardKey(key string) bool {
+	k := strings.ToLower(strings.TrimSpace(key))
+	if k == "" {
+		return false
+	}
+	for _, marker := range []string{
+		"whiteboard", "white_board", "board_context", "boardcontext", "board_url", "boardurl",
+		"board_play", "boardplay", "board_resource", "boardresource", "board_font", "boardfont",
+		"wboffcn", "wbx", "wbr",
+	} {
+		if strings.Contains(k, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeEoffcnWhiteboardString(s string) bool {
+	low := strings.ToLower(strings.TrimSpace(s))
+	if low == "" {
+		return false
+	}
+	for _, marker := range []string{
+		"pcvod.offcncloud.com", "wboffcn", "wb1004", "/base/wb",
+		"whiteboard", "white_board", "board_context", ".wbx", ".wbr", "板书",
+	} {
+		if strings.Contains(low, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func isEoffcnWhiteboardURL(s string) bool {
+	low := strings.ToLower(strings.TrimSpace(s))
+	if !isHTTPURL(low) {
+		return false
+	}
+	if strings.Contains(low, "pcvod.offcncloud.com") ||
+		strings.Contains(low, "wboffcn") ||
+		strings.Contains(low, "wb1004") ||
+		strings.Contains(low, "/base/wb") ||
+		strings.Contains(low, "whiteboard") ||
+		strings.Contains(low, "white_board") ||
+		strings.Contains(low, "board") ||
+		strings.Contains(low, ".wbx") ||
+		strings.Contains(low, ".wbr") {
+		return true
+	}
+	if strings.Contains(low, "offcncloud.com") && (strings.Contains(low, "room_id=") || strings.Contains(low, "room_num=") || strings.Contains(low, "account=") || strings.Contains(low, "k=")) {
+		return true
+	}
+	return false
+}
+
+func eoffcnWhiteboardURLScore(s string) int {
+	low := strings.ToLower(strings.TrimSpace(s))
+	if low == "" {
+		return 0
+	}
+	score := 1
+	if strings.Contains(low, "pcvod.offcncloud.com") {
+		score += 100
+	}
+	if strings.Contains(low, "offcncloud.com") {
+		score += 50
+	}
+	if strings.Contains(low, "whiteboard") || strings.Contains(low, "white_board") || strings.Contains(low, "board") {
+		score += 30
+	}
+	if strings.Contains(low, "wboffcn") || strings.Contains(low, "wb1004") || strings.Contains(low, ".wbx") || strings.Contains(low, ".wbr") {
+		score += 20
+	}
+	if isMediaURL(low) {
+		score -= 10
+	}
+	return score
+}
+
+func parseNestedJSON(s string) (any, bool) {
+	s = strings.TrimSpace(s)
+	if !strings.HasPrefix(s, "{") && !strings.HasPrefix(s, "[") {
+		return nil, false
+	}
+	var out any
+	if json.Unmarshal([]byte(s), &out) != nil {
+		return nil, false
+	}
+	return out, true
+}
+
 func findMediaURL(v any) string {
 	switch x := v.(type) {
 	case map[string]any:
@@ -775,11 +1120,92 @@ func pkcs7Unpad(data []byte) []byte {
 }
 
 func mediaInfo(title, u string, h map[string]string) *extractor.MediaInfo {
-	format := "mp4"
-	if strings.Contains(strings.ToLower(u), ".m3u8") {
-		format = "m3u8"
+	return mediaInfoWithExtra(title, u, h, nil)
+}
+
+func mediaInfoWithExtra(title, u string, h map[string]string, extra map[string]any) *extractor.MediaInfo {
+	format := eoffcnFormat(u, extra)
+	return &extractor.MediaInfo{
+		Site:  "eoffcn",
+		Title: title,
+		Streams: map[string]extractor.Stream{"best": {
+			Quality:   "best",
+			URLs:      []string{u},
+			Format:    format,
+			NeedMerge: format == "m3u8",
+			Headers:   h,
+			Extra:     cloneExtra(extra),
+		}},
+		Extra: cloneExtra(extra),
 	}
-	return &extractor.MediaInfo{Site: "eoffcn", Title: title, Streams: map[string]extractor.Stream{"best": {Quality: "best", URLs: []string{u}, Format: format, Headers: h}}}
+}
+
+func eoffcnFormat(u string, extra map[string]any) string {
+	low := strings.ToLower(u)
+	switch {
+	case strings.Contains(low, ".m3u8"):
+		return "m3u8"
+	case strings.Contains(low, ".flv"):
+		return "flv"
+	case strings.Contains(low, ".mp3"):
+		return "mp3"
+	case strings.Contains(low, ".mp4"):
+		return "mp4"
+	case extra != nil && extra["whiteboard"] == true:
+		return "html"
+	default:
+		return "mp4"
+	}
+}
+
+func eoffcnStreamHeaders(headers map[string]string, mediaURL string, extra map[string]any) map[string]string {
+	out := cloneStringMap(headers)
+	if len(extra) > 0 {
+		if whiteboard, ok := extra["whiteboard"].(bool); ok && whiteboard {
+			if apiURL, _ := extra["whiteboard_api_url"].(string); mediaURL == apiURL || needsEoffcnBoardReferer(mediaURL) {
+				out["Referer"] = eoffcnBoardReferer
+			}
+		}
+	}
+	return out
+}
+
+func needsEoffcnBoardReferer(mediaURL string) bool {
+	low := strings.ToLower(strings.TrimSpace(mediaURL))
+	if low == "" {
+		return false
+	}
+	if strings.Contains(low, "pcvod.offcncloud.com") ||
+		strings.Contains(low, "wboffcn") ||
+		strings.Contains(low, "wb1004") ||
+		strings.Contains(low, "/base/wb") ||
+		strings.Contains(low, ".wbx") ||
+		strings.Contains(low, ".wbr") {
+		return true
+	}
+	return !isMediaURL(mediaURL) && isEoffcnWhiteboardURL(mediaURL)
+}
+
+func cloneStringMap(in map[string]string) map[string]string {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneExtra(in map[string]any) map[string]any {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 func rx(re *regexp.Regexp, s string) string {
@@ -845,6 +1271,11 @@ func normalizeURL(s string) string {
 func isMediaURL(s string) bool {
 	low := strings.ToLower(s)
 	return strings.HasPrefix(low, "http") && (strings.Contains(low, ".m3u8") || strings.Contains(low, ".mp4") || strings.Contains(low, ".flv") || strings.Contains(low, ".mp3"))
+}
+
+func isHTTPURL(s string) bool {
+	low := strings.ToLower(strings.TrimSpace(s))
+	return strings.HasPrefix(low, "http://") || strings.HasPrefix(low, "https://")
 }
 
 func firstNonEmpty(values ...string) string {

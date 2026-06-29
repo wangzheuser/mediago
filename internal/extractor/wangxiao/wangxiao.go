@@ -2,15 +2,20 @@
 package wangxiao
 
 import (
+	"bytes"
+	"encoding/hex"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"html"
+	"io"
+	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/Sophomoresty/mediago/internal/extractor"
-	"github.com/Sophomoresty/mediago/internal/extractor/shared"
 	"github.com/Sophomoresty/mediago/internal/util"
 )
 
@@ -27,7 +32,7 @@ const (
 	urlPlayerDown     = "https://users.wangxiao.cn/player/down.aspx?Id=%s"
 	urlLiveHandout    = "https://live.wangxiao.cn/LiveActivity/DownHandOut/?Id=%s"
 	urlVideoPlay      = "https://p.bokecc.com/servlet/getvideofile?vid=%s&siteid=%s"
-	defaultBokeSiteID = "A183AC83A2983CCC"
+	defaultBokeSiteID = "E601487AD12A3E06"
 )
 
 var patterns = []string{`(?:[\w-]+\.)?wangxiao\.cn/(?:play|item|Course|player|user)|(?:[\w-]+\.)?bokecc\.com/`}
@@ -77,25 +82,36 @@ func (w *Wangxiao) Extract(rawURL string, opts *extractor.ExtractOpts) (*extract
 		return nil, fmt.Errorf("wangxiao requires valid NewPlatFormToken/token cookies")
 	}
 
-	refs := parseLessonRefs(page, seed)
+	productID := firstNonEmpty(firstGroup(productRe, seed), firstGroup(productRe, page))
+	refs := parseLessonRefs(page, seed, productID)
 	if len(refs) == 0 {
-		refs = []lessonRef{{Title: extractTitle(page), URL: seed, ActivityID: firstGroup(activityRe, seed), ProductID: firstGroup(productRe, seed), SiteID: extractSiteID(page), VideoID: extractVideoID(page), Legacy: strings.Contains(strings.ToLower(seed), "users.wangxiao.cn/player")}}
+		refs = []lessonRef{{Title: extractTitle(page), URL: seed, ActivityID: firstGroup(activityRe, seed), ProductID: productID, SiteID: extractSiteID(page), VideoID: extractVideoID(page), Legacy: strings.Contains(strings.ToLower(seed), "users.wangxiao.cn/player")}}
 	}
-	refs = append(refs, refsFromKeCatalog(c, page, seed, headers)...)
+	refs = append(refs, refsFromKeCatalog(c, page, seed, headers, opts.Cookies)...)
+	if productID != "" {
+		if userRefs, err := fetchUserClasshours(c, productID, extractOrderNumber(page), extractCourseID(page, seed), headers); err == nil {
+			refs = append(refs, userRefs...)
+		}
+	}
 
 	entries := make([]*extractor.MediaInfo, 0, len(refs))
 	seen := map[string]bool{}
 	for i, ref := range refs {
-		entry, err := resolveRef(c, ref, i+1, headers)
-		if err != nil || entry == nil || len(entry.Streams) == 0 {
+		resolved, err := resolveRefEntries(c, ref, i+1, headers, opts.Quality)
+		if err != nil {
 			continue
 		}
-		key := entry.Streams["default"].URLs[0]
-		if key == "" || seen[key] {
-			continue
+		for _, entry := range resolved {
+			if entry == nil || len(entry.Streams) == 0 {
+				continue
+			}
+			key := entry.Streams["default"].URLs[0]
+			if key == "" || seen[key] {
+				continue
+			}
+			seen[key] = true
+			entries = append(entries, entry)
 		}
-		seen[key] = true
-		entries = append(entries, entry)
 	}
 	if len(entries) == 0 {
 		return nil, fmt.Errorf("wangxiao: no playable BokeCC video resolved")
@@ -107,7 +123,7 @@ func (w *Wangxiao) Extract(rawURL string, opts *extractor.ExtractOpts) (*extract
 	return &extractor.MediaInfo{Site: "wangxiao", Title: title, Entries: entries}, nil
 }
 
-func resolveRef(c *util.Client, ref lessonRef, index int, headers map[string]string) (*extractor.MediaInfo, error) {
+func resolveRefEntries(c *util.Client, ref lessonRef, index int, headers map[string]string, quality string) ([]*extractor.MediaInfo, error) {
 	if ref.ActivityID != "" {
 		if ref.Legacy {
 			ref.URL = fmt.Sprintf(urlPlayer, ref.ActivityID)
@@ -132,20 +148,69 @@ func resolveRef(c *util.Client, ref lessonRef, index int, headers map[string]str
 		ref.SiteID = defaultBokeSiteID
 	}
 	if ref.VideoID == "" {
-		return nil, fmt.Errorf("wangxiao: lesson has no cc vid")
+		ref.VideoID = extractVideoID(ref.URL)
 	}
-	mediaURL, err := shared.BokeCCResolve(c, ref.VideoID, ref.SiteID, map[string]string{"Referer": ref.URL})
-	if err != nil {
-		return nil, err
+	var entries []*extractor.MediaInfo
+	if ref.VideoID != "" {
+		play, err := resolveBokeCCWangxiao(c, ref.VideoID, ref.SiteID, ref.URL, quality)
+		if err == nil && play.URL != "" {
+			title := strings.TrimSpace(ref.Title)
+			if title == "" {
+				title = fmt.Sprintf("视频%d", index)
+			}
+			extra := map[string]any{
+				"activity_id":    ref.ActivityID,
+				"video_id":       ref.VideoID,
+				"siteid":         ref.SiteID,
+				"lesson_url":     ref.URL,
+				"video_play_url": fmt.Sprintf(urlVideoPlay, ref.VideoID, ref.SiteID),
+				"headers":        headers,
+			}
+			if play.M3U8Text != "" {
+				extra["m3u8_text"] = play.M3U8Text
+				extra["source_type"] = "m3u8_text"
+			}
+			entries = append(entries, &extractor.MediaInfo{
+				Site:  "wangxiao",
+				Title: title,
+				Streams: map[string]extractor.Stream{"default": {
+					Quality:   "best",
+					URLs:      []string{play.URL},
+					Format:    formatFromURL(play.URL),
+					NeedMerge: strings.Contains(strings.ToLower(play.URL), ".m3u8"),
+					Headers:   map[string]string{"Referer": ref.URL},
+				}},
+				Extra: extra,
+			})
+		}
 	}
-	title := strings.TrimSpace(ref.Title)
-	if title == "" {
-		title = fmt.Sprintf("视频%d", index)
+	for j, fileURL := range resolveFileResourcesFromBody(c, ref, body, map[string]string{"Referer": ref.URL}) {
+		name := strings.TrimSpace(ref.Title)
+		if name == "" {
+			name = fmt.Sprintf("资料%d", index)
+		}
+		if len(entries) > 0 || j > 0 {
+			name = fmt.Sprintf("%s-资料%d", name, j+1)
+		}
+		entries = append(entries, &extractor.MediaInfo{
+			Site:  "wangxiao",
+			Title: name,
+			Streams: map[string]extractor.Stream{"default": {
+				Quality: "source",
+				URLs:    []string{fileURL},
+				Format:  resourceExt(fileURL),
+				Headers: map[string]string{"Referer": ref.URL},
+			}},
+			Extra: map[string]any{"activity_id": ref.ActivityID, "lesson_url": ref.URL, "type": "file"},
+		})
 	}
-	return &extractor.MediaInfo{Site: "wangxiao", Title: title, Streams: map[string]extractor.Stream{"default": {Quality: "best", URLs: []string{mediaURL}, Format: formatFromURL(mediaURL), Headers: map[string]string{"Referer": ref.URL}}}, Extra: map[string]any{"activity_id": ref.ActivityID, "video_id": ref.VideoID, "siteid": ref.SiteID, "lesson_url": ref.URL, "video_play_url": fmt.Sprintf(urlVideoPlay, ref.VideoID, ref.SiteID), "headers": headers}}, nil
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("wangxiao: lesson has no cc vid or handout")
+	}
+	return entries, nil
 }
 
-func parseLessonRefs(text, pageURL string) []lessonRef {
+func parseLessonRefs(text, pageURL, fallbackProductID string) []lessonRef {
 	refs := make([]lessonRef, 0)
 	seen := map[string]bool{}
 	add := func(u, title string) {
@@ -159,10 +224,28 @@ func parseLessonRefs(text, pageURL string) []lessonRef {
 			return
 		}
 		seen[u] = true
-		refs = append(refs, lessonRef{Title: title, URL: u, ActivityID: act, ProductID: firstGroup(productRe, u), Legacy: strings.Contains(strings.ToLower(u), "users.wangxiao.cn/player")})
+		refs = append(refs, lessonRef{Title: title, URL: u, ActivityID: act, ProductID: firstNonEmpty(firstGroup(productRe, u), fallbackProductID), Legacy: strings.Contains(strings.ToLower(u), "users.wangxiao.cn/player")})
 	}
 	for _, m := range hrefRe.FindAllStringSubmatch(text, -1) {
 		add(m[1], "")
+	}
+	classHourRe := regexp.MustCompile(`(?is)<[^>]+data-classhourid=["']([^"']+)["'][^>]*>`)
+	titleAttrRe := regexp.MustCompile(`(?is)(?:title|data-title)=["']([^"']+)["']`)
+	for _, m := range classHourRe.FindAllStringSubmatch(text, -1) {
+		act := strings.TrimSpace(m[1])
+		if act == "" {
+			continue
+		}
+		title := ""
+		if tm := titleAttrRe.FindStringSubmatch(m[0]); len(tm) > 1 {
+			title = cleanText(tm[1])
+		}
+		if fallbackProductID != "" {
+			add(fmt.Sprintf(urlPlay, act, fallbackProductID), title)
+		} else if !seen[act] {
+			seen[act] = true
+			refs = append(refs, lessonRef{Title: title, URL: pageURL, ActivityID: act, ProductID: fallbackProductID})
+		}
 	}
 	if m := pageDataRe.FindStringSubmatch(text); len(m) > 1 {
 		var data map[string]any
@@ -175,19 +258,27 @@ func parseLessonRefs(text, pageURL string) []lessonRef {
 	return refs
 }
 
-func refsFromKeCatalog(c *util.Client, page, pageURL string, headers map[string]string) []lessonRef {
+func refsFromKeCatalog(c *util.Client, page, pageURL string, headers map[string]string, jar http.CookieJar) []lessonRef {
 	setmealID := firstGroup(setmealRe, page)
 	if setmealID == "" {
 		return nil
 	}
 	h := wangxiaoHeaders(pageURL)
-	h["content-type"] = "application/json;charset=UTF-8"
+	h["Content-Type"] = "application/json;charset=UTF-8"
 	h["token"] = keAPIToken
+	h["sessionId"] = cookieFromJar(jar, "sessionId", "k.wangxiao.cn", "ke.wangxiao.cn")
 	h["source"] = "pc"
-	body, err := c.PostForm(urlSku, map[string]string{"id": setmealID}, h)
+	payload, _ := json.Marshal(map[string]string{"id": setmealID})
+	resp, err := c.Post(urlSku, bytes.NewReader(payload), h)
 	if err != nil {
 		return nil
 	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil || resp.StatusCode >= 400 {
+		return nil
+	}
+	body := string(raw)
 	var root map[string]any
 	if json.Unmarshal([]byte(body), &root) != nil || fmt.Sprint(root["code"]) != "0" {
 		return nil
@@ -284,50 +375,53 @@ func formatFromURL(u string) string {
 // <li> tags from GetClasshours response → lesson links.
 func fetchUserClasshours(c *util.Client, productID, orderNumber, courseID string, headers map[string]string) ([]lessonRef, error) {
 	h := cloneMap(headers)
-	// Step 1: ProductsDirectory → get ordernumber if missing
-	if orderNumber == "" {
+	courseIDs := []string{}
+	if courseID != "" {
+		courseIDs = append(courseIDs, courseID)
+	}
+
+	// Step 1: ProductsDirectory → get ordernumber/course ids when they are not
+	// embedded in the current page. The Python source always tries this owned
+	// course-directory endpoint before GetClasshours.
+	if orderNumber == "" || len(courseIDs) == 0 {
 		dirURL := fmt.Sprintf(urlDirectory, productID, "")
 		body, err := c.GetString(dirURL, h)
 		if err == nil {
-			orderNumber = extractOrderNumber(body)
+			if orderNumber == "" {
+				orderNumber = extractOrderNumber(body)
+			}
+			courseIDs = append(courseIDs, extractCourseIDs(body)...)
 		}
 	}
-	if orderNumber == "" {
-		return nil, fmt.Errorf("wangxiao: cannot determine ordernumber")
+	if len(courseIDs) == 0 {
+		return nil, fmt.Errorf("wangxiao: cannot determine course id")
 	}
 
 	// Step 2: GetClasshours → parse lesson list
-	classURL := fmt.Sprintf(urlClasshours, courseID, productID)
-	body, err := c.GetString(classURL, h)
-	if err != nil {
-		return nil, fmt.Errorf("wangxiao GetClasshours: %w", err)
+	var out []lessonRef
+	for _, cid := range uniqueStrings(courseIDs) {
+		classURL := fmt.Sprintf(urlClasshours, cid, productID)
+		body, err := c.GetString(classURL, h)
+		if err != nil {
+			continue
+		}
+		out = append(out, parseClasshourLinks(body, productID)...)
 	}
-	return parseClasshourLinks(body, productID), nil
+	if len(out) == 0 {
+		return nil, fmt.Errorf("wangxiao GetClasshours: no lessons")
+	}
+	return out, nil
 }
 
 // parseClasshourLinks extracts lesson links from GetClasshours HTML.
 // Source _parse_user_classhours: finds <li> elements with lesson links.
 func parseClasshourLinks(html, productID string) []lessonRef {
-	var refs []lessonRef
-	liRe := regexp.MustCompile(`(?is)<li[^>]*>(.*?)</li>`)
-	linkRe := regexp.MustCompile(`(?i)href=["']([^"']*player[^"']*)["']`)
-	titleRe := regexp.MustCompile(`(?is)<(?:a|span)[^>]*>(.*?)</(?:a|span)>`)
-	for _, li := range liRe.FindAllString(html, -1) {
-		linkMatch := linkRe.FindStringSubmatch(li)
-		if linkMatch == nil {
-			continue
+	refs := parseLessonRefs(html, refererURL, productID)
+	for i := range refs {
+		lower := strings.ToLower(refs[i].URL)
+		if strings.Contains(lower, "player/") || strings.Contains(lower, "users.wangxiao.cn") {
+			refs[i].Legacy = true
 		}
-		title := ""
-		if tm := titleRe.FindStringSubmatch(li); len(tm) > 1 {
-			title = cleanText(tm[1])
-		}
-		refs = append(refs, lessonRef{
-			Title:      title,
-			URL:        linkMatch[1],
-			ActivityID: firstGroup(activityRe, linkMatch[1]),
-			ProductID:  productID,
-			Legacy:     strings.Contains(linkMatch[1], "users.wangxiao.cn"),
-		})
 	}
 	return refs
 }
@@ -389,4 +483,354 @@ func firstString(m map[string]any, keys ...string) string {
 		}
 	}
 	return ""
+}
+
+type bokeCCPlay struct {
+	URL      string
+	M3U8Text string
+	Quality  int
+}
+
+type bokeCCVariant struct {
+	URL       string
+	Quality   int
+	MediaType int
+}
+
+type bokeCCXMLCopy struct {
+	PlayURL   string `xml:"playurl"`
+	BackupURL string `xml:"backupurl"`
+	Quality   int    `xml:"quality"`
+	MediaType int    `xml:"mediatype"`
+}
+
+type bokeCCXMLResponse struct {
+	Copies []bokeCCXMLCopy `xml:"copy"`
+}
+
+func resolveBokeCCWangxiao(c *util.Client, vid, siteid, referer, quality string) (bokeCCPlay, error) {
+	if vid == "" || siteid == "" {
+		return bokeCCPlay{}, fmt.Errorf("bokecc: missing vid or siteid")
+	}
+	api := fmt.Sprintf(urlVideoPlay, url.QueryEscape(vid), url.QueryEscape(siteid))
+	body, err := c.GetString(api, map[string]string{"Referer": referer})
+	if err != nil {
+		return bokeCCPlay{}, fmt.Errorf("bokecc fetch: %w", err)
+	}
+	variants := parseBokeCCPayload(body, api)
+	if len(variants) == 0 {
+		return bokeCCPlay{}, fmt.Errorf("bokecc: no playable variants")
+	}
+	sort.SliceStable(variants, func(i, j int) bool { return variants[i].Quality > variants[j].Quality })
+	chosen := chooseBokeVariant(variants, quality)
+	play := bokeCCPlay{URL: chosen.URL, Quality: chosen.Quality}
+	if strings.Contains(strings.ToLower(chosen.URL), ".m3u8") {
+		if text, err := rewriteWangxiaoM3U8(c, chosen.URL, referer); err == nil && strings.TrimSpace(text) != "" {
+			play.M3U8Text = text
+		}
+	}
+	return play, nil
+}
+
+func parseBokeCCPayload(raw, base string) []bokeCCVariant {
+	raw = strings.TrimSpace(raw)
+	var out []bokeCCVariant
+	var xmlResp bokeCCXMLResponse
+	if xml.Unmarshal([]byte(raw), &xmlResp) == nil {
+		for _, c := range xmlResp.Copies {
+			u := firstNonEmpty(c.PlayURL, c.BackupURL)
+			if u == "" {
+				continue
+			}
+			if c.MediaType != 0 && c.MediaType != 1 {
+				continue
+			}
+			out = append(out, bokeCCVariant{URL: normalizeURL(u, base), Quality: c.Quality, MediaType: c.MediaType})
+		}
+	}
+	if len(out) > 0 {
+		return uniqueBokeVariants(out)
+	}
+
+	raw = stripJSONP(raw)
+	var v any
+	if json.Unmarshal([]byte(raw), &v) != nil {
+		return nil
+	}
+	for _, m := range mapsUnder(v) {
+		u := firstString(m, "playurl", "playUrl", "url")
+		if u == "" {
+			u = firstString(m, "backupurl", "backupUrl")
+		}
+		if u == "" {
+			continue
+		}
+		mediaType := toIntAny(m["mediatype"])
+		if mediaType != 0 && mediaType != 1 {
+			continue
+		}
+		out = append(out, bokeCCVariant{
+			URL:       normalizeURL(u, base),
+			Quality:   toIntAny(firstAny(m, "quality", "definition", "bitrate")),
+			MediaType: mediaType,
+		})
+	}
+	return uniqueBokeVariants(out)
+}
+
+func chooseBokeVariant(variants []bokeCCVariant, quality string) bokeCCVariant {
+	if len(variants) == 0 {
+		return bokeCCVariant{}
+	}
+	q := strings.ToLower(strings.TrimSpace(quality))
+	switch {
+	case strings.Contains(q, "sd"), strings.Contains(q, "low"), strings.Contains(q, "360"), strings.Contains(q, "标清"):
+		return variants[len(variants)-1]
+	case strings.Contains(q, "hd"), strings.Contains(q, "720"), strings.Contains(q, "高清"):
+		if len(variants) >= 2 {
+			return variants[1]
+		}
+	}
+	return variants[0]
+}
+
+func rewriteWangxiaoM3U8(c *util.Client, m3u8URL, referer string) (string, error) {
+	text, err := c.GetString(m3u8URL, map[string]string{"Referer": referer})
+	if err != nil {
+		return "", err
+	}
+	if !strings.Contains(text, "#EXTM3U") {
+		return text, nil
+	}
+	keyRe := regexp.MustCompile(`(?i)URI="([^"]+)"`)
+	if m := keyRe.FindStringSubmatch(text); len(m) > 1 {
+		keyURL := normalizeURL(m[1], m3u8URL)
+		if key, err := c.GetBytes(keyURL, map[string]string{"Referer": referer}); err == nil && len(key) > 0 {
+			if len(key) > 16 {
+				key = key[:16]
+			}
+			text = strings.ReplaceAll(text, m[1], strings.ToUpper(hex.EncodeToString(key)))
+		}
+	}
+	lines := strings.Split(text, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(strings.ToLower(trimmed), "http") || strings.HasPrefix(strings.ToLower(trimmed), "data:") {
+			continue
+		}
+		lines[i] = normalizeURL(trimmed, m3u8URL)
+	}
+	return strings.Join(lines, "\n"), nil
+}
+
+func resolveFileResourcesFromBody(c *util.Client, ref lessonRef, body string, headers map[string]string) []string {
+	candidates := []string{}
+	linkRe := regexp.MustCompile(`(?is)(?:href|src|data-href)=["']([^"']*(?:DownHandOut|down\.aspx)[^"']*)["']|["']([^"']*(?:DownHandOut|down\.aspx)[^"']*)["']`)
+	for _, m := range linkRe.FindAllStringSubmatch(body, -1) {
+		for _, group := range m[1:] {
+			if group != "" {
+				candidates = append(candidates, normalizeURL(html.UnescapeString(group), ref.URL))
+			}
+		}
+	}
+	if ref.ActivityID != "" {
+		if ref.Legacy {
+			candidates = append(candidates, fmt.Sprintf(urlPlayerDown, ref.ActivityID))
+		} else {
+			candidates = append(candidates, fmt.Sprintf(urlLiveHandout, ref.ActivityID))
+		}
+	}
+	var out []string
+	for _, candidate := range uniqueStrings(candidates) {
+		if u := resolveFileCandidate(c, candidate, headers); u != "" {
+			out = append(out, u)
+		}
+	}
+	return uniqueStrings(out)
+}
+
+func resolveFileCandidate(c *util.Client, candidate string, headers map[string]string) string {
+	if candidate == "" {
+		return ""
+	}
+	resp, err := c.Get(candidate, headers)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	finalURL := candidate
+	if resp.Request != nil && resp.Request.URL != nil {
+		finalURL = resp.Request.URL.String()
+	}
+	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	if resp.StatusCode < 400 && !strings.Contains(ct, "text/html") && !strings.Contains(ct, "application/json") {
+		return finalURL
+	}
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return ""
+	}
+	if u := extractFileURL(string(raw)); u != "" {
+		return normalizeURL(html.UnescapeString(u), finalURL)
+	}
+	if resourceExt(finalURL) != "file" && !strings.Contains(strings.ToLower(finalURL), "downhandout") && !strings.Contains(strings.ToLower(finalURL), "down.aspx") {
+		return finalURL
+	}
+	return ""
+}
+
+func resourceExt(u string) string {
+	parsed, err := url.Parse(u)
+	target := u
+	if err == nil {
+		target = parsed.Path
+		if target == "" {
+			target = parsed.RawQuery
+		}
+	}
+	extRe := regexp.MustCompile(`(?i)\.([a-z0-9]{2,5})(?:$|[?#&])`)
+	if m := extRe.FindStringSubmatch(target); len(m) > 1 {
+		return strings.ToLower(m[1])
+	}
+	return "file"
+}
+
+func cookieFromJar(jar http.CookieJar, name string, domains ...string) string {
+	if jar == nil || name == "" {
+		return ""
+	}
+	for _, domain := range domains {
+		u, err := url.Parse("https://" + strings.TrimPrefix(domain, "https://"))
+		if err != nil {
+			continue
+		}
+		for _, c := range jar.Cookies(u) {
+			if strings.EqualFold(c.Name, name) && c.Value != "" {
+				return c.Value
+			}
+		}
+	}
+	return ""
+}
+
+func extractCourseID(text, fallback string) string {
+	for _, s := range []string{fallback, text} {
+		re := regexp.MustCompile(`(?i)(?:cid|courseid|courseId|CourseId|data-cid|data-id)\s*[=:]\s*["']?([A-Za-z0-9_-]+)`)
+		if m := re.FindStringSubmatch(s); len(m) > 1 {
+			return m[1]
+		}
+	}
+	return ""
+}
+
+func extractCourseIDs(text string) []string {
+	re := regexp.MustCompile(`(?i)(?:cid|courseid|data-cid|data-id)\s*[=:]\s*["']?([A-Za-z0-9_-]+)`)
+	var out []string
+	for _, m := range re.FindAllStringSubmatch(text, -1) {
+		if len(m) > 1 {
+			out = append(out, m[1])
+		}
+	}
+	return uniqueStrings(out)
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		v = strings.TrimSpace(v)
+		if v != "" && v != "<nil>" {
+			return v
+		}
+	}
+	return ""
+}
+
+func uniqueStrings(in []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(in))
+	for _, v := range in {
+		v = strings.TrimSpace(v)
+		if v == "" || seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	return out
+}
+
+func uniqueBokeVariants(in []bokeCCVariant) []bokeCCVariant {
+	seen := map[string]bool{}
+	out := make([]bokeCCVariant, 0, len(in))
+	for _, v := range in {
+		if v.URL == "" || seen[v.URL] {
+			continue
+		}
+		seen[v.URL] = true
+		out = append(out, v)
+	}
+	return out
+}
+
+func stripJSONP(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if strings.HasPrefix(raw, "{") || strings.HasPrefix(raw, "[") {
+		return raw
+	}
+	start := strings.IndexAny(raw, "{[")
+	end := strings.LastIndexAny(raw, "}]")
+	if start >= 0 && end > start {
+		return raw[start : end+1]
+	}
+	return raw
+}
+
+func firstAny(m map[string]any, keys ...string) any {
+	for _, k := range keys {
+		if v, ok := m[k]; ok {
+			return v
+		}
+	}
+	return nil
+}
+
+func toIntAny(v any) int {
+	switch x := v.(type) {
+	case int:
+		return x
+	case int64:
+		return int(x)
+	case float64:
+		return int(x)
+	case json.Number:
+		n, _ := x.Int64()
+		return int(n)
+	case string:
+		var n int
+		fmt.Sscanf(strings.TrimSpace(x), "%d", &n)
+		return n
+	default:
+		var n int
+		fmt.Sscanf(strings.TrimSpace(fmt.Sprint(x)), "%d", &n)
+		return n
+	}
+}
+
+func mapsUnder(v any) []map[string]any {
+	out := []map[string]any{}
+	var walk func(any)
+	walk = func(x any) {
+		switch t := x.(type) {
+		case map[string]any:
+			out = append(out, t)
+			for _, vv := range t {
+				walk(vv)
+			}
+		case []any:
+			for _, vv := range t {
+				walk(vv)
+			}
+		}
+	}
+	walk(v)
+	return out
 }

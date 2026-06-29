@@ -41,20 +41,20 @@ const (
 	yikao88Platform      = "PC"
 	yikao88APISignSecret = "4ad2d8f07ee9a358455375c2982f8a9a"
 	playSafePublicKeyPEM = "-----BEGIN PUBLIC KEY-----\nMIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCTjFALEDjmjD2/0HVoWtHuAmEptQrV\nUy1bZxoSoDrpiyllHI9UtVMkt7fGcaX5eifaIpkF/cmvD4LUlv7ioPyUiSQ9SpRqZEsI\nWfvYOyXgFF0REo2cULp49PK6glN00NEUAi6VW1CCHBetQJau/HeDojzPWacSq7UlG2/e\nnEDTlQIDAQAB\n-----END PUBLIC KEY-----"
-	polyvPDXSecret = "OWtjN9xcDcc2cwXKxECpRgKw7piD4RwCdfOUlyNHFdSV0gHi="
+	polyvPDXSecret       = "OWtjN9xcDcc2cwXKxECpRgKw7piD4RwCdfOUlyNHFdSV0gHi="
 	// POLYV_IV used for key decryption (Zhaozhao_Config).
 	polyvIVHex = "01020305070B0D1113171D0705030201"
 )
 
 var (
-	patterns      = []string{`(?:[\w-]+\.)?yikao88\.com/`}
-	idRe          = regexp.MustCompile(`(?:productId|product_id|pid|courseId|course_id|cid)=([0-9A-Za-z_\-]+)`)
-	polyvVidRe    = regexp.MustCompile(`^[0-9A-Za-z]+_[0-9A-Za-z]+$`)
-	mediaURLRe    = regexp.MustCompile(`https?://[^"'\s<>]+(?:\.m3u8|\.mp4|\.flv|\.pdf|\.pptx?|\.docx?|\.xlsx?|\.zip|\.rar|\.7z|\.txt|\.png|\.jpe?g)[^"'\s<>]*`)
-	titleCleanRe  = regexp.MustCompile(`[\\/:*?"<>|\r\n\t]+`)
-	m3u8URIRe     = regexp.MustCompile(`URI="([^"]+)"`)
-	m3u8IVRe      = regexp.MustCompile(`IV\s*=\s*0x([0-9a-fA-F]+)`)
-	bitrateRe     = regexp.MustCompile(`_(\d+)\.m3u8(?:\?|$)`)
+	patterns     = []string{`(?:[\w-]+\.)?yikao88\.com/`}
+	idRe         = regexp.MustCompile(`(?:productId|product_id|pid|courseId|course_id|cid)=([0-9A-Za-z_\-]+)`)
+	polyvVidRe   = regexp.MustCompile(`^[0-9A-Za-z]+_[0-9A-Za-z]+$`)
+	mediaURLRe   = regexp.MustCompile(`https?://[^"'\s<>]+(?:\.m3u8|\.mp4|\.flv|\.pdf|\.pptx?|\.docx?|\.xlsx?|\.zip|\.rar|\.7z|\.txt|\.png|\.jpe?g)[^"'\s<>]*`)
+	titleCleanRe = regexp.MustCompile(`[\\/:*?"<>|\r\n\t]+`)
+	m3u8URIRe    = regexp.MustCompile(`URI="([^"]+)"`)
+	m3u8IVRe     = regexp.MustCompile(`IV\s*=\s*0x([0-9a-fA-F]+)`)
+	bitrateRe    = regexp.MustCompile(`_(\d+)\.m3u8(?:\?|$)`)
 	// polyvPDXIVBytes from Zhaozhao_Base.polyv_pdx_iv_bytes.
 	polyvPDXIVBytes = []byte{13, 22, 8, 12, 7, 6, 13, 1, 50, 11, 12, 8, 5, 16, 4, 1}
 	playTokenAPIs   = []string{
@@ -89,6 +89,7 @@ type zzContext struct {
 
 type zzVideo struct {
 	VideoID     string
+	DirectURL   string
 	Title       string
 	CourseID    string
 	ProductID   string
@@ -107,10 +108,17 @@ func (s *Zhaozhao) Extract(rawURL string, opts *extractor.ExtractOpts) (*extract
 		return nil, fmt.Errorf("zhaozhao requires login cookies")
 	}
 	pid, cid := parseIDs(rawURL)
-	if pid == "" && cid == "" {
-		return nil, fmt.Errorf("zhaozhao: cannot parse productId/courseId from URL")
-	}
 	ctx := newContext(opts.Cookies, pid, cid)
+	if pid == "" && cid == "" {
+		entries, err := ctx.courseListEntries()
+		if err != nil {
+			return nil, err
+		}
+		if len(entries) == 0 {
+			return nil, fmt.Errorf("zhaozhao: purchased course list is empty")
+		}
+		return &extractor.MediaInfo{Site: "zhaozhao", Title: "zhaozhao_courses", Entries: entries}, nil
+	}
 
 	coursePayloads, title, err := ctx.loadCoursePayloads()
 	if err != nil {
@@ -118,6 +126,13 @@ func (s *Zhaozhao) Extract(rawURL string, opts *extractor.ExtractOpts) (*extract
 	}
 	videos := collectVideos(coursePayloads)
 	files := collectFiles(coursePayloads)
+	for _, v := range videos {
+		if v.ChildID == "" {
+			continue
+		}
+		files = append(files, ctx.fetchChildFiles(v.ChildID)...)
+	}
+	files = dedupeFiles(files)
 	if len(videos) == 0 && len(files) == 0 {
 		return nil, fmt.Errorf("zhaozhao: no video/file nodes found for productId=%s courseId=%s", pid, cid)
 	}
@@ -130,7 +145,7 @@ func (s *Zhaozhao) Extract(rawURL string, opts *extractor.ExtractOpts) (*extract
 		}
 	}
 	for i, f := range files {
-		entries = append(entries, fileEntry(f, i+1))
+		entries = append(entries, ctx.fileEntry(f, i+1))
 	}
 	if len(entries) == 0 {
 		return nil, fmt.Errorf("zhaozhao: discovered %d video nodes but no playable polyv manifest resolved", len(videos))
@@ -269,6 +284,44 @@ func (x *zzContext) loadCoursePayloads() ([]any, string, error) {
 	return payloads, firstNonEmpty(x.cid, x.pid), nil
 }
 
+func (x *zzContext) courseListEntries() ([]*extractor.MediaInfo, error) {
+	productList, err := x.signedGet(myProductAPI, map[string]string{"productTypeId": "1,7"}, nil)
+	if err != nil {
+		return nil, err
+	}
+	rows := extractItems(productList["data"])
+	if len(rows) == 0 {
+		rows = walkMaps(productList)
+	}
+	entries := make([]*extractor.MediaInfo, 0, len(rows))
+	seen := map[string]bool{}
+	for _, row := range rows {
+		productID := firstString(row, "productId", "product_id", "id")
+		courseID := firstString(row, "courseId", "course_id")
+		if productID == "" && courseID == "" {
+			continue
+		}
+		key := firstNonEmpty(productID, "-") + ":" + firstNonEmpty(courseID, "-")
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		title := cleanTitle(firstNonEmpty(firstString(row, "productName", "courseName", "packageName", "name", "title"), key))
+		extra := map[string]any{"raw": row}
+		if productID != "" {
+			extra["product_id"] = productID
+		}
+		if courseID != "" {
+			extra["course_id"] = courseID
+		}
+		if price := firstString(row, "price", "salePrice", "payPrice"); price != "" {
+			extra["price"] = price
+		}
+		entries = append(entries, &extractor.MediaInfo{Site: "zhaozhao", Title: title, Extra: extra})
+	}
+	return entries, nil
+}
+
 func (x *zzContext) signedGet(api string, params map[string]string, extraHeaders map[string]string) (map[string]any, error) {
 	variants := x.requestVariants(params, extraHeaders)
 	var last map[string]any
@@ -356,6 +409,16 @@ func responseUsable(out map[string]any) bool {
 }
 
 func (x *zzContext) resolveVideo(v zzVideo, index int) (*extractor.MediaInfo, error) {
+	if v.DirectURL != "" {
+		u := normalizeAssetURL(v.DirectURL)
+		name := cleanTitle(firstNonEmpty(v.Title, fmt.Sprintf("[%02d]--视频", index)))
+		format := pickFormat(u, "")
+		stream := extractor.Stream{Quality: "best", URLs: []string{u}, Format: format, Headers: x.downloadHeaders()}
+		if strings.Contains(strings.ToLower(format), "m3u8") {
+			stream.NeedMerge = true
+		}
+		return &extractor.MediaInfo{Site: "zhaozhao", Title: name, Streams: map[string]extractor.Stream{"default": stream}, Extra: map[string]any{"source_type": "direct", "video_url": u}}, nil
+	}
 	vid := formatPolyvVID(v.VideoID)
 	if vid == "" {
 		return nil, fmt.Errorf("zhaozhao: empty polyv video id")
@@ -375,6 +438,10 @@ func (x *zzContext) resolveVideo(v zzVideo, index int) (*extractor.MediaInfo, er
 	if err != nil {
 		return nil, err
 	}
+	manifest = normalizePolyvManifestURL(manifest)
+	if strings.Contains(strings.ToLower(manifestPath(manifest)), ".pdx") {
+		return nil, fmt.Errorf("zhaozhao polyv: blocked needs PDX DRM JS engine (%s)", polyvPDXLibPlayerURL)
+	}
 	playToken = firstNonEmpty(playToken, sec.Data.Playsafe.Token)
 	name := cleanTitle(firstNonEmpty(v.Title, sec.Data.Title, fmt.Sprintf("[%02d]--%s", index, v.VideoID)))
 	extra := map[string]any{"video_id": v.VideoID, "polyv_vid": vid, "secure_url_template": polyvSecureURL}
@@ -384,7 +451,14 @@ func (x *zzContext) resolveVideo(v zzVideo, index int) (*extractor.MediaInfo, er
 	if v.ChildID != "" {
 		extra["child_id"] = v.ChildID
 	}
-	return &extractor.MediaInfo{Site: "zhaozhao", Title: name, Streams: map[string]extractor.Stream{"default": {Quality: "best", URLs: []string{manifest}, Format: "m3u8", NeedMerge: true, Headers: map[string]string{"Referer": refererURL, "User-Agent": x.headers["User-Agent"]}}}, Extra: extra}, nil
+	streamURL := manifest
+	if m3u8Text := x.fetchPolyvM3U8Text(manifest, playToken); m3u8Text != "" {
+		extra["m3u8_text"] = m3u8Text
+		extra["m3u8_url"] = manifest
+		extra["source_type"] = "m3u8_text"
+		streamURL = dataM3U8URL(m3u8Text)
+	}
+	return &extractor.MediaInfo{Site: "zhaozhao", Title: name, Streams: map[string]extractor.Stream{"default": {Quality: "best", URLs: []string{streamURL}, Format: "m3u8", NeedMerge: true, Headers: x.downloadHeaders()}}, Extra: extra}, nil
 }
 
 func (x *zzContext) getPlayToken(videoID string) string {
@@ -498,9 +572,22 @@ func collectVideos(payloads []any) []zzVideo {
 				titles = append(titles, title)
 			}
 			vid := firstString(t, "videoId", "video_id", "polyvVideoId", "polyv_video_id", "vid")
-			if looksLikeVideoID(vid) && !seen[vid] {
-				seen[vid] = true
-				out = append(out, zzVideo{VideoID: vid, Title: buildTitle(titles, len(out)+1), ProductID: productID, CourseID: courseID, ChildID: firstString(t, "childId", "child_id"), Definitions: parseDefinitions(t["definitionList"])})
+			directURL := ""
+			if strings.HasPrefix(strings.ToLower(vid), "http") && isVideoURL(vid) {
+				directURL = vid
+				vid = ""
+			} else {
+				for _, key := range []string{"videoUrl", "video_url", "playUrl", "play_url", "m3u8Url", "m3u8_url", "mediaUrl", "media_url", "url", "path", "src"} {
+					if u := firstString(t, key); strings.HasPrefix(strings.ToLower(u), "http") && isVideoURL(u) {
+						directURL = u
+						break
+					}
+				}
+			}
+			key := firstNonEmpty(directURL, vid)
+			if key != "" && (directURL != "" || looksLikeVideoID(vid)) && !seen[key] {
+				seen[key] = true
+				out = append(out, zzVideo{VideoID: vid, DirectURL: directURL, Title: buildTitle(titles, len(out)+1), ProductID: productID, CourseID: courseID, ChildID: firstString(t, "childId", "child_id"), Definitions: parseDefinitions(t["definitionList"])})
 			}
 			for _, val := range t {
 				walk(val, titles, productID, courseID)
@@ -548,8 +635,40 @@ func collectFiles(payloads []any) []zzFile {
 	return out
 }
 
+func (x *zzContext) fetchChildFiles(childID string) []zzFile {
+	childID = strings.TrimSpace(childID)
+	if childID == "" {
+		return nil
+	}
+	out, err := x.signedGet(childFileAPI, map[string]string{"childId": childID}, nil)
+	if err != nil {
+		return nil
+	}
+	files := collectFiles([]any{out})
+	for i := range files {
+		if files[i].Title == "" {
+			files[i].Title = "资料"
+		}
+	}
+	return files
+}
+
+func dedupeFiles(files []zzFile) []zzFile {
+	seen := map[string]bool{}
+	out := make([]zzFile, 0, len(files))
+	for _, f := range files {
+		key := strings.Join([]string{f.URL, f.Title, f.Format}, "\x00")
+		if f.URL == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, f)
+	}
+	return out
+}
+
 func addFile(out *[]zzFile, seen map[string]bool, rawURL, title, fmtHint string) {
-	rawURL = strings.TrimSpace(strings.ReplaceAll(rawURL, `\/`, `/`))
+	rawURL = normalizeAssetURL(rawURL)
 	if rawURL == "" || seen[rawURL] || isVideoURL(rawURL) {
 		return
 	}
@@ -557,9 +676,9 @@ func addFile(out *[]zzFile, seen map[string]bool, rawURL, title, fmtHint string)
 	(*out) = append(*out, zzFile{URL: rawURL, Title: title, Format: pickFormat(rawURL, fmtHint)})
 }
 
-func fileEntry(f zzFile, index int) *extractor.MediaInfo {
+func (x *zzContext) fileEntry(f zzFile, index int) *extractor.MediaInfo {
 	name := cleanTitle(firstNonEmpty(f.Title, fmt.Sprintf("[%02d]--资料", index)))
-	return &extractor.MediaInfo{Site: "zhaozhao", Title: name, Streams: map[string]extractor.Stream{"default": {Quality: "source", URLs: []string{f.URL}, Format: f.Format, Headers: map[string]string{"Referer": refererURL}}}}
+	return &extractor.MediaInfo{Site: "zhaozhao", Title: name, Streams: map[string]extractor.Stream{"default": {Quality: "source", URLs: []string{f.URL}, Format: f.Format, Headers: x.downloadHeaders()}}, Extra: map[string]any{"type": "file", "file_url": f.URL}}
 }
 
 func looksLikeVideoID(value string) bool {
@@ -646,22 +765,31 @@ func withoutEmpty(in map[string]string) map[string]string {
 }
 
 func extractItems(v any) []map[string]any {
-	if arr, ok := v.([]any); ok {
-		out := make([]map[string]any, 0, len(arr))
-		for _, it := range arr {
+	switch x := v.(type) {
+	case nil:
+		return nil
+	case []any:
+		out := make([]map[string]any, 0, len(x))
+		for _, it := range x {
 			if m := asMap(it); len(m) > 0 {
 				out = append(out, m)
 			}
 		}
 		return out
-	}
-	m := asMap(v)
-	for _, k := range []string{"data", "list", "records", "items", "courseStationList", "courseChapterList", "childVideoList", "children"} {
-		if out := extractItems(m[k]); len(out) > 0 {
-			return out
+	case map[string]any:
+		for _, k := range []string{"data", "list", "records", "items", "courseStationList", "courseChapterList", "childVideoList", "children"} {
+			child, ok := x[k]
+			if !ok {
+				continue
+			}
+			if out := extractItems(child); len(out) > 0 {
+				return out
+			}
 		}
+		return nil
+	default:
+		return nil
 	}
-	return nil
 }
 
 func walkMaps(v any) []map[string]any {
@@ -775,4 +903,125 @@ func pickFormat(rawURL, hint string) string {
 		return path[idx+1:]
 	}
 	return "pdf"
+}
+
+func (x *zzContext) downloadHeaders() map[string]string {
+	h := map[string]string{
+		"Referer":    refererURL,
+		"User-Agent": x.headers["User-Agent"],
+	}
+	for _, k := range []string{"Cookie", "cookie", "token", "authorization", "Authorization", "x-token", "memberId", "memberid"} {
+		if v := x.headers[k]; v != "" {
+			h[k] = v
+		}
+	}
+	return h
+}
+
+func (x *zzContext) fetchPolyvM3U8Text(manifest, token string) string {
+	if manifest == "" || !strings.Contains(strings.ToLower(manifest), ".m3u8") {
+		return ""
+	}
+	headers := map[string]string{"Referer": refererURL, "User-Agent": x.headers["User-Agent"]}
+	text, err := x.c.GetString(manifest, headers)
+	if err != nil || !strings.HasPrefix(strings.TrimSpace(text), "#EXTM3U") {
+		return ""
+	}
+	text = absolutizeM3U8Text(text, manifest)
+	if token != "" {
+		if rewritten, err := shared.PolyvRewriteM3U8Keys(x.c, text, token, refererURL); err == nil && rewritten != "" {
+			text = inlineHexKeyURIs(rewritten)
+		}
+	}
+	return text
+}
+
+func normalizeAssetURL(raw string) string {
+	raw = strings.TrimSpace(strings.ReplaceAll(raw, `\/`, `/`))
+	if strings.HasPrefix(raw, "//") {
+		return "https:" + raw
+	}
+	return raw
+}
+
+func normalizePolyvManifestURL(raw string) string {
+	raw = normalizeAssetURL(raw)
+	if raw == "" || strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://") {
+		return raw
+	}
+	return strings.TrimRight(shared.PolyvHLSPlayBase, "/") + "/" + strings.TrimLeft(raw, "/")
+}
+
+func manifestPath(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	return u.Path
+}
+
+func absolutizeM3U8Text(text, manifest string) string {
+	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "#EXT-X-KEY:") {
+			lines[i] = m3u8URIRe.ReplaceAllStringFunc(line, func(match string) string {
+				parts := m3u8URIRe.FindStringSubmatch(match)
+				if len(parts) != 2 {
+					return match
+				}
+				return `URI="` + resolveAgainst(parts[1], manifest) + `"`
+			})
+			continue
+		}
+		if strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		lines[i] = resolveAgainst(trimmed, manifest)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func resolveAgainst(raw, baseRaw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://") || strings.HasPrefix(raw, "data:") || strings.HasPrefix(raw, "0x") {
+		return raw
+	}
+	if strings.HasPrefix(raw, "//") {
+		return "https:" + raw
+	}
+	base, err := url.Parse(baseRaw)
+	if err != nil {
+		return raw
+	}
+	ref, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	return base.ResolveReference(ref).String()
+}
+
+func inlineHexKeyURIs(text string) string {
+	return m3u8URIRe.ReplaceAllStringFunc(text, func(match string) string {
+		parts := m3u8URIRe.FindStringSubmatch(match)
+		if len(parts) != 2 {
+			return match
+		}
+		uri := strings.TrimSpace(parts[1])
+		if !strings.HasPrefix(strings.ToLower(uri), "0x") {
+			return match
+		}
+		keyBytes, err := hex.DecodeString(strings.TrimPrefix(strings.TrimPrefix(uri, "0x"), "0X"))
+		if err != nil || len(keyBytes) == 0 {
+			return match
+		}
+		return `URI="data:application/octet-stream;base64,` + base64.StdEncoding.EncodeToString(keyBytes) + `"`
+	})
+}
+
+func dataM3U8URL(text string) string {
+	return "data:application/vnd.apple.mpegurl;base64," + base64.StdEncoding.EncodeToString([]byte(text))
 }

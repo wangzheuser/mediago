@@ -1,9 +1,10 @@
 package dongao
 
 import (
-	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/md5"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"net/url"
@@ -25,7 +26,11 @@ var (
 	attrValRe    = regexp.MustCompile(`(?is)\bvalue\s*=\s*["']([^"']*)["']`)
 	ivRe         = regexp.MustCompile(`(?is)IV\s*=\s*(0x[0-9a-fA-F]+)`)
 	keyURIRe     = regexp.MustCompile(`(?is)URI\s*=\s*["']([^"']+)["']`)
-	m3u8SgPrefix = "sg_prefix_placeholder" // replaced at runtime by server value
+)
+
+const (
+	dongaoTSKeySeed  = "h8k9npx&$yuYR0W1"
+	dongaoCDNSignKey = "L31VSA2VFNGi6E68QNbIVsZ"
 )
 
 // extractPlayerFields parses the hidden <input> fields from the lecture HTML page.
@@ -109,8 +114,9 @@ func unpadPKCS7(data []byte) ([]byte, error) {
 	return data[:len(data)-pad], nil
 }
 
-// signDongaoMediaURL appends the sg= signature param to a .ts segment URL.
-// Source _sign_dongao_media_url: builds w_p from wok/w_id/w_time, appends ccode + sg.
+// signDongaoMediaURL appends Dongao's player signature params to a segment URL.
+// Source _sign_dongao_media_url: builds w_p from wok/w_id/w_time and cdn_sign_key,
+// then carries the player fields required by the signed CDN request.
 func signDongaoMediaURL(rawURL string, fields map[string]string) string {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -126,14 +132,34 @@ func signDongaoMediaURL(rawURL string, fields map[string]string) string {
 	if wid := fields["w_id"]; wid != "" {
 		q.Set("w_id", wid)
 	}
+	if wtime := fields["w_time"]; wtime != "" {
+		q.Set("w_time", wtime)
+	}
+	if wp := buildDongaoWP(fields); wp != "" {
+		q.Set("w_p", wp)
+	}
 	u.RawQuery = q.Encode()
 	return u.String()
+}
+
+func buildDongaoWP(fields map[string]string) string {
+	parts := []string{
+		strings.TrimSpace(fields["wok"]),
+		strings.TrimSpace(fields["w_id"]),
+		strings.TrimSpace(fields["w_time"]),
+		dongaoCDNSignKey,
+	}
+	joined := strings.Join(parts, "")
+	if strings.TrimSpace(joined) == dongaoCDNSignKey {
+		return ""
+	}
+	return fmt.Sprintf("%x", md5.Sum([]byte(joined)))
 }
 
 // buildSignedM3U8 fetches the signed m3u8, extracts IV from EXT-X-KEY,
 // rewrites each segment URL with the sg= signature, and returns the
 // rewritten manifest text ready for a downstream HLS downloader.
-func buildSignedM3U8(m3u8Text string, fields map[string]string) (string, []byte, error) {
+func buildSignedM3U8(m3u8Text string, fields map[string]string, baseURL string) (string, []byte, error) {
 	if !strings.HasPrefix(strings.TrimSpace(m3u8Text), "#EXTM3U") {
 		return "", nil, fmt.Errorf("dongao: not an m3u8 manifest")
 	}
@@ -157,22 +183,26 @@ func buildSignedM3U8(m3u8Text string, fields map[string]string) (string, []byte,
 					iv = parsed
 				}
 			}
-			// Extract key URI and decrypt
+			rewrittenKeyLine := line
+			// Extract key URI and decrypt. Python source uses the fixed
+			// ts_key_seed with w_vkey_n; some manifests also expose a hex seed.
+			keySeed := []byte(dongaoTSKeySeed)
 			if m := keyURIRe.FindStringSubmatch(line); m != nil {
-				keySeed, err := hex.DecodeString(strings.TrimSpace(m[1]))
-				if err == nil {
-					if k, err := dongaoTSKey(fields, keySeed); err == nil {
-						tsKey = k
-					}
+				if parsed, err := hex.DecodeString(strings.TrimSpace(m[1])); err == nil && len(parsed) > 0 {
+					keySeed = parsed
 				}
 			}
-			outLines = append(outLines, line)
+			if k, err := dongaoTSKey(fields, keySeed); err == nil && len(k) > 0 {
+				tsKey = k
+				rewrittenKeyLine = replaceKeyURI(line, "data:application/octet-stream;base64,"+base64.StdEncoding.EncodeToString(k))
+			}
+			outLines = append(outLines, rewrittenKeyLine)
 			continue
 		}
 
 		// Rewrite segment URLs
 		if !strings.HasPrefix(line, "#") && line != "" {
-			signed := signDongaoMediaURL(line, fields)
+			signed := signDongaoMediaURL(resolveM3U8LineURL(line, baseURL), fields)
 			outLines = append(outLines, signed)
 			continue
 		}
@@ -182,6 +212,39 @@ func buildSignedM3U8(m3u8Text string, fields map[string]string) (string, []byte,
 
 	result := strings.Join(outLines, "\n")
 	return result, combineKeyAndIV(tsKey, iv), nil
+}
+
+func replaceKeyURI(line, uri string) string {
+	if keyURIRe.MatchString(line) {
+		return keyURIRe.ReplaceAllString(line, `URI="`+uri+`"`)
+	}
+	return line + `,URI="` + uri + `"`
+}
+
+func resolveM3U8LineURL(raw, baseURL string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://") || strings.HasPrefix(raw, "data:") {
+		return raw
+	}
+	if strings.HasPrefix(raw, "//") {
+		return "https:" + raw
+	}
+	if baseURL == "" {
+		return raw
+	}
+	base, err := url.Parse(baseURL)
+	if err != nil {
+		return raw
+	}
+	ref, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	return base.ResolveReference(ref).String()
+}
+
+func m3u8DataURL(manifest string) string {
+	return "data:application/vnd.apple.mpegurl;base64," + base64.StdEncoding.EncodeToString([]byte(manifest))
 }
 
 // combineKeyAndIV returns the AES key material for downstream decryption.
@@ -208,5 +271,3 @@ func decryptCBCSegment(ciphertext, key, iv []byte) ([]byte, error) {
 	mode.CryptBlocks(plaintext, ciphertext)
 	return unpadPKCS7(plaintext)
 }
-
-var _ = bytes.NewReader // keep import for future use

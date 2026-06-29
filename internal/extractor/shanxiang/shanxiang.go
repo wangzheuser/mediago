@@ -61,6 +61,13 @@ type playbackInfo struct {
 	Title       string
 }
 
+type fileInfo struct {
+	URL      string
+	Title    string
+	Referer  string
+	CourseID string
+}
+
 func (s *Shanxiang) Extract(rawURL string, opts *extractor.ExtractOpts) (*extractor.MediaInfo, error) {
 	if opts == nil || opts.Cookies == nil {
 		return nil, fmt.Errorf("shanxiang requires login cookies")
@@ -105,8 +112,13 @@ func (s *Shanxiang) Extract(rawURL string, opts *extractor.ExtractOpts) (*extrac
 		}
 		entries = append(entries, entry)
 	}
+	for _, file := range parseFiles(body, studyURL, info.CourseID) {
+		if entry := resolveFileEntry(c, file); entry != nil {
+			entries = append(entries, entry)
+		}
+	}
 	if len(entries) == 0 {
-		return nil, fmt.Errorf("shanxiang: playback pages found but no CSSLcloud streams resolved")
+		return nil, fmt.Errorf("shanxiang: no CSSLcloud streams or courseware files resolved")
 	}
 	return &extractor.MediaInfo{Site: "shanxiang", Title: title, Entries: entries}, nil
 }
@@ -223,6 +235,7 @@ func parseInputURL(raw string) playbackInfo {
 
 var (
 	lessonLinkRe = regexp.MustCompile(`(?is)(?:href|data-url)\s*=\s*["']([^"']*/course/playbackView[^"']*)["']`)
+	fileLinkRe   = regexp.MustCompile(`(?is)(?:href|data-url|src)\s*=\s*["']([^"']+)["']`)
 	titleAttrRe  = regexp.MustCompile(`(?is)(?:title|data-title|aria-label)\s*=\s*["']([^"']{2,160})["']`)
 	studyTitleRe = regexp.MustCompile(`(?is)<(?:h1|h2|h3|div)[^>]*(?:h-title|course-title|js-title-name)[^>]*>(.*?)</(?:h1|h2|h3|div)>|<title>(.*?)</title>`)
 	ccPairRe     = regexp.MustCompile(`(?is)(userId|roomId|recordId|viewername|viewertoken|groupId)\s*:\s*["']([^"']*)["']`)
@@ -274,6 +287,90 @@ func parseCCInfo(text string) map[string]string {
 		}
 	}
 	return out
+}
+
+func parseFiles(body, base, cid string) []fileInfo {
+	seen := map[string]bool{}
+	var out []fileInfo
+	for _, m := range fileLinkRe.FindAllStringSubmatchIndex(body, -1) {
+		link := html.UnescapeString(body[m[2]:m[3]])
+		if strings.Contains(link, "/course/playbackView") {
+			continue
+		}
+		abs := makeAbsolute(link, base)
+		if !isFileURL(abs) && !strings.Contains(abs, "/course/docview.html") {
+			continue
+		}
+		if seen[abs] {
+			continue
+		}
+		seen[abs] = true
+		start, end := m[0]-500, m[1]+500
+		if start < 0 {
+			start = 0
+		}
+		if end > len(body) {
+			end = len(body)
+		}
+		out = append(out, fileInfo{URL: abs, Title: firstNonEmpty(extractContextTitle(body[start:end]), fmt.Sprintf("资料 %d", len(out)+1)), Referer: base, CourseID: cid})
+	}
+	return out
+}
+
+func resolveFileEntry(c *util.Client, f fileInfo) *extractor.MediaInfo {
+	fileURL := f.URL
+	if strings.Contains(fileURL, "/course/docview.html") {
+		body, err := c.GetString(fileURL, shanxiangHeaders(f.Referer))
+		if err != nil {
+			return nil
+		}
+		fileURL = parseDocviewFileURL(body, fileURL)
+	}
+	fileURL = unwrapFileURL(fileURL)
+	if !isFileURL(fileURL) {
+		return nil
+	}
+	fmtName := fileFormat(fileURL)
+	title := strings.TrimSpace(f.Title)
+	if title == "" {
+		title = "资料"
+	}
+	return &extractor.MediaInfo{
+		Site:  "shanxiang",
+		Title: cleanName(title),
+		Streams: map[string]extractor.Stream{
+			"file": {Quality: "file", URLs: []string{fileURL}, Format: fmtName, Headers: map[string]string{"Referer": firstNonEmpty(f.Referer, urlReferer)}},
+		},
+		Extra: map[string]any{"type": "file", "course_id": f.CourseID, "file_url": fileURL},
+	}
+}
+
+func parseDocviewFileURL(body, base string) string {
+	if u := unwrapFileURL(base); isFileURL(u) {
+		return u
+	}
+	for _, m := range fileLinkRe.FindAllStringSubmatch(body, -1) {
+		if u := unwrapFileURL(makeAbsolute(html.UnescapeString(m[1]), base)); isFileURL(u) {
+			return u
+		}
+	}
+	if m := regexp.MustCompile(`(?is)(https?://[^"'\s<>]+\.(?:pdf|pptx?|docx?|xlsx?|xls|zip|rar|7z|caj|txt)(?:\?[^"'\s<>]*)?)`).FindStringSubmatch(body); len(m) > 1 {
+		return html.UnescapeString(m[1])
+	}
+	return ""
+}
+
+func unwrapFileURL(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return raw
+	}
+	for _, key := range []string{"file", "url", "downloadUrl"} {
+		if v := u.Query().Get(key); v != "" {
+			return makeAbsolute(html.UnescapeString(v), raw)
+		}
+	}
+	return raw
 }
 
 func csslStreams(play *shared.CssLcloudPlayInfo, referer string) map[string]extractor.Stream {
@@ -329,6 +426,24 @@ func pickFormat(u string) string {
 		return "m3u8"
 	}
 	return "mp4"
+}
+func isFileURL(u string) bool {
+	switch fileFormat(unwrapFileURL(u)) {
+	case "pdf", "ppt", "pptx", "doc", "docx", "xls", "xlsx", "zip", "rar", "7z", "caj", "txt":
+		return true
+	default:
+		return false
+	}
+}
+func fileFormat(u string) string {
+	p := strings.ToLower(strings.Split(strings.Split(u, "?")[0], "#")[0])
+	if i := strings.LastIndex(p, "."); i >= 0 && i+1 < len(p) {
+		return p[i+1:]
+	}
+	return ""
+}
+func cleanName(s string) string {
+	return regexp.MustCompile(`[\\/:*?"<>|\r\n\t]+`).ReplaceAllString(strings.TrimSpace(s), "_")
 }
 func anyString(v any) string {
 	if v == nil {

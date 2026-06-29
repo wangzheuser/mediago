@@ -82,11 +82,17 @@ func resolveItem(c *util.Client, jar http.CookieJar, ctx xetCtx, it xetItem) (st
 		}
 		return "", map[string]any{"blocked_reason": "blocked: no playable lookback URL found for live resource", "resource_id": it.id, "resource_type": "live", "app_id": ctx.appID}
 	case "audio":
+		if u := firstMediaURL(it.raw); u != "" {
+			return u, map[string]any{"resource_id": it.id, "resource_type": "audio", "api": "source"}
+		}
 		if u := postDetailURL(c, jar, ctx, it.id, audioURL, pcAudioURL, map[string]string{"bizData[resource_id]": it.id}); u != "" {
 			return u, map[string]any{"resource_id": it.id, "resource_type": "audio", "api": audioURL}
 		}
 		return "", map[string]any{"blocked_reason": "blocked: needs audio endpoint resolution", "resource_id": it.id, "resource_type": "audio"}
 	case "text":
+		if u := firstMediaURL(it.raw); u != "" {
+			return u, map[string]any{"resource_id": it.id, "resource_type": "text", "api": "source"}
+		}
 		if u := postDetailURL(c, jar, ctx, it.id, textURL, pcTextURL, map[string]string{"bizData[resource_id]": it.id}); u != "" {
 			return u, map[string]any{"resource_id": it.id, "resource_type": "text", "api": textURL}
 		}
@@ -96,7 +102,13 @@ func resolveItem(c *util.Client, jar http.CookieJar, ctx xetCtx, it xetItem) (st
 			return u, map[string]any{"resource_id": it.id, "resource_type": "book", "api": ebookURL}
 		}
 		return "", map[string]any{"blocked_reason": "blocked: needs ebook endpoint resolution", "resource_id": it.id, "resource_type": "book"}
+	case "clock":
+		return "", map[string]any{"blocked_reason": "blocked: clock resource has no playable media in source APIs", "resource_id": it.id, "resource_type": "clock"}
 	case "document", "file":
+		if u := firstMediaURL(it.raw); u != "" {
+			baseExtra["api"] = "courseware_list"
+			return u, baseExtra
+		}
 		fileResType := firstNonEmpty(val(it.raw, "resource_type"), normType(typ))
 		if u := postDetailURL(c, jar, ctx, it.id, fileURL, pcFileURL, map[string]string{"bizData[resource_type]": fileResType, "bizData[resource_id]": it.id}); u != "" {
 			return u, map[string]any{"resource_id": it.id, "resource_type": typ, "api": fileURL}
@@ -121,7 +133,13 @@ func resolveItem(c *util.Client, jar http.CookieJar, ctx xetCtx, it xetItem) (st
 			if decoded != "" && isMediaURL(normalizeURL(decoded)) {
 				baseExtra["api"] = "source"
 				baseExtra["private_decoded"] = true
-				return normalizeURL(decoded), baseExtra
+				decoded = appendLookbackAccessParams(normalizeURL(decoded), ctx.userID)
+				if dataURL, text := preparePrivateLookbackM3U8(c, headers(jar, referer(ctx)), ctx.userID, decoded, referer(ctx)); dataURL != "" {
+					baseExtra["source_type"] = "m3u8_text"
+					baseExtra["m3u8_text"] = text
+					return dataURL, baseExtra
+				}
+				return decoded, baseExtra
 			}
 			return "", map[string]any{"blocked_reason": "blocked: failed to decode private lookback URL", "resource_id": it.id, "resource_type": typ}
 		}
@@ -156,6 +174,16 @@ func videoMediaURL(c *util.Client, jar http.CookieJar, ctx xetCtx, vid string) (
 	}
 	if u := firstMediaURL(root["data"]); u != "" {
 		return u, map[string]any{"api": api}
+	}
+	for _, cand := range extractPrivateLookbackCandidates(root["data"]) {
+		u := appendLookbackAccessParams(cand.url, ctx.userID)
+		extra := map[string]any{"api": api, "private_decoded": true}
+		if dataURL, text := preparePrivateLookbackM3U8WithExt(c, h, ctx.userID, u, referer(ctx), cand.ext); dataURL != "" {
+			extra["source_type"] = "m3u8_text"
+			extra["m3u8_text"] = text
+			return dataURL, extra
+		}
+		return u, extra
 	}
 	if s := deepText(root, "video_urls", "play_urls", "url"); s != "" {
 		if u := firstURLInString(s); u != "" {
@@ -248,7 +276,21 @@ func decryptLookbackKey(keyBytes []byte, userID string) []byte {
 // extractPrivateLookbackURLs extracts all media URLs from a protected live
 // lookback API response, decoding any __ba-obfuscated URLs.
 func extractPrivateLookbackURLs(data any) []string {
-	var urls []string
+	candidates := extractPrivateLookbackCandidates(data)
+	urls := make([]string, 0, len(candidates))
+	for _, cand := range candidates {
+		urls = append(urls, cand.url)
+	}
+	return urls
+}
+
+type privateLookbackCandidate struct {
+	url string
+	ext map[string]any
+}
+
+func extractPrivateLookbackCandidates(data any) []privateLookbackCandidate {
+	var out []privateLookbackCandidate
 	seen := map[string]bool{}
 	for _, m := range mapsUnder(data) {
 		for _, k := range []string{"url", "aliveVideoUrl", "alive_video_url", "aliveVideoMp4Url",
@@ -263,22 +305,237 @@ func extractPrivateLookbackURLs(data any) []string {
 				continue
 			}
 			seen[u] = true
-			urls = append(urls, u)
+			out = append(out, privateLookbackCandidate{url: u, ext: privateExtInfo(m)})
 		}
 		// Also check nested list structures (lookback_list, etc.)
 		for _, listKey := range []string{"lookback_list", "lookbackList", "video_list",
 			"videoList", "record_list", "recordList", "list", "items"} {
 			if sub, ok := m[listKey]; ok {
-				for _, u := range extractPrivateLookbackURLs(sub) {
-					if !seen[u] {
-						seen[u] = true
-						urls = append(urls, u)
+				for _, cand := range extractPrivateLookbackCandidates(sub) {
+					if !seen[cand.url] {
+						seen[cand.url] = true
+						out = append(out, cand)
 					}
 				}
 			}
 		}
 	}
-	return urls
+	return out
+}
+
+func privateExtInfo(m map[string]any) map[string]any {
+	for _, k := range []string{"ext", "ext_info", "extInfo"} {
+		switch v := m[k].(type) {
+		case map[string]any:
+			return v
+		case string:
+			var decoded map[string]any
+			if json.Unmarshal([]byte(v), &decoded) == nil {
+				return decoded
+			}
+		}
+	}
+	if val(m, "host") != "" || val(m, "path") != "" || val(m, "param") != "" {
+		return m
+	}
+	return nil
+}
+
+var xetM3U8URIRe = regexp.MustCompile(`URI="([^"]+)"`)
+
+func appendLookbackAccessParams(raw, userID string) string {
+	return appendXETParams(raw, [][2]string{
+		{"time", fmt.Sprintf("%d", time.Now().UnixMilli())},
+		{"uuid", userID},
+	})
+}
+
+func appendXETParams(raw string, params [][2]string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	q := u.Query()
+	for _, kv := range params {
+		if kv[0] == "" || kv[1] == "" || q.Has(kv[0]) {
+			continue
+		}
+		q.Set(kv[0], kv[1])
+	}
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+func preparePrivateLookbackM3U8(c *util.Client, h map[string]string, userID, m3u8URL, ref string) (string, string) {
+	return preparePrivateLookbackM3U8WithExt(c, h, userID, m3u8URL, ref, nil)
+}
+
+func preparePrivateLookbackM3U8WithExt(c *util.Client, h map[string]string, userID, m3u8URL, ref string, extInfo map[string]any) (string, string) {
+	m3u8URL = normalizeURL(m3u8URL)
+	if m3u8URL == "" || !strings.Contains(strings.ToLower(m3u8URL), ".m3u8") {
+		return "", ""
+	}
+	reqHeaders := cloneHeaderMap(h)
+	if ref != "" {
+		reqHeaders["Referer"] = ref
+		reqHeaders["referer"] = ref
+	}
+	body, err := c.GetString(m3u8URL, reqHeaders)
+	if err != nil || !strings.Contains(body, "#EXTM3U") {
+		return "", ""
+	}
+	rewritten := rewritePrivateLookbackM3U8WithExt(c, body, m3u8URL, reqHeaders, userID, extInfo)
+	if rewritten == "" {
+		return "", ""
+	}
+	return "data:application/vnd.apple.mpegurl;base64," + base64.StdEncoding.EncodeToString([]byte(rewritten)), rewritten
+}
+
+func rewritePrivateLookbackM3U8(c *util.Client, text, sourceURL string, h map[string]string, userID string) string {
+	return rewritePrivateLookbackM3U8WithExt(c, text, sourceURL, h, userID, nil)
+}
+
+func rewritePrivateLookbackM3U8WithExt(c *util.Client, text, sourceURL string, h map[string]string, userID string, extInfo map[string]any) string {
+	if !strings.Contains(text, "#EXTM3U") {
+		return ""
+	}
+	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	out := make([]string, 0, len(lines)*2)
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			out = append(out, line)
+			continue
+		}
+		if strings.HasPrefix(trimmed, "#") {
+			if strings.Contains(trimmed, `URI="`) {
+				line = xetM3U8URIRe.ReplaceAllStringFunc(line, func(match string) string {
+					m := xetM3U8URIRe.FindStringSubmatch(match)
+					if len(m) < 2 {
+						return match
+					}
+					keyURL := resolveXETAgainst(m[1], sourceURL)
+					if strings.Contains(keyURL, "distribute.vod.pri.get/1.0.0") {
+						fetchURL := appendXETParams(keyURL, [][2]string{{"uid", userID}})
+						if key := fetchPrivateLookbackKey(c, h, fetchURL, userID); len(key) > 0 {
+							return `URI="data:application/octet-stream;base64,` + base64.StdEncoding.EncodeToString(key) + `"`
+						}
+						keyURL = fetchURL
+					}
+					return `URI="` + keyURL + `"`
+				})
+			}
+			out = append(out, line)
+			continue
+		}
+		segmentURL, br := buildPrivateLookbackSegmentURL(trimmed, extInfo)
+		if segmentURL == "" {
+			segmentURL = resolveXETAgainst(trimmed, sourceURL)
+		}
+		if br != nil {
+			out = append(out, fmt.Sprintf("#EXT-X-BYTERANGE:%d@%d", br.end-br.start+1, br.start))
+		}
+		out = append(out, resolveXETAgainst(segmentURL, sourceURL))
+	}
+	return strings.Join(out, "\n")
+}
+
+type lookbackByteRange struct {
+	start int64
+	end   int64
+}
+
+func buildPrivateLookbackSegmentURL(segmentLine string, extInfo map[string]any) (string, *lookbackByteRange) {
+	segmentLine = strings.TrimSpace(segmentLine)
+	if segmentLine == "" || strings.HasPrefix(segmentLine, "#") || extInfo == nil {
+		return segmentLine, nil
+	}
+	host := strings.TrimRight(strings.TrimSpace(val(extInfo, "host")), "/")
+	pathPart := strings.Trim(strings.TrimSpace(val(extInfo, "path")), "/")
+	if host == "" || pathPart == "" {
+		return segmentLine, nil
+	}
+	segmentURL := segmentLine
+	if !strings.HasPrefix(strings.ToLower(segmentURL), "http") {
+		segmentURL = host + "/" + pathPart + "/" + strings.TrimLeft(segmentURL, "/")
+	}
+	var br *lookbackByteRange
+	if parsed, err := url.Parse(segmentURL); err == nil {
+		q := parsed.Query()
+		start, startOK := parseInt64Param(q.Get("start"))
+		end, endOK := parseInt64Param(q.Get("end"))
+		q.Del("start")
+		q.Del("end")
+		if strings.EqualFold(q.Get("type"), "mpegts") {
+			q.Del("type")
+		}
+		if startOK && endOK && end >= start {
+			br = &lookbackByteRange{start: start, end: end}
+		}
+		parsed.RawQuery = q.Encode()
+		segmentURL = parsed.String()
+	}
+	param := strings.TrimLeft(strings.TrimSpace(val(extInfo, "param")), "?&")
+	if param != "" {
+		if parsed, err := url.Parse(segmentURL); err == nil && !parsed.Query().Has("sign") {
+			if strings.Contains(segmentURL, "?") {
+				segmentURL += "&" + param
+			} else {
+				segmentURL += "?" + param
+			}
+		}
+	}
+	return segmentURL, br
+}
+
+func parseInt64Param(s string) (int64, bool) {
+	var n int64
+	if _, err := fmt.Sscanf(strings.TrimSpace(s), "%d", &n); err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+func fetchPrivateLookbackKey(c *util.Client, h map[string]string, rawURL, userID string) []byte {
+	keyBytes, err := c.GetBytes(rawURL, h)
+	if err != nil || len(keyBytes) == 0 {
+		return nil
+	}
+	key := decryptLookbackKey(keyBytes, userID)
+	switch len(key) {
+	case 16, 24, 32:
+		return key
+	default:
+		return nil
+	}
+}
+
+func resolveXETAgainst(raw, base string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://") || strings.HasPrefix(raw, "data:") {
+		return raw
+	}
+	b, err := url.Parse(base)
+	if err != nil {
+		return raw
+	}
+	ref, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	return b.ResolveReference(ref).String()
+}
+
+func cloneHeaderMap(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 func liveMediaURL(c *util.Client, jar http.CookieJar, ctx xetCtx, id string) (string, map[string]any) {
@@ -311,17 +568,15 @@ func liveMediaURL(c *util.Client, jar http.CookieJar, ctx xetCtx, id string) (st
 
 		// If this response contains private/protected flow data, try to
 		// decode any __ba-obfuscated URLs from it.
-		decoded := extractPrivateLookbackURLs(data)
-		for _, u := range decoded {
-			// Append time and uuid query params as the source does.
-			ts := fmt.Sprintf("%d", time.Now().UnixMilli())
-			sep := "?"
-			if strings.Contains(u, "?") {
-				sep = "&"
+		for _, cand := range extractPrivateLookbackCandidates(data) {
+			u := cand.url
+			u = appendLookbackAccessParams(u, ctx.userID)
+			liveRef := referer(ctx)
+			if ctx.appID != "" {
+				liveRef = fmt.Sprintf("https://%s%s/v3/course/alive/%s?app_id=%s&type=2", ctx.appID, firstNonEmpty(ctx.xetDomain, xetDomainDefault), id, ctx.appID)
 			}
-			u = u + sep + "time=" + url.QueryEscape(ts)
-			if ctx.userID != "" {
-				u = u + "&uuid=" + url.QueryEscape(ctx.userID)
+			if dataURL, text := preparePrivateLookbackM3U8WithExt(c, h, ctx.userID, u, liveRef, cand.ext); dataURL != "" {
+				return dataURL, map[string]any{"api": api, "private_decoded": true, "source_type": "m3u8_text", "m3u8_text": text}
 			}
 			return u, map[string]any{"api": api, "private_decoded": true}
 		}
@@ -356,6 +611,28 @@ func postDetailURL(c *util.Client, jar http.CookieJar, ctx xetCtx, id, h5Tpl, pc
 	return firstURLInString(body)
 }
 
+func postJSONDetail(c *util.Client, jar http.CookieJar, ctx xetCtx, h5Tpl string, data map[string]any) map[string]any {
+	if ctx.appID == "" || h5Tpl == "" {
+		return nil
+	}
+	api := fmt.Sprintf(h5Tpl, ctx.appID, firstNonEmpty(ctx.xetDomain, xetDomainDefault))
+	payload := map[string]any{"bizData": data}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return nil
+	}
+	resp, err := c.Post(api, strings.NewReader(string(b)), jsonHeaders(jar, referer(ctx)))
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	var root map[string]any
+	if json.NewDecoder(resp.Body).Decode(&root) != nil {
+		return nil
+	}
+	return root
+}
+
 // unwrapBizData converts h5-style "bizData[key]" form keys to plain "key" for PC endpoints.
 func unwrapBizData(form map[string]string) map[string]string {
 	out := make(map[string]string, len(form))
@@ -376,16 +653,30 @@ func itemFromMap(m map[string]any) xetItem {
 	typ := normType(firstNonEmpty(val(m, "resource_type"), val(m, "course_type"), p.typ))
 	return xetItem{id: firstNonEmpty(val(m, "resource_id"), val(m, "cid"), val(m, "id"), p.cid), title: firstNonEmpty(val(m, "title"), val(m, "resource_title"), val(m, "name")), typ: typ, appID: firstNonEmpty(val(m, "app_id"), p.appID), userID: firstNonEmpty(val(m, "user_id"), p.userID), pageURL: u, raw: m}
 }
+
 func headers(jar http.CookieJar, ref string) map[string]string {
-	h := map[string]string{"Accept": "application/json, text/plain, */*", "Referer": firstNonEmpty(ref, refererURL), "Origin": refererURL, "X-Requested-With": "XMLHttpRequest"}
-	if ck := cookieHeader(jar); ck != "" {
+	ref = firstNonEmpty(ref, refererURL)
+	h := map[string]string{"Accept": "application/json, text/plain, */*", "Referer": ref, "Origin": originOf(ref), "X-Requested-With": "XMLHttpRequest"}
+	if ck := cookieHeader(jar, ref); ck != "" {
 		h["Cookie"] = ck
 	}
 	return h
 }
-func cookieHeader(jar http.CookieJar) string {
+func jsonHeaders(jar http.CookieJar, ref string) map[string]string {
+	h := headers(jar, ref)
+	h["Content-Type"] = "application/json"
+	return h
+}
+func cookieHeader(jar http.CookieJar, refs ...string) string {
 	parts := []string{}
-	for _, raw := range []string{refererURL, "https://study.xiaoe-tech.com", "https://www.xiaoeknow.com"} {
+	raws := append([]string{}, refs...)
+	raws = append(raws, refererURL, "https://study.xiaoe-tech.com", "https://www.xiaoeknow.com")
+	seen := map[string]bool{}
+	for _, raw := range raws {
+		if raw == "" || seen[raw] {
+			continue
+		}
+		seen[raw] = true
 		if u, err := url.Parse(raw); err == nil {
 			for _, c := range jar.Cookies(u) {
 				parts = append(parts, c.Name+"="+c.Value)
@@ -393,6 +684,12 @@ func cookieHeader(jar http.CookieJar) string {
 		}
 	}
 	return strings.Join(parts, "; ")
+}
+func originOf(ref string) string {
+	if u, err := url.Parse(ref); err == nil && u.Scheme != "" && u.Host != "" {
+		return u.Scheme + "://" + u.Host
+	}
+	return refererURL
 }
 func referer(c xetCtx) string {
 	if c.referer != "" {
@@ -408,7 +705,7 @@ func referer(c xetCtx) string {
 }
 func normType(t string) string {
 	t = strings.ToLower(strings.TrimSpace(t))
-	if v := map[string]string{"1": "text", "2": "audio", "3": "video", "4": "live", "5": "member", "6": "column", "7": "column", "8": "bigcolumn", "10": "live", "12": "live", "20": "book", "25": "train", "50": "ecourse", "51": "document", "64": "ecourse", "alive": "live", "ebook": "book"}[t]; v != "" {
+	if v := map[string]string{"1": "text", "2": "audio", "3": "video", "4": "live", "5": "member", "6": "column", "7": "column", "8": "bigcolumn", "10": "live", "12": "live", "16": "clock", "20": "book", "25": "train", "50": "ecourse", "51": "document", "64": "ecourse", "alive": "live", "ebook": "book"}[t]; v != "" {
 		return v
 	}
 	return t
@@ -430,6 +727,9 @@ func firstURLInString(s string) string {
 	return ""
 }
 func isMediaURL(u string) bool {
+	if strings.HasPrefix(u, "data:text/html") {
+		return true
+	}
 	return (strings.HasPrefix(u, "http") || strings.HasPrefix(u, "//")) && !regexp.MustCompile(`(?i)\.(?:jpg|jpeg|png|gif|webp)(?:[?#]|$)`).MatchString(u)
 }
 func media(title, u string, extra map[string]any) *extractor.MediaInfo {
@@ -519,6 +819,12 @@ func normalizeURL(u string) string {
 }
 func formatOf(u string) string {
 	l := strings.ToLower(u)
+	if strings.HasPrefix(l, "data:text/html") {
+		return "html"
+	}
+	if strings.HasPrefix(l, "data:application/vnd.apple.mpegurl") {
+		return "m3u8"
+	}
 	if strings.Contains(l, ".m3u8") {
 		return "m3u8"
 	}

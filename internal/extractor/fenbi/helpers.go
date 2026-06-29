@@ -2,6 +2,7 @@ package fenbi
 
 import (
 	"fmt"
+	"net/http"
 	"net/url"
 	"path"
 	"strconv"
@@ -99,10 +100,56 @@ func pickTitle(v any) string {
 
 func mediaInfo(title, mediaURL string, headers map[string]string) *extractor.MediaInfo {
 	format := "mp4"
-	if strings.Contains(strings.ToLower(mediaURL), ".m3u8") {
+	if strings.Contains(strings.ToLower(mediaURL), ".m3u8") || strings.HasPrefix(strings.ToLower(mediaURL), "data:application/vnd.apple.mpegurl") {
 		format = "m3u8"
 	}
-	return &extractor.MediaInfo{Site: "fenbi", Title: util.SanitizeFilename(title), Streams: map[string]extractor.Stream{"best": {Quality: "best", URLs: []string{mediaURL}, Format: format, Headers: headers}}}
+	stream := extractor.Stream{Quality: "best", URLs: []string{mediaURL}, Format: format, Headers: headers}
+	if format == "m3u8" {
+		stream.NeedMerge = true
+	}
+	return &extractor.MediaInfo{Site: "fenbi", Title: util.SanitizeFilename(title), Streams: map[string]extractor.Stream{"best": stream}}
+}
+
+func withFenbiCookieHeader(jar http.CookieJar, base map[string]string) map[string]string {
+	out := map[string]string{}
+	for k, v := range base {
+		out[k] = v
+	}
+	cookie := fenbiCookieHeader(jar,
+		"https://pc.fenbi.com/",
+		"https://ke.fenbi.com/",
+		"https://live.fenbi.com/",
+		"https://login.fenbi.com/",
+		referer,
+	)
+	if cookie != "" {
+		out["Cookie"] = cookie
+		out["cookie"] = cookie
+	}
+	return out
+}
+
+func fenbiCookieHeader(jar http.CookieJar, rawURLs ...string) string {
+	if jar == nil {
+		return ""
+	}
+	seen := map[string]bool{}
+	var parts []string
+	for _, raw := range rawURLs {
+		u, err := url.Parse(raw)
+		if err != nil {
+			continue
+		}
+		for _, ck := range jar.Cookies(u) {
+			key := ck.Name + "=" + ck.Value
+			if key == "=" || seen[key] {
+				continue
+			}
+			seen[key] = true
+			parts = append(parts, key)
+		}
+	}
+	return strings.Join(parts, "; ")
 }
 
 func valueString(m map[string]any, keys ...string) string {

@@ -1,4 +1,42 @@
 {
-  "blocked": true,
-  "message": "needs upstream API samples"
+  "code": 1,
+  "message": "ok",
+  "data": {
+    "course_id": "1001",
+    "title": "医考帮综合课程",
+    "items": [
+      {
+        "id": "1001",
+        "title": "医考帮综合课程",
+        "cover_img": "https://cdn.example.com/ykb/course.jpg",
+        "activity_id": "act-1",
+        "app_id": "app-1"
+      }
+    ],
+    "chapterList": [
+      {
+        "id": "ch1",
+        "title": "第一章 导学",
+        "courseList": [
+          {
+            "id": "v1",
+            "chapter_id": "ch1",
+            "title": "导学课",
+            "vid": "aliyun-vid-1",
+            "playUrl": "https://cdn.example.com/ykb/intro.m3u8",
+            "size": "1024"
+          }
+        ]
+      }
+    ],
+    "handouts": [
+      {
+        "id": "f1",
+        "title": "导学讲义",
+        "suffix": "pdf",
+        "url": "/handouts/intro.pdf",
+        "size_byte": "2048"
+      }
+    ]
+  }
 }

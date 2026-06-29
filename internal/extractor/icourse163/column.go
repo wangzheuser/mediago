@@ -26,7 +26,7 @@ type columnUnit struct {
 }
 
 var columnURLRe = regexp.MustCompile(
-	`^https?://www\.icourse163\.org/(?:columns/(?P<cid1>\d+)\.htm|column/learn/(?P<cid2>\d+)(?:/.*?\.htm)?)`,
+	`^https?://[\w.-]*icourse163\.org/(?:columns/(?P<cid1>\d+)\.htm|column/learn/(?P<cid2>\d+)(?:/.*?\.htm)?)`,
 )
 
 func parseColumnURL(rawURL string) (columnURLInfo, bool) {

@@ -42,16 +42,31 @@ func (n *Nmkjxy) Extract(rawURL string, opts *extractor.ExtractOpts) (*extractor
 	if opts == nil || opts.Cookies == nil {
 		return nil, fmt.Errorf("nmkjxy requires login cookies")
 	}
+	c := util.NewClient()
+	c.SetCookieJar(opts.Cookies)
+	h := headers(opts.Cookies)
+	if err := checkCookie(c, h); err != nil {
+		return nil, err
+	}
+
 	cid := parseCID(rawURL)
+	orderSN := ""
+	if cid == "" {
+		courses := fetchCourseList(c, h)
+		if len(courses) == 0 {
+			return nil, fmt.Errorf("cannot parse nmkjxy courseId/productId from URL and course list is empty")
+		}
+		cid = firstText(courses[0], "course_id", "productId", "prodId", "courseId", "id")
+		orderSN = firstText(courses[0], "order_sn", "orderSn", "orderSN")
+	}
 	if cid == "" {
 		return nil, fmt.Errorf("cannot parse nmkjxy courseId/productId from URL")
 	}
 
-	c := util.NewClient()
-	c.SetCookieJar(opts.Cookies)
-	h := headers(opts.Cookies)
 	product, _ := requestJSON(c, fmt.Sprintf(product_url, cid), h)
-	title := firstText(dataMap(product), "prodName", "name", "productName", "title")
+	productData := dataMap(product)
+	title := firstText(productData, "prodName", "name", "productName", "title")
+	orderSN = first(orderSN, firstText(productData, "orderSn", "orderSN"))
 	if title == "" {
 		title = "nmkjxy_" + cid
 	}
@@ -61,6 +76,11 @@ func (n *Nmkjxy) Extract(rawURL string, opts *extractor.ExtractOpts) (*extractor
 		return nil, fmt.Errorf("nmkjxy video list: %w", err)
 	}
 	items := iterItems(listJSON)
+	if len(items) == 0 && orderSN != "" {
+		if recorded, err := requestJSON(c, fmt.Sprintf(recorded_video_url, url.QueryEscape(orderSN), url.QueryEscape(cid)), h); err == nil {
+			items = iterItems(recorded)
+		}
+	}
 	var entries []*extractor.MediaInfo
 	seen := map[string]bool{}
 	for i, item := range items {
@@ -74,8 +94,8 @@ func (n *Nmkjxy) Extract(rawURL string, opts *extractor.ExtractOpts) (*extractor
 		seen[vi.VideoSN+":"+vi.VideoID] = true
 		play, _ := requestJSON(c, fmt.Sprintf(video_play_url, cid, url.QueryEscape(first(vi.VideoSN, vi.VideoID))), h)
 		playData := dataMap(play)
-		picked := pickPlayInfo(playData["playInfoList"])
-		playURL := firstText(picked, "playURL")
+		picked := pickPlayInfo(playData["playInfoList"], qualityFromOpts(opts))
+		playURL := absURL(firstText(picked, "playURL", "playUrl", "url"))
 		if playURL == "" {
 			continue
 		}
@@ -180,7 +200,7 @@ func dataMap(v any) map[string]any {
 	return map[string]any{}
 }
 
-func pickPlayInfo(v any) map[string]any {
+func pickPlayInfo(v any, quality string) map[string]any {
 	list, ok := v.([]any)
 	if !ok {
 		return map[string]any{}
@@ -195,7 +215,7 @@ func pickPlayInfo(v any) map[string]any {
 			}
 		}
 	}
-	for _, d := range []string{"HD", "OD", "SD", "LD", "FD"} {
+	for _, d := range preferredDefinitions(quality) {
 		if m := defs[d]; m != nil {
 			return m
 		}
@@ -210,6 +230,89 @@ func pickPlayInfo(v any) map[string]any {
 		return map[string]any{}
 	}
 	return best
+}
+
+func preferredDefinitions(quality string) []string {
+	switch strings.ToLower(strings.TrimSpace(quality)) {
+	case "sd", "ld", "fd":
+		return []string{"LD", "FD", "SD", "HD", "OD"}
+	case "hd":
+		return []string{"SD", "HD", "LD", "FD", "OD"}
+	case "fhd", "od", "4k", "2k":
+		return []string{"HD", "OD", "SD", "LD", "FD"}
+	default:
+		return []string{"HD", "OD", "SD", "LD", "FD"}
+	}
+}
+
+func checkCookie(c *util.Client, h map[string]string) error {
+	body, err := c.GetString(check_login_url, h)
+	if err != nil {
+		return fmt.Errorf("nmkjxy login check: %w", err)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal([]byte(body), &resp); err != nil {
+		return fmt.Errorf("nmkjxy login check parse: %w", err)
+	}
+	code := firstText(resp, "code", "status")
+	if boolValue(resp["success"]) || boolValue(resp["Success"]) || code == "0" || code == "200" || resp["data"] != nil {
+		return nil
+	}
+	return fmt.Errorf("nmkjxy login check rejected token")
+}
+
+func fetchCourseList(c *util.Client, h map[string]string) []map[string]any {
+	out := []map[string]any{}
+	seen := map[string]bool{}
+	for page := 0; page < 50; page++ {
+		v, err := requestJSON(c, fmt.Sprintf(course_url, "20", strconv.Itoa(page)), h)
+		if err != nil {
+			break
+		}
+		items := iterCourseItems(v)
+		if len(items) == 0 {
+			break
+		}
+		for _, item := range items {
+			id := firstText(item, "prodId", "productId", "courseId", "id")
+			if id == "" || seen[id] {
+				continue
+			}
+			seen[id] = true
+			item["course_id"] = id
+			item["order_sn"] = firstText(item, "orderSn", "orderSN")
+			item["title"] = firstText(item, "prodName", "productName", "courseName", "title", "name")
+			out = append(out, item)
+		}
+		if len(items) < 20 {
+			break
+		}
+	}
+	return out
+}
+
+func iterCourseItems(v any) []map[string]any {
+	var out []map[string]any
+	var walk func(any)
+	walk = func(x any) {
+		switch t := x.(type) {
+		case []any:
+			for _, e := range t {
+				walk(e)
+			}
+		case map[string]any:
+			if firstText(t, "prodId", "productId", "courseId", "id") != "" && firstText(t, "prodName", "productName", "courseName", "title", "name") != "" {
+				out = append(out, t)
+			}
+			for _, k := range []string{"data", "rows", "list", "items", "result"} {
+				if y, ok := t[k]; ok {
+					walk(y)
+				}
+			}
+		}
+	}
+	walk(v)
+	return out
 }
 
 func fetchCourseware(c *util.Client, h map[string]string, cid string) []map[string]string {
@@ -326,11 +429,15 @@ func parseToken(name, val string) string {
 	return strings.TrimSpace(v)
 }
 
-var cidRe = regexp.MustCompile(`(?i)[?&](?:courseId|productId|prodId)=([0-9]+)`)
+var cidRe = regexp.MustCompile(`(?i)[?&](?:courseId|course_id|productId|prodId|cid|id)=([0-9]+)|/(?:course|product|detail|video)/([0-9]+)`)
 
 func parseCID(raw string) string {
 	if m := cidRe.FindStringSubmatch(raw); len(m) > 1 {
-		return m[1]
+		for i := 1; i < len(m); i++ {
+			if m[i] != "" {
+				return m[i]
+			}
+		}
 	}
 	return ""
 }
@@ -369,6 +476,20 @@ func first(vals ...string) string {
 	}
 	return ""
 }
+func boolValue(v any) bool {
+	switch x := v.(type) {
+	case bool:
+		return x
+	case string:
+		s := strings.ToLower(strings.TrimSpace(x))
+		return s == "true" || s == "1" || s == "ok" || s == "success"
+	case float64:
+		return x != 0
+	case int:
+		return x != 0
+	}
+	return false
+}
 func absURL(s string) string {
 	if s == "" {
 		return ""
@@ -405,6 +526,13 @@ func pickFormat(u string) string {
 		return "m3u8"
 	}
 	return "mp4"
+}
+
+func qualityFromOpts(opts *extractor.ExtractOpts) string {
+	if opts == nil {
+		return ""
+	}
+	return opts.Quality
 }
 
 var badName = regexp.MustCompile(`[\\/:*?"<>|\r\n\t]+`)

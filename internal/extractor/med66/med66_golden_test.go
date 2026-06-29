@@ -29,6 +29,35 @@ func TestExtractMock(t *testing.T) {
 	goldenAssertMedia(t, "med66", got)
 }
 
+func TestExtractCourseListFallback(t *testing.T) {
+	routes := map[string]json.RawMessage{
+		"POST /homes/mycourse/courseInfo": json.RawMessage(`{"code":200,"data":[{"courseId":"med123","title":"医学课程","eduSubjectId":10,"classType":2,"classId":3,"linkedCourseIds":"med123","isAi":0}]}`),
+		"__default":                       json.RawMessage(`{"code":0,"data":{}}`),
+	}
+	goldenInstallTransport(t, routes)
+	jar := goldenNewJar(t)
+	goldenSetCookie(t, jar, "https://member.med66.com/", "cdeluid", "USER1")
+	got, err := (&Med66{}).Extract("https://member.med66.com/homes/mycourse", &extractor.ExtractOpts{Cookies: jar})
+	if err != nil {
+		t.Fatalf("Extract returned error: %v", err)
+	}
+	if got.Title != "med66_courses" || len(got.Entries) != 1 {
+		t.Fatalf("unexpected course list media: %#v", got)
+	}
+	if got.Entries[0].Extra["course_id"] != "med123" {
+		t.Fatalf("course_id = %#v, want med123", got.Entries[0].Extra["course_id"])
+	}
+	if !strings.Contains(got.Entries[0].Extra["url"].(string), "courseId=med123") {
+		t.Fatalf("course URL = %#v, want med123 query", got.Entries[0].Extra["url"])
+	}
+}
+
+func TestMed66CourseIDEqualAcceptsMedPrefix(t *testing.T) {
+	if !med66CourseIDEqual("123", "med123") || !med66CourseIDEqual("med123", "123") {
+		t.Fatalf("med66CourseIDEqual should normalize optional med prefix")
+	}
+}
+
 func goldenLoadRoutes(t *testing.T) map[string]json.RawMessage {
 	t.Helper()
 	data, err := os.ReadFile("testdata/sample.json")
@@ -45,6 +74,24 @@ func goldenLoadRoutes(t *testing.T) map[string]json.RawMessage {
 func goldenInstallTransport(t *testing.T, routes map[string]json.RawMessage) {
 	t.Helper()
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/api/room/replay/login" {
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if got := r.Form.Get("userid"); got != "USER1" {
+				http.Error(w, "unexpected userid "+got, http.StatusBadRequest)
+				return
+			}
+			if got := r.Form.Get("accessid"); got != "ACC1" {
+				http.Error(w, "unexpected accessid "+got, http.StatusBadRequest)
+				return
+			}
+			if got := r.Form.Get("version"); got != MED66_CC_REPLAY_VERSION {
+				http.Error(w, "unexpected version "+got, http.StatusBadRequest)
+				return
+			}
+		}
 		if raw, ok := goldenExactRoute(routes, r); ok {
 			goldenWriteResponse(w, raw)
 			return

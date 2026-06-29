@@ -17,9 +17,9 @@ type kaoyanURLInfo struct {
 }
 
 var (
-	kaoyanLearnRe = regexp.MustCompile(`^https?://www\.icourse163\.org/learn/kaopei-(?P<cid>\d+)(?:.*?tid=(?P<tid>\d+))?`)
+	kaoyanLearnRe = regexp.MustCompile(`^https?://[\w.-]*icourse163\.org/learn/kaopei-(?P<cid>\d+)(?:.*?tid=(?P<tid>\d+))?`)
 	kaoyanTermRe  = regexp.MustCompile(`^https?://kaoyan\.icourse163\.org/course/terms/(?P<tid>\d+)(?:\.htm)?(?:.*?course[Ii]d=(?P<cid>\d+))?`)
-	kaoyanLiveRe  = regexp.MustCompile(`^https?://www\.icourse163\.org/live/.*?(?P<live>\d+)\.htm`)
+	kaoyanLiveRe  = regexp.MustCompile(`^https?://[\w.-]*icourse163\.org/live/.*?(?P<live>\d+)\.htm`)
 )
 
 func parseKaoyanURL(rawURL string) (kaoyanURLInfo, bool) {

@@ -51,4 +51,4 @@
 | 缺口 | 处理结果 |
 |---|---|
 | 多资源类型 endpoint 路由 | `resolveItem` 已拆分 text -> `xe.course.business.get.detail`, book -> `xe.course.business.ebook.info`, document/file -> `xe.course.business.courseware_list.get`, audio -> `xe.course.business.audio.info.get`; column/member/ecourse/train 保持 column items API. |
-| protected live/private lookback | live 分支现在优先检测 `aliveVideoUrlEncrypt`, `private_info`, `private_m3u8`, `__ba`, `distribute.vod.pri.get`; 命中时返回 `blocked: needs private lookback decrypt`, 不再把受保护 m3u8 当作普通 URL. |
+| protected live/private lookback | live/video 分支现在检测 `aliveVideoUrlEncrypt`, `__ba`, `distribute.vod.pri.get`; 解码私有 m3u8 后追加 `time`/`uuid`, 拉取并重写 m3u8, 相对分片转绝对 URL, 按 `ext.host/path/param` 重写分片与 `BYTERANGE`, 私有 key 通过 `uid` 请求并内联为 hex key. |

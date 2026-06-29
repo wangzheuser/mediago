@@ -57,6 +57,9 @@ func (c *BilibiliCheese) Extract(rawURL string, opts *extractor.ExtractOpts) (*e
 
 	client := util.NewClient()
 	client.SetCookieJar(opts.Cookies)
+	if err := ensureBilibiliLogin(client, opts.Cookies); err != nil {
+		return nil, err
+	}
 	h := cheeseHeaders()
 
 	if m := cheeseEPRe.FindStringSubmatch(rawURL); m != nil {

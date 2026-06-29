@@ -16,7 +16,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
-	"strings"
 
 	"github.com/Sophomoresty/mediago/internal/extractor"
 	"github.com/Sophomoresty/mediago/internal/util"
@@ -26,9 +25,9 @@ const (
 	// From source: https://api.bilibili.com/pgc/view/web/ep/list?season_id={}
 	bangumiEPListURL = "https://api.bilibili.com/pgc/view/web/ep/list?season_id=%s"
 	// Standard pgc playurl endpoint (same param style as x/player/playurl)
-	bangumiPlayURL   = "https://api.bilibili.com/pgc/player/web/playurl?ep_id=%s&fnval=4048&fourk=1&qn=127"
-	bangumiReferer   = "https://www.bilibili.com"
-	bangumiSite      = "bilibili-bangumi"
+	bangumiPlayURL = "https://api.bilibili.com/pgc/player/web/playurl?ep_id=%s&fnval=4048&fourk=1&qn=127"
+	bangumiReferer = "https://www.bilibili.com"
+	bangumiSite    = "bilibili-bangumi"
 )
 
 var bangumiPatterns = []string{
@@ -54,6 +53,11 @@ func (b *BilibiliBangumi) Extract(rawURL string, opts *extractor.ExtractOpts) (*
 	client := util.NewClient()
 	if opts != nil && opts.Cookies != nil {
 		client.SetCookieJar(opts.Cookies)
+		if hasBilibiliLoginCookie(opts.Cookies) {
+			if err := validateBilibiliLogin(client); err != nil {
+				return nil, err
+			}
+		}
 	}
 	headers := bangumiHeaders()
 
@@ -232,8 +236,8 @@ func fetchBangumiEpisodes(client *util.Client, headers map[string]string, season
 		Code    int    `json:"code"`
 		Message string `json:"message"`
 		Result  struct {
-			Title    string            `json:"title"`
-			Episodes []bangumiEpisode  `json:"episodes"`
+			Title    string           `json:"title"`
+			Episodes []bangumiEpisode `json:"episodes"`
 		} `json:"result"`
 	}
 
@@ -367,20 +371,4 @@ func bangumiDownloadHeaders() map[string]string {
 		"Referer":    bangumiReferer,
 		"User-Agent": util.RandomUA(),
 	}
-}
-
-// bangumiSeasonTitleFromPage extracts the og:title from the page HTML.
-// Reuses the same approach as _get_bangumi_list which scrapes the page
-// for property="og:title".
-func bangumiSeasonTitleFromPage(body string) string {
-	re := regexp.MustCompile(`property\s*=\s*"og:title"\s*content\s*=\s*"(.*?)"`)
-	if m := re.FindStringSubmatch(body); m != nil {
-		title := strings.TrimSpace(m[1])
-		// Clean common suffixes like "_bilibili_哔哩哔哩"
-		if idx := strings.Index(title, "_bilibili"); idx > 0 {
-			title = title[:idx]
-		}
-		return title
-	}
-	return ""
 }

@@ -3,7 +3,10 @@ package ckjr
 import (
 	"encoding/base64"
 	"fmt"
+	"html"
+	"net/http"
 	"net/url"
+	"path"
 	"regexp"
 	"strings"
 
@@ -15,25 +18,71 @@ func parseRoute(raw string) routeInfo {
 	if m := routeRe.FindStringSubmatch(raw); m != nil {
 		kind := routeKindFromPath(m[2], m[3])
 		cfg := routeCfg[kind]
+		cfg.RawURL = raw
+		cfg.BaseURL = routeBaseURL(raw)
 		cfg.Company = m[1]
 		q, _ := url.ParseQuery(m[4])
+		cfg.Query = valuesToMap(q)
 		cfg.ID = firstNonEmpty(q.Get(cfg.IDKey), q.Get("courseId"), q.Get("liveId"), q.Get("extId"), q.Get("datumId"), q.Get("combosId"), q.Get("testId"))
 		return cfg
 	}
 	kind := "video"
 	cfg := routeCfg[kind]
-	if strings.Contains(raw, "voice") {
+	cfg.RawURL = raw
+	cfg.BaseURL = routeBaseURL(raw)
+	cfg.Query = extractRouteQuery(raw)
+	if company := extractRouteCompany(raw); company != "" {
+		cfg.Company = company
+	}
+	lower := strings.ToLower(raw)
+	if strings.Contains(lower, "livepersonaldetail") {
+		cfg = routeCfg["livePersonal"]
+		cfg.RawURL = raw
+		cfg.BaseURL = routeBaseURL(raw)
+		cfg.Query = extractRouteQuery(raw)
+		cfg.Company = extractRouteCompany(raw)
+	} else if strings.Contains(lower, "voice") {
 		cfg = routeCfg["voice"]
-	} else if strings.Contains(raw, "imgText") {
+		cfg.RawURL = raw
+		cfg.BaseURL = routeBaseURL(raw)
+		cfg.Query = extractRouteQuery(raw)
+		cfg.Company = extractRouteCompany(raw)
+	} else if strings.Contains(lower, "imgtext") {
 		cfg = routeCfg["imgText"]
-	} else if strings.Contains(raw, "live") {
+		cfg.RawURL = raw
+		cfg.BaseURL = routeBaseURL(raw)
+		cfg.Query = extractRouteQuery(raw)
+		cfg.Company = extractRouteCompany(raw)
+	} else if strings.Contains(lower, "live") {
 		cfg = routeCfg["live"]
-	} else if strings.Contains(raw, "column") {
+		cfg.RawURL = raw
+		cfg.BaseURL = routeBaseURL(raw)
+		cfg.Query = extractRouteQuery(raw)
+		cfg.Company = extractRouteCompany(raw)
+	} else if strings.Contains(lower, "column") {
 		cfg = routeCfg["column"]
-	} else if strings.Contains(raw, "datum") {
+		cfg.RawURL = raw
+		cfg.BaseURL = routeBaseURL(raw)
+		cfg.Query = extractRouteQuery(raw)
+		cfg.Company = extractRouteCompany(raw)
+	} else if strings.Contains(lower, "datum") {
 		cfg = routeCfg["datum"]
-	} else if strings.Contains(raw, "package") {
+		cfg.RawURL = raw
+		cfg.BaseURL = routeBaseURL(raw)
+		cfg.Query = extractRouteQuery(raw)
+		cfg.Company = extractRouteCompany(raw)
+	} else if strings.Contains(lower, "package") {
 		cfg = routeCfg["package"]
+		cfg.RawURL = raw
+		cfg.BaseURL = routeBaseURL(raw)
+		cfg.Query = extractRouteQuery(raw)
+		cfg.Company = extractRouteCompany(raw)
+	} else if strings.Contains(lower, "testpaper") {
+		cfg = routeCfg["testPaper"]
+		cfg.RawURL = raw
+		cfg.BaseURL = routeBaseURL(raw)
+		cfg.Query = extractRouteQuery(raw)
+		cfg.Company = extractRouteCompany(raw)
 	}
 	u, _ := url.Parse(raw)
 	if u != nil {
@@ -46,28 +95,118 @@ func parseRoute(raw string) routeInfo {
 	return cfg
 }
 
-func resourceParams(r routeInfo) map[string]string {
-	return map[string]string{
-		r.IDKey:      r.ID,
-		"id":         r.ID,
-		"courseId":   r.ID,
-		"prodId":     r.ID,
-		"productId":  r.ID,
-		"prodType":   r.ProdType,
-		"courseType": r.CourseTyp,
-		"type":       r.CourseTyp,
-		"page":       "1",
-		"pageNum":    "1",
-		"pageSize":   "100",
-		"limit":      "100",
-		"size":       "100",
+func routeBaseURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
 	}
+	base := strings.SplitN(raw, "#", 2)[0]
+	if !strings.Contains(base, "://") {
+		return ""
+	}
+	return base
+}
+
+func extractRouteCompany(raw string) string {
+	if m := regexp.MustCompile(`(?i)/kpv2p/([\w-]+)`).FindStringSubmatch(raw); len(m) > 1 {
+		return strings.TrimSpace(m[1])
+	}
+	return ""
+}
+
+func extractRouteQuery(raw string) map[string]string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	if i := strings.Index(raw, "#"); i >= 0 {
+		frag := raw[i+1:]
+		if j := strings.Index(frag, "?"); j >= 0 {
+			q, _ := url.ParseQuery(frag[j+1:])
+			return valuesToMap(q)
+		}
+	}
+	if u, err := url.Parse(raw); err == nil {
+		return valuesToMap(u.Query())
+	}
+	return nil
+}
+
+func valuesToMap(values url.Values) map[string]string {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(values))
+	for k, vals := range values {
+		if len(vals) > 0 && vals[0] != "" {
+			out[k] = vals[0]
+		}
+	}
+	return out
+}
+
+func resourceParams(r routeInfo) map[string]string {
+	params := map[string]string{
+		r.IDKey:         r.ID,
+		"id":            r.ID,
+		"courseId":      r.ID,
+		"prodId":        r.ID,
+		"productId":     r.ID,
+		"prodType":      r.ProdType,
+		"courseType":    r.CourseTyp,
+		"type":          r.CourseTyp,
+		"page":          "1",
+		"pageNum":       "1",
+		"pageSize":      "100",
+		"limit":         "100",
+		"size":          "100",
+		"hasPermission": "1",
+	}
+	switch r.Kind {
+	case "video", "voice", "imgText":
+		params["ckFrom"] = "5"
+		params["extId"] = "-1"
+		params["isSkeleton"] = "1"
+		params["sortInColumn"] = "asc"
+	case "column":
+		params["ckFrom"] = "9"
+		params["cId"] = "-1"
+		params["extId"] = r.ID
+		params["columnDetailId"] = "0"
+		params["columnDetailld"] = "0"
+		params["columnPermission"] = "1"
+		params["isCoursePage"] = "0"
+		params["name"] = ""
+		params["sort"] = "asc"
+	case "datum":
+		params["ckFrom"] = "8"
+		params["datumId"] = r.ID
+	case "live":
+		params["ckFrom"] = "51"
+		params["liveId"] = r.ID
+	case "livePersonal":
+		params["ckFrom"] = "180"
+		params["liveId"] = r.ID
+	case "package":
+		params["ckFrom"] = "61"
+		params["combosId"] = r.ID
+	case "testPaper":
+		params["ckFrom"] = "125"
+		params["testId"] = r.ID
+	}
+	for k, v := range r.Query {
+		if v != "" {
+			params[k] = v
+		}
+	}
+	params[r.IDKey] = r.ID
+	return params
 }
 
 func qcloudAuth(node map[string]any) map[string]string {
 	appID := textValue(node, "app_id", "appId", "appID", "appid", "app")
-	fileID := textValue(node, "fileID", "fileId", "file_id", "fileid", "vid")
-	psign := textValue(node, "psign", "pSign", "p_sign", "playAuth", "sign", "token")
+	fileID := textValue(node, "fileID", "fileId", "file_id", "fileid", "vodVideoId", "vod_video_id", "vid")
+	psign := textValue(node, "psign", "pSign", "p_sign", "playAuth", "play_auth", "sign", "token")
 	if appID == "" || fileID == "" || psign == "" {
 		return nil
 	}
@@ -126,13 +265,39 @@ func walkMaps(v any) []map[string]any {
 }
 
 func ckjrHeaders(raw string) map[string]string {
-	h := map[string]string{"Accept": "application/json, text/plain, */*", "User-Agent": ckjrUA, "Referer": raw}
+	h := map[string]string{"Accept": "application/json, text/plain, */*", "User-Agent": ckjrUA, "Referer": raw, "X-From": ckjrFromApp, "X-Trace-Ch": "1"}
 	if u, err := url.Parse(raw); err == nil && u.Scheme != "" && u.Host != "" {
 		h["Origin"] = u.Scheme + "://" + u.Host
 	} else {
 		h["Origin"] = url0
 	}
 	return h
+}
+
+func ckjrCookieHeader(jar http.CookieJar, rawURL string) string {
+	if jar == nil {
+		return ""
+	}
+	origins := []string{rawURL, url0, "https://ckjr001.com/", "https://www.ckjr001.com/"}
+	if u, err := url.Parse(rawURL); err == nil && u.Scheme != "" && u.Host != "" {
+		origins = append([]string{u.Scheme + "://" + u.Host + "/"}, origins...)
+	}
+	seen := map[string]bool{}
+	var parts []string
+	for _, origin := range origins {
+		u, err := url.Parse(origin)
+		if err != nil || u.Host == "" {
+			continue
+		}
+		for _, cookie := range jar.Cookies(u) {
+			if cookie.Name == "" || seen[cookie.Name] {
+				continue
+			}
+			seen[cookie.Name] = true
+			parts = append(parts, cookie.Name+"="+cookie.Value)
+		}
+	}
+	return strings.Join(parts, "; ")
 }
 
 func routeKindFromPath(path, courseKind string) string {
@@ -169,9 +334,15 @@ func dedupeEntries(in []*extractor.MediaInfo) []*extractor.MediaInfo {
 	seen := map[string]bool{}
 	var out []*extractor.MediaInfo
 	for _, e := range in {
+		if e == nil {
+			continue
+		}
 		key := e.Title
-		if s := e.Streams["best"]; len(s.URLs) > 0 {
-			key = s.URLs[0]
+		for _, s := range e.Streams {
+			if len(s.URLs) > 0 {
+				key = s.URLs[0]
+				break
+			}
 		}
 		if key == "" || seen[key] {
 			continue
@@ -184,9 +355,17 @@ func dedupeEntries(in []*extractor.MediaInfo) []*extractor.MediaInfo {
 
 func normalizeMediaText(s string) string {
 	s = strings.TrimSpace(strings.Trim(s, `"'`))
+	s = html.UnescapeString(s)
 	s = strings.ReplaceAll(s, `\/`, "/")
 	s = strings.ReplaceAll(s, `\u002F`, "/")
 	s = strings.ReplaceAll(s, `\u002f`, "/")
+	s = strings.ReplaceAll(s, `\u003A`, ":")
+	s = strings.ReplaceAll(s, `\u003a`, ":")
+	s = strings.ReplaceAll(s, `\u003D`, "=")
+	s = strings.ReplaceAll(s, `\u003d`, "=")
+	s = strings.ReplaceAll(s, `\u0026`, "&")
+	s = strings.ReplaceAll(s, `\u003F`, "?")
+	s = strings.ReplaceAll(s, `\u003f`, "?")
 	if strings.HasPrefix(s, "//") {
 		s = "https:" + s
 	}
@@ -198,20 +377,100 @@ func normalizeMediaText(s string) string {
 
 func isMediaURL(s string) bool {
 	lower := strings.ToLower(s)
-	return strings.HasPrefix(lower, "http") && (strings.Contains(lower, ".m3u8") || strings.Contains(lower, ".mp4") || strings.Contains(lower, ".m4v") || strings.Contains(lower, ".mov") || strings.Contains(lower, ".flv") || strings.Contains(lower, ".mp3") || strings.Contains(lower, ".m4a") || strings.Contains(lower, ".aac") || strings.Contains(lower, ".wav") || strings.Contains(lower, ".pdf"))
+	if strings.HasPrefix(strings.TrimSpace(lower), "#extm3u") {
+		return true
+	}
+	if !strings.HasPrefix(lower, "http") {
+		return false
+	}
+	for _, ext := range []string{".m3u8", ".mp4", ".m4v", ".mov", ".flv", ".mp3", ".m4a", ".aac", ".wav", ".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".zip", ".rar", ".7z", ".txt", ".csv", ".jpeg", ".jpg", ".png", ".gif", ".webp"} {
+		if strings.Contains(lower, ext) {
+			return true
+		}
+	}
+	return strings.Contains(lower, "mime_type=video_mp4") || strings.Contains(lower, "video/mp4") || strings.Contains(lower, "audio/mp4") || strings.Contains(lower, "audio/mpeg") || strings.Contains(lower, "application/pdf")
 }
 
 func pickFormat(mediaURL string) string {
 	lower := strings.ToLower(mediaURL)
 	switch {
+	case strings.HasPrefix(lower, "data:text/html"):
+		return "html"
+	case strings.HasPrefix(lower, "data:application/vnd.apple.mpegurl"):
+		return "m3u8"
 	case strings.Contains(lower, ".m3u8"):
 		return "m3u8"
 	case strings.Contains(lower, ".mp3") || strings.Contains(lower, ".m4a") || strings.Contains(lower, ".aac") || strings.Contains(lower, ".wav"):
 		return "audio"
-	case strings.Contains(lower, ".pdf"):
+	case strings.Contains(lower, ".pdf"), strings.Contains(lower, "application/pdf"):
 		return "pdf"
 	}
+	if u, err := url.Parse(mediaURL); err == nil {
+		ext := strings.TrimPrefix(strings.ToLower(path.Ext(u.Path)), ".")
+		switch ext {
+		case "doc", "docx", "ppt", "pptx", "xls", "xlsx", "zip", "rar", "7z", "txt", "csv", "jpeg", "jpg", "png", "gif", "webp":
+			return ext
+		}
+	}
 	return "mp4"
+}
+
+func pickCandidateFormat(cand mediaCandidate) string {
+	if cand.Format != "" {
+		return strings.TrimPrefix(strings.ToLower(cand.Format), ".")
+	}
+	format := pickFormat(cand.URL)
+	if cand.Kind == "file" && format == "mp4" && !looksLikeVideoURL(cand.URL) {
+		if ext := fileFormatFromURL(cand.URL); ext != "" {
+			return ext
+		}
+		if ext := fileFormatFromKey(cand.SourceKey); ext != "" {
+			return ext
+		}
+		return "bin"
+	}
+	return format
+}
+
+func mediaKindFromFormat(format string) string {
+	switch strings.ToLower(format) {
+	case "audio":
+		return "audio"
+	case "pdf", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "zip", "rar", "7z", "txt", "csv", "jpeg", "jpg", "png", "gif", "webp", "html":
+		return "file"
+	default:
+		return "video"
+	}
+}
+
+func looksLikeVideoURL(raw string) bool {
+	lower := strings.ToLower(raw)
+	return strings.Contains(lower, ".m3u8") || strings.Contains(lower, ".mp4") || strings.Contains(lower, ".m4v") || strings.Contains(lower, ".mov") || strings.Contains(lower, ".flv") || strings.Contains(lower, "video/")
+}
+
+func fileFormatFromURL(raw string) string {
+	u, err := url.Parse(raw)
+	pathValue := raw
+	if err == nil {
+		pathValue = u.Path
+	}
+	ext := strings.TrimPrefix(strings.ToLower(path.Ext(pathValue)), ".")
+	switch ext {
+	case "pdf", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "zip", "rar", "7z", "txt", "csv", "jpeg", "jpg", "png", "gif", "webp":
+		return ext
+	default:
+		return ""
+	}
+}
+
+func fileFormatFromKey(sourceKey string) string {
+	key := regexp.MustCompile(`[^a-z0-9]`).ReplaceAllString(strings.ToLower(sourceKey), "")
+	for _, ext := range []string{"jpeg", "jpg", "png", "gif", "webp", "pdf", "docx", "doc", "pptx", "ppt", "xlsx", "xls", "zip", "rar", "7z", "csv", "txt"} {
+		if strings.Contains(key, ext) {
+			return ext
+		}
+	}
+	return ""
 }
 
 func textValue(m map[string]any, keys ...string) string {
@@ -225,6 +484,25 @@ func textValue(m map[string]any, keys ...string) string {
 	return ""
 }
 
+func cloneStringMap(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneAnyMap(in map[string]any) map[string]any {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
 func firstNonEmpty(values ...string) string {
 	for _, v := range values {
 		if strings.TrimSpace(v) != "" {
@@ -236,10 +514,10 @@ func firstNonEmpty(values ...string) string {
 
 func extractFirst(re *regexp.Regexp, s string) string {
 	m := re.FindStringSubmatch(s)
-	if m == nil {
+	if len(m) < 2 {
 		return ""
 	}
-	return ""
+	return strings.TrimSpace(m[1])
 }
 
 var ckjrAESKey = []byte("ckjrTheKey!@##@!")
@@ -268,4 +546,5 @@ func ckjrDecryptURL(s string) string {
 	}
 	return ""
 }
+
 // end of file

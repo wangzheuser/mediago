@@ -171,7 +171,10 @@ var (
 )
 
 func parseCourseRef(rawURL string) (string, string) {
-	u, _ := url.Parse(strings.TrimSpace(rawURL))
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || u == nil {
+		return "", ""
+	}
 	path := strings.ToLower(u.Path)
 	source := ""
 	switch {

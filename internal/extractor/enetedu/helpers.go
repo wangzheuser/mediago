@@ -1,12 +1,23 @@
 package enetedu
 
 import (
+	"encoding/json"
 	"fmt"
+	"net/url"
+	"regexp"
 	"strings"
 
 	"github.com/Sophomoresty/mediago/internal/extractor"
 	"github.com/Sophomoresty/mediago/internal/util"
 )
+
+type fileInfo struct {
+	Title      string
+	URL        string
+	Format     string
+	SourceType string
+	Raw        map[string]any
+}
 
 func apiURL(path string) string {
 	if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
@@ -101,6 +112,74 @@ func findMediaURL(v any) string {
 	return ""
 }
 
+func parseNoticeFiles(detail map[string]any) []fileInfo {
+	notice := valueString(detail, "courseNotice")
+	if notice == "" {
+		return nil
+	}
+	var payload any
+	if err := json.Unmarshal([]byte(notice), &payload); err != nil {
+		payload = notice
+	}
+	var out []fileInfo
+	walkNoticePayload(payload, &out)
+	return out
+}
+
+func walkNoticePayload(v any, out *[]fileInfo) {
+	switch x := v.(type) {
+	case map[string]any:
+		rawURL := firstNonEmpty(valueString(x, "url", "fileUrl", "filePath", "path", "downloadUrl", "resourceUrl"))
+		if rawURL != "" {
+			fileURL := normalizeURL(rawURL)
+			if isDownloadableURL(fileURL) {
+				*out = append(*out, fileInfo{
+					Title:      firstNonEmpty(valueString(x, "fileName", "name", "title"), "课程通知"),
+					URL:        fileURL,
+					Format:     fileFormat(fileURL),
+					SourceType: "notice",
+					Raw:        x,
+				})
+			}
+		}
+		for _, child := range x {
+			walkNoticePayload(child, out)
+		}
+	case []any:
+		for _, child := range x {
+			walkNoticePayload(child, out)
+		}
+	}
+}
+
+func walkFilePayload(v any, out *[]fileInfo) {
+	switch x := v.(type) {
+	case map[string]any:
+		rawURL := firstNonEmpty(valueString(x, "url", "fileUrl", "filePath", "path", "downloadUrl", "resourceUrl"))
+		if rawURL != "" {
+			fileURL := normalizeURL(rawURL)
+			if isDownloadableURL(fileURL) {
+				*out = append(*out, fileInfo{
+					Title:      firstNonEmpty(valueString(x, "fileName", "name", "title", "resourceName"), fileTitleFromURL(fileURL), "课程资料"),
+					URL:        fileURL,
+					Format:     fileFormat(fileURL),
+					SourceType: "course_file",
+					Raw:        x,
+				})
+			}
+		}
+		for _, key := range []string{"children", "list", "records", "courseResourcesList", "resources", "data"} {
+			if child, ok := x[key]; ok {
+				walkFilePayload(child, out)
+			}
+		}
+	case []any:
+		for _, child := range x {
+			walkFilePayload(child, out)
+		}
+	}
+}
+
 func mediaInfo(title, mediaURL string, headers map[string]string) *extractor.MediaInfo {
 	format := "mp4"
 	low := strings.ToLower(mediaURL)
@@ -110,6 +189,30 @@ func mediaInfo(title, mediaURL string, headers map[string]string) *extractor.Med
 		format = "audio"
 	}
 	return &extractor.MediaInfo{Site: "enetedu", Title: util.SanitizeFilename(title), Streams: map[string]extractor.Stream{"best": {Quality: "best", URLs: []string{mediaURL}, Format: format, Headers: headers}}}
+}
+
+func fileEntries(files []fileInfo, headers map[string]string) []*extractor.MediaInfo {
+	entries := make([]*extractor.MediaInfo, 0, len(files))
+	for _, file := range files {
+		fileURL := normalizeURL(file.URL)
+		if !isDownloadableURL(fileURL) {
+			continue
+		}
+		format := firstNonEmpty(file.Format, fileFormat(fileURL), "bin")
+		title := strings.TrimSuffix(util.SanitizeFilename(firstNonEmpty(file.Title, fileTitleFromURL(fileURL), "课程资料")), "."+format)
+		entries = append(entries, &extractor.MediaInfo{
+			Site:  "enetedu",
+			Title: title,
+			Streams: map[string]extractor.Stream{"best": {
+				Quality: "best",
+				URLs:    []string{fileURL},
+				Format:  format,
+				Headers: cloneHeaders(headers),
+			}},
+			Extra: map[string]any{"type": "file", "source_type": file.SourceType, "raw": file.Raw},
+		})
+	}
+	return entries
 }
 
 func dedupe(in []*extractor.MediaInfo) []*extractor.MediaInfo {
@@ -161,6 +264,50 @@ func normalizeURL(s string) string {
 func isMediaURL(s string) bool {
 	low := strings.ToLower(strings.TrimSpace(s))
 	return strings.HasPrefix(low, "http") && (strings.Contains(low, ".m3u8") || strings.Contains(low, ".mp4") || strings.Contains(low, ".flv") || strings.Contains(low, ".mov") || strings.Contains(low, ".m4v") || strings.Contains(low, ".mp3") || strings.Contains(low, ".m4a") || strings.Contains(low, ".aac") || strings.Contains(low, ".wav"))
+}
+
+func isDownloadableURL(s string) bool {
+	return isMediaURL(s) || isFileURL(s)
+}
+
+func isFileURL(s string) bool {
+	low := strings.ToLower(strings.TrimSpace(s))
+	if !strings.HasPrefix(low, "http") {
+		return false
+	}
+	return regexp.MustCompile(`\.(?:pdf|pptx?|docx?|xlsx?|xls|zip|rar|7z|caj)(?:[?#]|$)`).MatchString(low)
+}
+
+func fileFormat(raw string) string {
+	low := strings.ToLower(raw)
+	if strings.Contains(low, ".m3u8") {
+		return "m3u8"
+	}
+	u, err := url.Parse(raw)
+	path := raw
+	if err == nil {
+		path = u.Path
+	}
+	if i := strings.LastIndex(path, "."); i >= 0 && i < len(path)-1 {
+		return strings.ToLower(path[i+1:])
+	}
+	return ""
+}
+
+func fileTitleFromURL(raw string) string {
+	u, err := url.Parse(raw)
+	path := raw
+	if err == nil {
+		path = u.Path
+	}
+	if i := strings.LastIndex(path, "/"); i >= 0 && i < len(path)-1 {
+		name, _ := url.PathUnescape(path[i+1:])
+		if ext := fileFormat(name); ext != "" {
+			return strings.TrimSuffix(name, "."+ext)
+		}
+		return name
+	}
+	return ""
 }
 
 func cloneHeaders(in map[string]string) map[string]string {

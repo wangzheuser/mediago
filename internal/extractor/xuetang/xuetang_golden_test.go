@@ -108,3 +108,84 @@ func TestExtractMock(t *testing.T) {
 	media, err := (&Xuetang{}).Extract("https://www.xuetangx.com/course/sign123/1001", &extractor.ExtractOpts{Cookies: jar})
 	assertGoldenOutcome(t, media, err)
 }
+
+func TestParseURLSourceExamples(t *testing.T) {
+	tests := []struct {
+		raw        string
+		kind       xuetangURLKind
+		host       string
+		sign       string
+		cid        string
+		tid        string
+		wantOrigin string
+	}{
+		{
+			raw:        "https://www.xuetangx.com/course/xjtu08301000528/12424483?channel=i.area.learn_title",
+			kind:       xuetangURLCourse,
+			host:       "www.xuetangx.com",
+			sign:       "xjtu08301000528",
+			cid:        "12424483",
+			wantOrigin: "https://www.xuetangx.com",
+		},
+		{
+			raw:        "https://next.xuetangx.com/course/szpt08071002217/26284632?channel=i.area.learn_title",
+			kind:       xuetangURLCourse,
+			host:       "next.xuetangx.com",
+			sign:       "szpt08071002217",
+			cid:        "26284632",
+			wantOrigin: "https://www.xuetangx.com",
+		},
+		{
+			raw:        "https://next.xuetangx.com/live/live20191205/live20191205001/1480012/1150601",
+			kind:       xuetangURLLive,
+			host:       "next.xuetangx.com",
+			sign:       "live20191205",
+			cid:        "1480012",
+			tid:        "1150601",
+			wantOrigin: "https://www.xuetangx.com",
+		},
+		{
+			raw:        "https://next.xuetangx.com/live/live20200611M001/live20200611M001/4127460/5786325?fromArray=home_live_ad",
+			kind:       xuetangURLLive,
+			host:       "next.xuetangx.com",
+			sign:       "live20200611M001",
+			cid:        "4127460",
+			tid:        "5786325",
+			wantOrigin: "https://www.xuetangx.com",
+		},
+		{
+			raw:        "https://www.xuetangx.com/training/NLP080910033761/16862187",
+			kind:       xuetangURLTraining,
+			host:       "www.xuetangx.com",
+			sign:       "NLP080910033761",
+			wantOrigin: "https://www.xuetangx.com",
+		},
+		{
+			raw:        "https://www.cmgemooc.com/course/cmg123/456",
+			kind:       xuetangURLCourse,
+			host:       "www.cmgemooc.com",
+			sign:       "cmg123",
+			cid:        "456",
+			wantOrigin: "https://www.xuetangx.com",
+		},
+		{
+			raw:        "https://www.gradsmartedu.cn/course/grad123/789",
+			kind:       xuetangURLCourse,
+			host:       "www.gradsmartedu.cn",
+			sign:       "grad123",
+			cid:        "789",
+			wantOrigin: "https://www.gradsmartedu.cn",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.raw, func(t *testing.T) {
+			got := parseURL(tt.raw)
+			if got.kind != tt.kind || got.host != tt.host || got.sign != tt.sign || got.cid != tt.cid || got.tid != tt.tid {
+				t.Fatalf("parseURL() = %#v, want kind=%s host=%s sign=%s cid=%s tid=%s", got, tt.kind, tt.host, tt.sign, tt.cid, tt.tid)
+			}
+			if origin := xuetangOrigin(got.host); origin != tt.wantOrigin {
+				t.Fatalf("xuetangOrigin(%q) = %q, want %q", got.host, origin, tt.wantOrigin)
+			}
+		})
+	}
+}

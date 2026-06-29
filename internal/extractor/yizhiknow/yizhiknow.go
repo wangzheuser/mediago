@@ -442,18 +442,18 @@ func (x *yzContext) resolveLesson(lesson yzLesson) []*extractor.MediaInfo {
 	if len(urls) > 0 {
 		u := urls[0]
 		format := pickFormat(u)
+		stream := extractor.Stream{
+			Quality: "best",
+			URLs:    []string{u},
+			Format:  format,
+			Headers: map[string]string{"Referer": refererURL},
+		}
+		stream.NeedMerge = format == "m3u8"
 		entries = append(entries, &extractor.MediaInfo{
-			Site:  "yizhiknow",
-			Title: lesson.Title,
-			Streams: map[string]extractor.Stream{
-				"default": {
-					Quality: "best",
-					URLs:    []string{u},
-					Format:  format,
-					Headers: map[string]string{"Referer": refererURL},
-				},
-			},
-			Extra: map[string]any{"lesson_id": lesson.ID},
+			Site:    "yizhiknow",
+			Title:   lesson.Title,
+			Streams: map[string]extractor.Stream{"default": stream},
+			Extra:   map[string]any{"lesson_id": lesson.ID},
 		})
 	}
 

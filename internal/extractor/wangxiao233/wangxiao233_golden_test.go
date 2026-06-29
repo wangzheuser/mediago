@@ -178,6 +178,10 @@ func TestExtractMock(t *testing.T) {
 			writeFixture(t, w, fixtures, "version")
 		case r.Host == "japi.233.com" && r.Method == http.MethodGet && r.URL.Path == "/ess-study-api/learn/do/list-chapter-by-version-id":
 			writeFixture(t, w, fixtures, "chapter")
+		case r.Host == "japi.233.com" && r.Method == http.MethodPost && r.URL.Path == "/ess-study-api/datum-api/page-list":
+			writeFixture(t, w, fixtures, "datum")
+		case r.Host == "japi.233.com" && r.Method == http.MethodPost && r.URL.Path == "/ess-study-api/datum-api/do/page-list":
+			writeFixture(t, w, fixtures, "datum")
 		default:
 			t.Errorf("unexpected request: %s %s%s", r.Method, r.Host, r.URL.String())
 			http.NotFound(w, r)

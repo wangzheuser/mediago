@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"strconv"
 	"strings"
 )
 
@@ -240,6 +241,9 @@ func cookieHeader(jar http.CookieJar, bases []string) string {
 	return strings.Join(parts, "; ")
 }
 func decodeAccessToken(cookie string) string {
+	return decodeSmarteduAuth(cookie).accessToken
+}
+func decodeSmarteduAuth(cookie string) smarteduAuth {
 	for _, part := range strings.Split(cookie, ";") {
 		kv := strings.SplitN(strings.TrimSpace(part), "=", 2)
 		if len(kv) != 2 || (kv[0] != "UC_TOKEN" && !strings.HasPrefix(kv[0], "UC_TOKEN-")) {
@@ -252,8 +256,16 @@ func decodeAccessToken(cookie string) string {
 		}
 		var m map[string]any
 		if json.Unmarshal(b, &m) == nil {
-			return str(m["access_token"])
+			auth := smarteduAuth{
+				accessToken:  str(m["access_token"]),
+				refreshToken: str(m["refresh_token"]),
+				macKey:       str(m["mac_key"]),
+			}
+			if d := str(m["diff"]); d != "" {
+				auth.diff, _ = strconv.ParseInt(d, 10, 64)
+			}
+			return auth
 		}
 	}
-	return ""
+	return smarteduAuth{}
 }

@@ -250,8 +250,8 @@ func resourceFromMap(m map[string]any) (chaoxingResource, bool) {
 		LiveID:   firstFieldString(m, "liveId", "liveid"),
 		JobID:    firstFieldString(m, "jobid", "jobId"),
 		UUID:     firstFieldString(m, "uuid"),
-		RawURL:   normalizeURL(firstFieldString(m, "url", "downloadUrl", "downloadURL", "statusUrl", "loadurl", "fileUrl")),
-		Ext:      firstFieldString(m, "type", "suffix", "ext", "fileType"),
+		RawURL:   normalizeURL(firstFieldString(m, "url", "downloadUrl", "downloadURL", "statusUrl", "loadurl", "fileUrl", "playUrl", "linkUrl", "uploadUrl", "http", "httphd", "httpmd")),
+		Ext:      firstFieldString(m, "type", "suffix", "ext", "fileType", "fileExtension", "extension"),
 	}
 	if res.UUID == "" && res.RawURL != "" {
 		res.UUID = regexpFirst(res.RawURL, `appswh\.chaoxing\.com/.*?/view/([\w-]+)`)

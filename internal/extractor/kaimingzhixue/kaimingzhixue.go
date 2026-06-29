@@ -79,6 +79,9 @@ func (s *Kaimingzhixue) Extract(rawURL string, opts *extractor.ExtractOpts) (*ex
 		courseType = courses[0].CourseType
 		title = courses[0].Title
 	}
+	if cid == "" && len(courses) > 1 {
+		return &extractor.MediaInfo{Site: "kaimingzhixue", Title: "kaimingzhixue_courses", Entries: kaimingCourseEntries(courses)}, nil
+	}
 	if cid == "" {
 		return nil, fmt.Errorf("cannot parse kaimingzhixue course id from URL: %s", rawURL)
 	}
@@ -212,10 +215,12 @@ type kzxCourse struct {
 func fetchKaimingCourseList(c *util.Client, headers map[string]string) ([]kzxCourse, error) {
 	var out []kzxCourse
 	seen := map[string]bool{}
+	var lastErr error
 	for _, courseType := range []string{"1", "2", "3", "11"} {
 		data, err := kzxAPIGet[any](c, fmt.Sprintf(urlCourseList, courseType), map[string]string{"type": "open"}, headers)
 		if err != nil {
-			return nil, fmt.Errorf("kaimingzhixue course list type=%s: %w", courseType, err)
+			lastErr = fmt.Errorf("kaimingzhixue course list type=%s: %w", courseType, err)
+			continue
 		}
 		for _, rec := range extractRecords(data) {
 			id := firstText(mapLookup(rec, "course_id"), mapLookup(rec, "id"))
@@ -227,9 +232,28 @@ func fetchKaimingCourseList(c *util.Client, headers map[string]string) ([]kzxCou
 		}
 	}
 	if len(out) == 0 {
+		if lastErr != nil {
+			return nil, lastErr
+		}
 		return nil, fmt.Errorf("kaimingzhixue: empty myStudy course list")
 	}
 	return out, nil
+}
+
+func kaimingCourseEntries(courses []kzxCourse) []*extractor.MediaInfo {
+	entries := make([]*extractor.MediaInfo, 0, len(courses))
+	for _, course := range courses {
+		if course.ID == "" {
+			continue
+		}
+		extra := map[string]any{"course_id": course.ID, "course_type": course.CourseType}
+		if course.Price != nil {
+			extra["price"] = course.Price
+		}
+		title := firstText(course.Title, "kaimingzhixue_"+course.ID)
+		entries = append(entries, &extractor.MediaInfo{Site: "kaimingzhixue", Title: title, Extra: extra})
+	}
+	return entries
 }
 
 func chooseKaimingCourse(courses []kzxCourse, cid string) (courseType, title string) {
@@ -487,7 +511,7 @@ func buildKaimingEntry(c *util.Client, headers map[string]string, item kzxItem, 
 		if streamKey == "" {
 			streamKey = "file"
 		}
-		stream := extractor.Stream{Quality: streamKey, URLs: []string{item.FileURL}, Format: item.FileFmt, Headers: map[string]string{"Referer": urlReferer}}
+		stream := extractor.Stream{Quality: streamKey, URLs: []string{item.FileURL}, Format: item.FileFmt, Headers: downloadHeaders(headers, urlReferer)}
 		return &extractor.MediaInfo{Site: "kaimingzhixue", Title: entryTitle, Streams: map[string]extractor.Stream{streamKey: stream}, Extra: map[string]any{"type": "file", "file_url": item.FileURL}}, nil
 	}
 
@@ -505,7 +529,7 @@ func buildKaimingEntry(c *util.Client, headers map[string]string, item kzxItem, 
 		return nil, err
 	}
 	format := mediaExt(mediaURL)
-	stream := extractor.Stream{Quality: "best", URLs: []string{mediaURL}, Format: format, Headers: map[string]string{"Referer": urlReferer}}
+	stream := extractor.Stream{Quality: "best", URLs: []string{mediaURL}, Format: format, Headers: downloadHeaders(headers, urlReferer)}
 	if format == "m3u8" {
 		stream.NeedMerge = true
 	}
@@ -681,7 +705,22 @@ func normalizeURL(raw string) string {
 	if strings.HasPrefix(raw, "//") {
 		return "https:" + raw
 	}
+	if strings.HasPrefix(raw, "/") {
+		return strings.TrimRight(urlReferer, "/") + raw
+	}
+	raw = strings.ReplaceAll(raw, `\/`, "/")
+	raw = strings.ReplaceAll(raw, " ", "%20")
 	return raw
+}
+
+func downloadHeaders(source map[string]string, referer string) map[string]string {
+	h := map[string]string{"Referer": referer}
+	for _, key := range []string{"cookie", "Cookie", "Authorization", "SchoolID", "DeviceID", "DeviceType"} {
+		if value := source[key]; value != "" {
+			h[key] = value
+		}
+	}
+	return h
 }
 
 func studentTokenFromJar(jar http.CookieJar) string {

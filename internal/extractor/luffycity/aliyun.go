@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Sophomoresty/mediago/internal/extractor/shared"
 	"github.com/Sophomoresty/mediago/internal/util"
 )
 
@@ -76,11 +77,52 @@ func luffyResolveAliyun(c *util.Client, sess *luffySession, authInfo map[string]
 	if r := firstText(authInfo["regionId"], authInfo["region"], payload["domain_region"]); r != "" {
 		payload["domain_region"] = r
 	}
+	if sharedSrc := luffyResolveAliyunShared(c, sess, payload, videoID); sharedSrc.URL != "" {
+		return sharedSrc
+	}
 	resp := luffyRequestAliyunPlayInfo(c, sess, payload, videoID)
 	if src := luffyExtractAliyunPlayResponse(resp); src.URL != "" {
 		return src
 	}
 	return luffySource{}
+}
+
+func luffyResolveAliyunShared(c *util.Client, sess *luffySession, payload map[string]any, videoID string) luffySource {
+	p := shared.AliyunPlayPayload{
+		AccessKeyID:     firstText(payload["access_id"]),
+		AccessKeySecret: firstText(payload["access_secret"]),
+		SecurityToken:   firstText(payload["sts_token"]),
+		Region:          firstText(payload["domain_region"]),
+		AuthInfo:        firstText(payload["auth_info"]),
+		AuthTimeout:     firstText(payload["auth_timeout"], "7200"),
+		Raw:             payload["raw"],
+	}
+	if p.AccessKeyID == "" || p.AccessKeySecret == "" || p.SecurityToken == "" || p.Region == "" || p.AuthInfo == "" {
+		return luffySource{}
+	}
+	opts := shared.AliyunPlayOptions{
+		Referer:           urlReferer,
+		Origin:            urlOrigin,
+		Quality:           "",
+		FetchM3U8:         true,
+		RewriteM3U8Keys:   true,
+		PreferDefinitions: []string{"4K", "2K", "OD", "FHD", "HD", "SD", "LD", "FD"},
+		Headers: map[string]string{
+			"Accept":     "application/json, text/plain, */*",
+			"Referer":    urlReferer,
+			"Origin":     urlOrigin,
+			"User-Agent": sess.Headers["User-Agent"],
+		},
+	}
+	info, err := shared.AliyunResolvePlayInfo(c, p, videoID, opts)
+	if err != nil || info == nil || info.URL == "" {
+		return luffySource{}
+	}
+	extra := map[string]any{"aliyun_api": info.APIURL, "source_type": info.SourceType, "definition": info.Definition}
+	if info.M3U8Text != "" {
+		extra["m3u8_text"] = info.M3U8Text
+	}
+	return luffySource{URL: info.URL, Type: firstText(info.SourceType, info.Format, mediaExt(info.URL)), Size: info.Size, Extra: extra}
 }
 
 func luffyRequestAliyunPlayInfo(c *util.Client, sess *luffySession, payload map[string]any, videoID string) map[string]any {

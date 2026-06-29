@@ -103,7 +103,7 @@ func mddclassCollectCoursewareInfo(value any, out map[string]any, depth int) {
 				mddclassCollectCoursewareInfo(nested, out, depth+1)
 			}
 		}
-		for _, pair := range [][2]string{{"tenantId", "tenantId"}, {"tenant_id", "tenantId"}, {"userSign", "userSign"}, {"user_sign", "userSign"}, {"ocsId", "coursewareId"}, {"coursewareId", "coursewareId"}, {"ocs_id", "coursewareId"}, {"courseware_id", "coursewareId"}, {"courseWareId", "coursewareId"}, {"courseId", "courseId"}, {"course_id", "courseId"}, {"videoId", "videoId"}, {"video_id", "videoId"}, {"contentId", "videoId"}, {"content_id", "videoId"}, {"sourceType", "sourceType"}, {"source_type", "sourceType"}, {"contentType", "contentType"}, {"content_type", "contentType"}, {"companyId", "companyId"}, {"company_id", "companyId"}, {"sellerId", "companyId"}, {"seller_id", "companyId"}, {"userSignKey", "userSignKey"}, {"user_sign_key", "userSignKey"}, {"xUserSign", "userSign"}, {"signature", "userSign"}, {"sign", "userSign"}, {"videoUrl", "videoUrl"}, {"playUrl", "videoUrl"}, {"m3u8Url", "videoUrl"}, {"hlsUrl", "videoUrl"}, {"mediaUrl", "videoUrl"}, {"mediaURL", "videoUrl"}, {"mp4URL", "videoUrl"}, {"downloadUrl", "videoUrl"}, {"url", "videoUrl"}} {
+		for _, pair := range [][2]string{{"tenantId", "tenantId"}, {"tenant_id", "tenantId"}, {"userSign", "userSign"}, {"user_sign", "userSign"}, {"ocsId", "coursewareId"}, {"coursewareId", "coursewareId"}, {"courseware_id", "coursewareId"}, {"ocs_id", "coursewareId"}, {"courseWareId", "coursewareId"}, {"courseId", "courseId"}, {"course_id", "courseId"}, {"videoId", "videoId"}, {"video_id", "videoId"}, {"contentId", "videoId"}, {"content_id", "videoId"}, {"sourceType", "sourceType"}, {"source_type", "sourceType"}, {"contentType", "contentType"}, {"content_type", "contentType"}, {"companyId", "companyId"}, {"company_id", "companyId"}, {"sellerId", "companyId"}, {"seller_id", "companyId"}, {"gatewayCompanyId", "companyId"}, {"gateway_company_id", "companyId"}, {"userSignKey", "userSignKey"}, {"user_sign_key", "userSignKey"}, {"xUserSign", "userSign"}, {"signature", "userSign"}, {"sign", "userSign"}, {"ocsAccessToken", "ocsAccessToken"}, {"ocs_access_token", "ocsAccessToken"}, {"ocsPlayerAccessToken", "ocsAccessToken"}, {"playerAccessToken", "ocsAccessToken"}, {"player_access_token", "ocsAccessToken"}, {"videoUrl", "videoUrl"}, {"playUrl", "videoUrl"}, {"play_url", "videoUrl"}, {"m3u8Url", "videoUrl"}, {"m3u8_url", "videoUrl"}, {"hlsUrl", "videoUrl"}, {"hls_url", "videoUrl"}, {"mediaUrl", "videoUrl"}, {"mediaURL", "videoUrl"}, {"mp4URL", "videoUrl"}, {"mp4Url", "videoUrl"}, {"downloadUrl", "videoUrl"}, {"download_url", "videoUrl"}, {"sourceUrl", "videoUrl"}, {"sourceURL", "videoUrl"}, {"resourceUrl", "videoUrl"}, {"fileUrl", "videoUrl"}, {"url", "videoUrl"}, {"path", "videoPath"}, {"filePath", "videoPath"}, {"mediaPath", "videoPath"}, {"resourcePath", "videoPath"}, {"sourcePath", "videoPath"}, {"playPath", "videoPath"}, {"hlsPath", "videoPath"}, {"m3u8Path", "videoPath"}, {"mp4Path", "videoPath"}, {"objectKey", "videoPath"}, {"key", "videoPath"}} {
 			if current := mddclassFirstText(out[pair[1]]); current == "" {
 				if value := mddclassFirstText(m[pair[0]]); value != "" {
 					out[pair[1]] = value
@@ -136,8 +136,13 @@ func mddclassFindMediaURLDepth(value any, depth int) string {
 		return ""
 	}
 	if m, ok := value.(map[string]any); ok {
-		for _, key := range []string{"videoUrl", "playUrl", "m3u8Url", "hlsUrl", "mediaUrl", "mediaURL", "mp4URL", "downloadUrl"} {
+		for _, key := range []string{"videoUrl", "playUrl", "play_url", "m3u8Url", "m3u8_url", "hlsUrl", "hls_url", "mediaUrl", "mediaURL", "mp4URL", "mp4Url", "downloadUrl", "download_url", "sourceUrl", "sourceURL", "resourceUrl", "fileUrl"} {
 			if u := mddclassNormalizeMediaURL(mddclassFirstText(m[key])); u != "" && !mddclassIsPlaceholderURL(u) {
+				return u
+			}
+		}
+		for _, key := range []string{"path", "filePath", "mediaPath", "resourcePath", "sourcePath", "playPath", "hlsPath", "m3u8Path", "mp4Path", "objectKey"} {
+			if u := mddclassNormalizeOCSResourceURL(mddclassFirstText(m[key])); u != "" && !mddclassIsPlaceholderURL(u) && mddclassLooksLikeMediaURL(u) {
 				return u
 			}
 		}

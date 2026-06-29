@@ -23,32 +23,26 @@
 //	url_video_change      = "https://newbase.zhihuishu.com/video/changeVideoLine"
 //	url_course_resource   = "https://ai-course-platform.zhihuishu.com/api/v1/coursehome/AtlasCourseResource/queryCourseResourceInfo"
 //	url_course_preview    = "https://coursehome.zhihuishu.com/home/resource/queryPreviewFilePath/{}/{}"
-//
-// BLOCKED: _post_encrypted requires RSA + AES server-side key exchange
-// (appcomm-user.zhihuishu.com/app-commserv-user/c/has) to obtain a per-session
-// AES key, then all API calls encrypt their POST body with that key.
-// The RSA public key is hardcoded but the server returns an RSA-encrypted
-// symmetric key that must be decrypted with the same public key's modulus+exponent
-// (a non-standard "verify" operation). This requires crypto/rsa and the exact
-// server-side protocol. The knowledge-dic and node-resources APIs all go through
-// this encrypted channel.
-//
-// We implement what is possible without the encrypted channel:
-// - URL routing and ID extraction
-// - Course resource tree download (url_course_resource / url_course_preview)
-//   which uses plain POST, not _post_encrypted
-// - Video URL resolution via initVideoNew + changeVideoLine (query params, not encrypted)
-//
-// The knowledge graph APIs (_get_infos, _get_node_resources) require the encrypted
-// channel and will return a "blocked" error explaining why.
 package zhihuishu
 
 import (
+	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
+	"math/big"
+	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Sophomoresty/mediago/internal/extractor"
 	"github.com/Sophomoresty/mediago/internal/util"
@@ -68,6 +62,8 @@ const (
 	urlSmartVideoChange     = "https://newbase.zhihuishu.com/video/changeVideoLine"
 	urlSmartCourseResource  = "https://ai-course-platform.zhihuishu.com/api/v1/coursehome/AtlasCourseResource/queryCourseResourceInfo"
 	urlSmartCoursePreview   = "https://coursehome.zhihuishu.com/home/resource/queryPreviewFilePath/%s/%s"
+	urlSmartHasAESKey       = "https://appcomm-user.zhihuishu.com/app-commserv-user/c/has"
+	smartRSAPublicKeyB64    = "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCgfZmpLpPEpEFRKBe+ZjWJUjPe+7qg7pGqcfN3j2egJ8H2mrKwaEqZEnPnpi2O3hN8HRyaFozDOp8gwZiYfiIZjWy0Jr/FNAiiKYh5bq0GsEn+ieMmRyJg/+i1rqizhvCXvFdrdGhFTw5EBwTpsGdwe1utdlrvIJUAFWj9Yh4qbQIDAQAB"
 )
 
 var smartHostRe = regexp.MustCompile(`(?i)(?:ai-smart-course-student-pro|smartcoursestudent|wisdomh5)\.zhihuishu\.com`)
@@ -129,11 +125,6 @@ func parseSmartURL(rawURL string) smartContext {
 	return ctx
 }
 
-// extractSmart implements the Zhihuishu_Smart flow.
-//
-// The knowledge graph APIs require an encrypted channel (_post_encrypted) that
-// needs RSA key exchange with the server. We extract what is possible via the
-// unencrypted course resource APIs and video resolution.
 func extractSmart(rawURL string, opts *extractor.ExtractOpts) (*extractor.MediaInfo, error) {
 	ctx := parseSmartURL(rawURL)
 	if ctx.cid == "" && ctx.mapUID == "" {
@@ -143,14 +134,31 @@ func extractSmart(rawURL string, opts *extractor.ExtractOpts) (*extractor.MediaI
 	c := util.NewClient()
 	c.SetCookieJar(opts.Cookies)
 	h := zhihuishuHeaders("https://ai-smart-course-student-pro.zhihuishu.com/")
+	cookie := smartCookieHeader(opts.Cookies)
+	if cookie != "" {
+		h["Cookie"] = cookie
+	}
+	session := &smartSession{c: c, h: h, cookie: cookie}
 
 	title := "zhihuishu_smart_" + firstNonEmpty(ctx.cid, ctx.mapUID)
+	if resolved := session.resolveTitle(&ctx); resolved != "" {
+		title = resolved
+	}
 
-	// Try to get course resources via the non-encrypted course resource API.
-	// This is the url_course_resource endpoint which uses plain POST.
 	var entries []*extractor.MediaInfo
 	if ctx.cid != "" {
-		entries = collectSmartCourseResources(c, ctx.cid, h)
+		entries = append(entries, collectSmartCourseResources(c, ctx.cid, h)...)
+	}
+	var encryptedErr error
+	if nodeEntries, err := session.collectNodeEntries(ctx); err == nil {
+		entries = append(entries, nodeEntries...)
+	} else {
+		encryptedErr = err
+	}
+	if taskEntries, err := session.collectTaskEntries(ctx); err == nil {
+		entries = append(entries, taskEntries...)
+	} else if encryptedErr == nil {
+		encryptedErr = err
 	}
 
 	if len(entries) > 0 {
@@ -168,15 +176,10 @@ func extractSmart(rawURL string, opts *extractor.ExtractOpts) (*extractor.MediaI
 		}, nil
 	}
 
-	// If no course resources found, the knowledge graph APIs would be needed.
-	// These require the encrypted channel which we cannot implement without
-	// the server-side RSA key exchange.
-	return nil, fmt.Errorf("zhihuishu smart course %s: knowledge graph APIs require encrypted channel "+
-		"(_post_encrypted with RSA key exchange via appcomm-user.zhihuishu.com/app-commserv-user/c/has). "+
-		"The server returns an RSA-encrypted AES key that must be decrypted to encrypt all subsequent API payloads. "+
-		"Course resource tree (non-encrypted) returned no downloadable items. "+
-		"This is a genuinely unrecoverable DRM/crypto flow without implementing the full RSA+AES protocol",
-		firstNonEmpty(ctx.cid, ctx.mapUID))
+	if encryptedErr != nil {
+		return nil, fmt.Errorf("zhihuishu smart course %s returned no downloadable items; encrypted knowledge APIs failed: %w", firstNonEmpty(ctx.cid, ctx.mapUID), encryptedErr)
+	}
+	return nil, fmt.Errorf("zhihuishu smart course %s returned no downloadable items", firstNonEmpty(ctx.cid, ctx.mapUID))
 }
 
 // collectSmartCourseResources uses the non-encrypted course resource API
@@ -217,18 +220,18 @@ func getSmartCourseResourceList(c *util.Client, cid, folderID string, h map[stri
 }
 
 type smartResourceItem struct {
-	DataType           string      `json:"dataType"`
-	ResourcesDataType  string      `json:"resourcesDataType"`
-	FolderID           string      `json:"folderId"`
-	Name               string      `json:"name"`
-	ResourcesName      string      `json:"resourcesName"`
-	URL                string      `json:"url"`
-	ResourcesURL       string      `json:"resourcesUrl"`
-	FileID             string      `json:"fileId"`
-	ResourcesFileID    string      `json:"resourcesFileId"`
-	Suffix             string      `json:"suffix"`
-	ResourcesSuffix    string      `json:"resourcesSuffix"`
-	Size               json.Number `json:"size"`
+	DataType          string      `json:"dataType"`
+	ResourcesDataType string      `json:"resourcesDataType"`
+	FolderID          string      `json:"folderId"`
+	Name              string      `json:"name"`
+	ResourcesName     string      `json:"resourcesName"`
+	URL               string      `json:"url"`
+	ResourcesURL      string      `json:"resourcesUrl"`
+	FileID            string      `json:"fileId"`
+	ResourcesFileID   string      `json:"resourcesFileId"`
+	Suffix            string      `json:"suffix"`
+	ResourcesSuffix   string      `json:"resourcesSuffix"`
+	Size              json.Number `json:"size"`
 }
 
 func walkSmartResourceTree(c *util.Client, cid string, items []smartResourceItem, h map[string]string, visited map[string]bool, prefix string) []*extractor.MediaInfo {
@@ -424,4 +427,531 @@ func getSmartVideoURL(c *util.Client, fileID, fallbackURL string, h map[string]s
 	// Return the last URL (typically highest quality, matching source logic
 	// which sorts by Content-Length and picks [-1] for HD)
 	return urls[len(urls)-1]
+}
+
+type smartSession struct {
+	c      *util.Client
+	h      map[string]string
+	cookie string
+	aesKey string
+}
+
+type smartNode struct {
+	id   string
+	name string
+	path string
+}
+
+func (s *smartSession) resolveTitle(ctx *smartContext) string {
+	if ctx.mapUID != "" {
+		root, err := s.postEncrypted(urlSmartMapDetail, map[string]any{"mapUid": ctx.mapUID})
+		if err != nil {
+			return ""
+		}
+		return smartMapDetailTitle(root)
+	}
+	if ctx.cid == "" || ctx.classID != "" {
+		return ""
+	}
+	root, err := s.postEncrypted(urlSmartGetMapUID, map[string]any{"courseId": ctx.cid})
+	if err != nil {
+		return ""
+	}
+	data := smartMap(root["data"])
+	if uid := firstNonEmpty(smartString(data["scMapUid"]), smartString(data["mapUid"])); uid != "" {
+		if detail, err := s.postEncrypted(urlSmartMapDetail, map[string]any{"mapUid": uid}); err == nil {
+			if title := smartMapDetailTitle(detail); title != "" {
+				return title
+			}
+		}
+	}
+	return sanitize(firstNonEmpty(smartString(data["mapName"]), ""))
+}
+
+func (s *smartSession) collectNodeEntries(ctx smartContext) ([]*extractor.MediaInfo, error) {
+	nodes, err := s.smartNodes(ctx)
+	if err != nil || len(nodes) == 0 {
+		return nil, err
+	}
+	var out []*extractor.MediaInfo
+	for i, node := range nodes {
+		resources, err := s.nodeResources(ctx, node.id)
+		if err != nil {
+			continue
+		}
+		prefix := fmt.Sprintf("%d", i+1)
+		if node.path != "" {
+			prefix = node.path
+		}
+		out = append(out, smartResourcesToEntries(s.c, ctx.cid, resources, s.h, prefix, node.name, map[string]any{"node_id": node.id})...)
+	}
+	return out, nil
+}
+
+func (s *smartSession) smartNodes(ctx smartContext) ([]smartNode, error) {
+	if ctx.mapUID != "" {
+		root, err := s.postEncrypted(urlSmartMapKnowledgeDic, map[string]any{"mapUid": ctx.mapUID})
+		if err != nil {
+			return nil, err
+		}
+		return smartNodesFromThemes(smartList(smartMap(root["data"])["themeList"]), true), nil
+	}
+	if ctx.cid == "" || ctx.classID == "" {
+		return nil, nil
+	}
+	payload := map[string]any{
+		"dateFormate": time.Now().UnixMilli(),
+		"uuid":        smartUUIDFromCookie(s.cookie),
+		"classId":     ctx.classID,
+		"courseId":    ctx.cid,
+	}
+	root, err := s.postEncrypted(urlSmartKnowledgeDic, payload)
+	if err != nil {
+		return nil, err
+	}
+	return smartNodesFromThemes(smartList(smartMap(root["data"])["themeList"]), false), nil
+}
+
+func smartNodesFromThemes(themes []map[string]any, mapMode bool) []smartNode {
+	var out []smartNode
+	for ti, theme := range themes {
+		themeName := sanitize(firstNonEmpty(smartString(theme["themeName"]), "主题"))
+		themePrefix := fmt.Sprintf("%d", ti+1)
+		if mapMode {
+			out = append(out, smartKnowledgeNodes(smartList(theme["knowledgeList"]), themePrefix, themeName)...)
+			continue
+		}
+		subThemes := smartList(theme["subThemeList"])
+		if len(subThemes) == 0 {
+			out = append(out, smartKnowledgeNodes(smartList(theme["knowledgeList"]), themePrefix, themeName)...)
+			continue
+		}
+		for si, sub := range subThemes {
+			subName := sanitize(firstNonEmpty(smartString(sub["themeName"]), "default"))
+			prefix := themePrefix
+			group := themeName
+			if subName != "" && !strings.EqualFold(subName, "default") && len(subThemes) > 1 {
+				prefix = fmt.Sprintf("%s.%d", themePrefix, si+1)
+				group = themeName + "--" + subName
+			}
+			out = append(out, smartKnowledgeNodes(smartList(sub["knowledgeList"]), prefix, group)...)
+		}
+	}
+	return out
+}
+
+func smartKnowledgeNodes(list []map[string]any, prefix, group string) []smartNode {
+	var out []smartNode
+	for i, item := range list {
+		id := smartString(item["knowledgeId"])
+		if id == "" {
+			continue
+		}
+		name := sanitize(firstNonEmpty(smartString(item["knowledgeName"]), "知识点"))
+		path := fmt.Sprintf("%s.%d", prefix, i+1)
+		out = append(out, smartNode{id: id, name: name, path: path + "--" + firstNonEmpty(group, name)})
+	}
+	return out
+}
+
+func (s *smartSession) nodeResources(ctx smartContext, nodeID string) ([]map[string]any, error) {
+	if nodeID == "" {
+		return nil, nil
+	}
+	payload := map[string]any{
+		"dateFormate": time.Now().UnixMilli(),
+		"uuid":        smartUUIDFromCookie(s.cookie),
+	}
+	endpoint := urlSmartNodeResources
+	if ctx.mapUID != "" {
+		payload["mapUid"] = ctx.mapUID
+		payload["nodeUid"] = nodeID
+		endpoint = urlSmartWisdomResources
+	} else {
+		payload["classId"] = ctx.classID
+		payload["courseId"] = ctx.cid
+		payload["knowledgeId"] = nodeID
+	}
+	root, err := s.postEncrypted(endpoint, payload)
+	if err != nil {
+		return nil, err
+	}
+	code := smartString(root["code"])
+	if code != "" && code != "200" && code != "0" {
+		return nil, nil
+	}
+	data := smartMap(root["data"])
+	if list := smartList(data["resourcesList"]); len(list) > 0 {
+		return list, nil
+	}
+	return smartList(root["data"]), nil
+}
+
+func (s *smartSession) collectTaskEntries(ctx smartContext) ([]*extractor.MediaInfo, error) {
+	if ctx.cid == "" || ctx.classID == "" {
+		return nil, nil
+	}
+	root, err := s.postEncrypted(urlSmartTaskList, map[string]any{"courseId": ctx.cid, "classId": ctx.classID})
+	if err != nil {
+		return nil, err
+	}
+	tasks := smartList(root["data"])
+	var out []*extractor.MediaInfo
+	for i, task := range tasks {
+		taskID := firstNonEmpty(smartString(task["taskId"]), smartString(task["id"]))
+		if taskID == "" {
+			continue
+		}
+		detail, _ := s.postEncrypted(urlSmartTaskDetail, map[string]any{"courseId": ctx.cid, "classId": ctx.classID, "taskId": taskID})
+		resRoot, err := s.postEncrypted(urlSmartTaskResources, map[string]any{"courseId": ctx.cid, "taskId": taskID})
+		if err != nil {
+			continue
+		}
+		taskName := firstNonEmpty(smartString(smartMap(detail["data"])["taskName"]), smartString(task["taskName"]), "资料任务")
+		extra := map[string]any{"task_id": taskID}
+		out = append(out, smartResourcesToEntries(s.c, ctx.cid, smartList(resRoot["data"]), s.h, fmt.Sprintf("task.%d", i+1), taskName, extra)...)
+	}
+	return out, nil
+}
+
+func smartResourcesToEntries(c *util.Client, cid string, resources []map[string]any, h map[string]string, prefix, group string, extraBase map[string]any) []*extractor.MediaInfo {
+	var out []*extractor.MediaInfo
+	for i, item := range resources {
+		dataType := firstNonEmpty(smartString(item["dataType"]), smartString(item["resourcesDataType"]))
+		if dataType == "21" {
+			continue
+		}
+		fileURL := smartHTTPURL(firstNonEmpty(smartString(item["resourcesUrl"]), smartString(item["url"]), smartString(item["fileUrl"]), smartString(item["downloadUrl"])))
+		fileID := firstNonEmpty(smartString(item["resourcesFileId"]), smartString(item["fileId"]), smartString(item["videoId"]))
+		if cid != "" && fileID != "" && (fileURL == "" || strings.Contains(fileURL, "/able-commons/resources/") || strings.Contains(fileURL, "swfReader.jsp")) {
+			if resolved := getSmartCourseFileURL(c, cid, fileID, h); resolved != "" {
+				fileURL = resolved
+			}
+		}
+		suffix := strings.TrimPrefix(strings.ToLower(firstNonEmpty(smartString(item["resourcesSuffix"]), smartString(item["suffix"]))), ".")
+		if dataType == "22" || dataType == "video" {
+			suffix = "mp4"
+		}
+		if suffix == "mp4" && fileID != "" {
+			fileURL = getSmartVideoURL(c, fileID, fileURL, h)
+		}
+		if fileURL == "" {
+			continue
+		}
+		name := sanitize(firstNonEmpty(smartString(item["resourcesName"]), smartString(item["name"]), smartString(item["title"]), "资源"))
+		entryTitle := fmt.Sprintf("(%s.%d)--%s", prefix, i+1, name)
+		if group != "" {
+			entryTitle = fmt.Sprintf("(%s.%d)--%s--%s", prefix, i+1, sanitize(group), name)
+		}
+		format := suffix
+		if format == "" {
+			format = pickFormat(fileURL)
+		}
+		extra := map[string]any{"resource_file_id": fileID, "resource_data_type": dataType}
+		for k, v := range extraBase {
+			extra[k] = v
+		}
+		out = append(out, &extractor.MediaInfo{
+			Site:  "zhihuishu",
+			Title: entryTitle,
+			Streams: map[string]extractor.Stream{
+				"default": {
+					Quality:   "best",
+					URLs:      []string{fileURL},
+					Format:    format,
+					NeedMerge: format == "m3u8",
+					Headers:   h,
+				},
+			},
+			Extra: extra,
+		})
+	}
+	return out
+}
+
+func (s *smartSession) postEncrypted(endpoint string, data map[string]any) (map[string]any, error) {
+	if s.aesKey == "" {
+		key, err := smartGetAESKey(s.c, s.cookie)
+		if err != nil {
+			return nil, err
+		}
+		s.aesKey = key
+	}
+	plain, err := smartCompactJSON(data)
+	if err != nil {
+		return nil, err
+	}
+	secret, err := smartAESEncrypt(s.aesKey, plain)
+	if err != nil {
+		return nil, err
+	}
+	headerToken, _ := smartAESEncrypt(s.aesKey, "")
+	payload := map[string]any{"secretStr": secret, "date": time.Now().UnixMilli()}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	h := smartCloneHeaders(s.h)
+	h["Content-Type"] = "application/json;charset=UTF-8"
+	h["XQJZXHIZ"] = headerToken
+	resp, err := s.c.Post(endpoint, bytes.NewReader(body), h)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, endpoint)
+	}
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	var root map[string]any
+	if err := json.Unmarshal(raw, &root); err != nil {
+		return nil, err
+	}
+	return root, nil
+}
+
+func smartGetAESKey(c *util.Client, cookie string) (string, error) {
+	pub, err := smartRSAPublicKey()
+	if err != nil {
+		return "", err
+	}
+	requestJSON, _ := smartCompactJSON(map[string]any{"module": 6})
+	encrypted, err := rsa.EncryptPKCS1v15(rand.Reader, pub, []byte(requestJSON))
+	if err != nil {
+		return "", err
+	}
+	hasURL := urlSmartHasAESKey + "?uid=" + url.QueryEscape(base64.StdEncoding.EncodeToString(encrypted))
+	h := map[string]string{
+		"Referer":    "https://ai-smart-course-student-pro.zhihuishu.com/",
+		"User-Agent": "Mozilla/5.0",
+	}
+	if cookie != "" {
+		h["Cookie"] = cookie
+	}
+	body, err := c.GetString(hasURL, h)
+	if err != nil {
+		return "", err
+	}
+	var root map[string]any
+	if err := json.Unmarshal([]byte(body), &root); err != nil {
+		return "", err
+	}
+	sl := smartString(smartMap(root["rt"])["sl"])
+	if sl == "" {
+		return "", fmt.Errorf("zhihuishu smart AES key response missing rt.sl")
+	}
+	ciphertext, err := base64.StdEncoding.DecodeString(sl)
+	if err != nil {
+		return "", err
+	}
+	keyJSON, err := rsaPublicUnpad(ciphertext, pub)
+	if err != nil {
+		return "", err
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(keyJSON, &decoded); err != nil {
+		return "", err
+	}
+	key := smartString(decoded["cKey"])
+	if key == "" {
+		return "", fmt.Errorf("zhihuishu smart AES key response missing cKey")
+	}
+	return key, nil
+}
+
+func smartRSAPublicKey() (*rsa.PublicKey, error) {
+	der, err := base64.StdEncoding.DecodeString(smartRSAPublicKeyB64)
+	if err != nil {
+		return nil, err
+	}
+	parsed, err := x509.ParsePKIXPublicKey(der)
+	if err != nil {
+		return nil, err
+	}
+	pub, ok := parsed.(*rsa.PublicKey)
+	if !ok {
+		return nil, fmt.Errorf("zhihuishu smart public key is %T, not RSA", parsed)
+	}
+	return pub, nil
+}
+
+func rsaPublicUnpad(ciphertext []byte, pub *rsa.PublicKey) ([]byte, error) {
+	m := new(big.Int).SetBytes(ciphertext)
+	e := big.NewInt(int64(pub.E))
+	out := m.Exp(m, e, pub.N).Bytes()
+	if size := pub.Size(); len(out) < size {
+		padded := make([]byte, size)
+		copy(padded[size-len(out):], out)
+		out = padded
+	}
+	if len(out) >= 3 && out[0] == 0 && out[1] == 1 {
+		if idx := bytes.IndexByte(out[2:], 0); idx >= 0 {
+			return out[idx+3:], nil
+		}
+	}
+	if len(out) >= 2 && out[0] == 1 {
+		if idx := bytes.IndexByte(out[1:], 0); idx >= 0 {
+			return out[idx+2:], nil
+		}
+	}
+	if idx := bytes.IndexByte(out, '{'); idx >= 0 {
+		return out[idx:], nil
+	}
+	return nil, fmt.Errorf("zhihuishu smart AES key RSA block has no JSON payload")
+}
+
+func smartAESEncrypt(key, plaintext string) (string, error) {
+	block, err := aes.NewCipher([]byte(key))
+	if err != nil {
+		return "", err
+	}
+	padded := pkcs7Pad([]byte(plaintext), aes.BlockSize)
+	out := make([]byte, len(padded))
+	cipher.NewCBCEncrypter(block, []byte(zhsAESIV)).CryptBlocks(out, padded)
+	return base64.StdEncoding.EncodeToString(out), nil
+}
+
+func smartCompactJSON(v any) (string, error) {
+	var b bytes.Buffer
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(b.String()), nil
+}
+
+func smartCookieHeader(jar http.CookieJar) string {
+	if jar == nil {
+		return ""
+	}
+	hosts := []string{
+		"https://ai-smart-course-student-pro.zhihuishu.com/",
+		"https://smartcoursestudent.zhihuishu.com/",
+		"https://wisdomh5.zhihuishu.com/",
+		"https://appcomm-user.zhihuishu.com/",
+		"https://kg-ai-run.zhihuishu.com/",
+		"https://kg-knowledge-graph.zhihuishu.com/",
+		"https://www.zhihuishu.com/",
+		"https://zhihuishu.com/",
+	}
+	seen := map[string]bool{}
+	var parts []string
+	for _, raw := range hosts {
+		u, err := url.Parse(raw)
+		if err != nil {
+			continue
+		}
+		for _, ck := range jar.Cookies(u) {
+			key := ck.Name + "=" + ck.Value
+			if ck.Name == "" || seen[key] {
+				continue
+			}
+			seen[key] = true
+			parts = append(parts, key)
+		}
+	}
+	return strings.Join(parts, "; ")
+}
+
+func smartUUIDFromCookie(cookie string) string {
+	for _, part := range strings.Split(cookie, ";") {
+		part = strings.TrimSpace(part)
+		if !strings.HasPrefix(part, "CASLOGC=") {
+			continue
+		}
+		raw := strings.TrimPrefix(part, "CASLOGC=")
+		if decoded, err := url.QueryUnescape(raw); err == nil {
+			raw = decoded
+		}
+		var m map[string]any
+		if json.Unmarshal([]byte(raw), &m) == nil {
+			return smartString(m["uuid"])
+		}
+	}
+	return ""
+}
+
+func smartMapDetailTitle(root map[string]any) string {
+	data := smartMap(root["data"])
+	name := smartString(data["mapName"])
+	school := ""
+	if schools := smartList(data["mapSchoolList"]); len(schools) > 0 {
+		school = smartString(schools[0]["schoolName"])
+	}
+	return sanitize(firstNonEmpty(name, "") + map[bool]string{true: "_" + school, false: ""}[school != ""])
+}
+
+func smartCloneHeaders(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func smartMap(v any) map[string]any {
+	if m, ok := v.(map[string]any); ok {
+		return m
+	}
+	return nil
+}
+
+func smartList(v any) []map[string]any {
+	switch x := v.(type) {
+	case []map[string]any:
+		return x
+	case []any:
+		out := make([]map[string]any, 0, len(x))
+		for _, item := range x {
+			if m, ok := item.(map[string]any); ok {
+				out = append(out, m)
+			}
+		}
+		return out
+	case map[string]any:
+		if list := smartList(x["list"]); len(list) > 0 {
+			return list
+		}
+		if list := smartList(x["resourcesList"]); len(list) > 0 {
+			return list
+		}
+	}
+	return nil
+}
+
+func smartString(v any) string {
+	switch x := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return strings.TrimSpace(x)
+	case json.Number:
+		return x.String()
+	case float64:
+		if x == float64(int64(x)) {
+			return strconv.FormatInt(int64(x), 10)
+		}
+		return strconv.FormatFloat(x, 'f', -1, 64)
+	case int:
+		return strconv.Itoa(x)
+	case int64:
+		return strconv.FormatInt(x, 10)
+	default:
+		return strings.TrimSpace(fmt.Sprint(x))
+	}
+}
+
+func smartHTTPURL(raw string) string {
+	raw = strings.TrimSpace(strings.ReplaceAll(raw, `\/`, "/"))
+	if strings.HasPrefix(raw, "//") {
+		raw = "https:" + raw
+	}
+	if regexp.MustCompile(`^https?://`).MatchString(raw) {
+		return raw
+	}
+	return ""
 }

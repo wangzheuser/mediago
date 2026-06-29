@@ -44,6 +44,7 @@ var youdaoPatterns = []string{
 	`(?:www\.)?ke\.youdao\.com/.*?detail/\d+`,
 	`live\.youdao.*?\.com/.*?course[Ii]d=\d+`,
 	`ke\.study\.(?:163|youdao)\.com/.*?detail/\d+`,
+	`ke\.study\.(?:163|youdao)\.com/.*?course[Ii]d=\d+`,
 	`.*\.study\.(?:163|youdao)\.com/.*?course[Ii]d=\d+`,
 	// Youdao course-list (Youdao_Course._get_course_list)
 	`(?:www\.)?ke\.youdao\.com/(?:mycourse|course/app)`,
@@ -429,7 +430,7 @@ func fetchYoudaoCourseList(c *util.Client, status string) ([]youdaoCourseItem, e
 		for _, r := range out.Data.Data {
 			all = append(all, youdaoCourseItem{
 				courseID: valueString(r.CourseID),
-				title:   r.CourseTitle,
+				title:    r.CourseTitle,
 			})
 		}
 	}

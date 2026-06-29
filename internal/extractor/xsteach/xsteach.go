@@ -89,13 +89,20 @@ func (s *Xsteach) Extract(rawURL string, opts *extractor.ExtractOpts) (*extracto
 	}
 	entries, seen := []*extractor.MediaInfo{}, map[string]bool{}
 	for _, p := range periods {
+		for _, fi := range filesFromPeriod(p, course) {
+			if fi.url == "" || seen[fi.url] {
+				continue
+			}
+			seen[fi.url] = true
+			entries = append(entries, fileMedia(fi))
+		}
 		for _, vi := range videosFromPeriod(p, course) {
-			for _, u := range resolveVideo(c, h, vi) {
-				if u == "" || seen[u] {
+			for _, src := range resolveVideoSources(c, h, vi) {
+				if src.URL == "" || seen[src.URL] {
 					continue
 				}
-				seen[u] = true
-				entries = append(entries, media(firstNonEmpty(vi.title, "period_"+vi.periodID), u, vi))
+				seen[src.URL] = true
+				entries = append(entries, mediaSource(firstNonEmpty(vi.title, "period_"+vi.periodID), src, vi))
 			}
 		}
 	}
@@ -231,18 +238,31 @@ func requestBody(c *util.Client, h map[string]string, api string, params map[str
 	return nil
 }
 
-func resolveVideo(c *util.Client, h map[string]string, vi xsVideo) []string {
-	out := []string{}
+type xsSource struct {
+	URL   string
+	Extra map[string]any
+}
+
+func resolveVideoSources(c *util.Client, h map[string]string, vi xsVideo) []xsSource {
+	out := []xsSource{}
 	play := requestPlayData(c, h, vi)
 	if auth := qcloudAuth(play); auth != nil {
-		if u := qcloudMediaURL(c, auth); u != "" {
-			out = append(out, u)
+		if src := qcloudMediaSource(c, auth); src.URL != "" {
+			out = append(out, src)
 		}
 	}
 	for _, v := range []any{play, vi.raw} {
 		if u := firstMediaURL(v); u != "" {
-			out = append(out, u)
+			out = append(out, xsSource{URL: u, Extra: map[string]any{"source_type": "direct"}})
 		}
+	}
+	return uniqueSources(out)
+}
+
+func resolveVideo(c *util.Client, h map[string]string, vi xsVideo) []string {
+	out := []string{}
+	for _, src := range resolveVideoSources(c, h, vi) {
+		out = append(out, src.URL)
 	}
 	return unique(out)
 }
@@ -267,6 +287,13 @@ func apiGet(c *util.Client, api string, params map[string]string, h map[string]s
 }
 
 func qcloudMediaURL(c *util.Client, auth map[string]string) string {
+	if src := qcloudMediaSource(c, auth); src.URL != "" {
+		return src.URL
+	}
+	return ""
+}
+
+func qcloudMediaURLFallback(c *util.Client, auth map[string]string) string {
 	q := url.Values{"keyId": {"1"}, "psign": {auth["psign"]}}
 	if iv := rsaOverlay(); iv != "" {
 		q.Set("cipheredOverlayIv", iv)
@@ -305,8 +332,19 @@ func qcloudAuth(v any) map[string]string {
 }
 
 func rsaOverlay() string {
+	return rsaEncryptOverlay(newOverlayText())
+}
+
+func newOverlayText() string {
 	raw := make([]byte, 16)
 	if _, err := crand.Read(raw); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(raw)
+}
+
+func rsaEncryptOverlay(overlayText string) string {
+	if overlayText == "" {
 		return ""
 	}
 	block, _ := pem.Decode([]byte(xsteachRSAPublicKey))
@@ -321,7 +359,7 @@ func rsaOverlay() string {
 	if !ok {
 		return ""
 	}
-	enc, err := rsa.EncryptPKCS1v15(crand.Reader, pub, []byte(hex.EncodeToString(raw)))
+	enc, err := rsa.EncryptPKCS1v15(crand.Reader, pub, []byte(overlayText))
 	if err != nil {
 		return ""
 	}

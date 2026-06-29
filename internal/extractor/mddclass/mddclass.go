@@ -35,6 +35,7 @@ const (
 	mddclassLexueHost         = url1
 	mddclassAccessHost        = url2
 	mddclassGlobalWebAPIHost  = "https://webapi.sksight.com"
+	mddclassPassSchoolURL     = "https://pass.mddclass.com/school/?business_domain=yyy_cctob&bireg=&url=https%3A%2F%2Fwww.mddclass.com%2F"
 	mddclassAPIV11            = "/webapi/content/v1.1"
 	mddclassAPIV12            = "/webapi/content/v1.2"
 	mddclassSNSAPI            = "/webapi/sns/v1.1"
@@ -43,6 +44,12 @@ const (
 	mddclassCompanyDomain     = "lexue"
 	mddclassPlaceholderMP4    = "51b106759c84acade91a81ef83cf2eea.mp4"
 	mddclassUserAgent         = "Mozilla/5.0 (Windows NT 6.2; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) QtWebEngine/5.15.2 Chrome/83.0.4103.122 Safari/537.36 CTPC/1.3.0.8/mddclass"
+	mddclassOCSUserAgent      = "Hujiang/OCS/PC/Qt/Win"
+	mddclassOCSBase           = "https://courseware-ocs.sksight.com/v5.6/"
+	mddclassOCSAPIHost        = "https://courseware-ocs-api.sksight.com"
+	mddclassOCSMaterialHost   = "https://p1-ocs.sksight.com"
+	mddclassOCSReferer        = "https://ocs.sksight.com/h5/v5/index.html"
+	mddclassOCSOrigin         = "https://ocs.sksight.com"
 	mddclassPCClientAgentTmpl = "HJClient 1.0/pc/6.2.9200/1.3.0.8/qt/mddclass%s"
 )
 
@@ -849,11 +856,30 @@ func mddclassBuildVideoEntry(c *util.Client, sess *mddclassSession, video mddcla
 		mediaURL = ""
 	}
 	if mediaURL == "" {
+		mediaURL = mddclassResolveOCSMediaURL(sess, detail, video.Raw, coursewareInfo)
+	}
+	if mediaURL == "" {
 		extra["detail"] = detail
 		extra["courseware_info"] = coursewareInfo
+		if hint := mddclassOCSHint(sess, coursewareInfo); hint != "" {
+			extra["ocs"] = map[string]any{
+				"referer":       mddclassOCSReferer,
+				"origin":        mddclassOCSOrigin,
+				"base":          mddclassOCSBase,
+				"api_host":      mddclassOCSAPIHost,
+				"material_host": mddclassOCSMaterialHost,
+				"login_url":     mddclassPassSchoolURL,
+				"hint":          hint,
+			}
+			return nil, fmt.Errorf("mddclass video %s: no media URL in API payload; %s", video.VideoID, hint)
+		}
 		return nil, fmt.Errorf("mddclass video %s: no media URL in API payload", video.VideoID)
 	}
 	format := mddclassStreamFormat(mediaURL)
+	streamHeaders := sess.mediaHeaders(video)
+	if mddclassIsOCSURL(mediaURL) {
+		streamHeaders = sess.ocsMediaHeaders(video, coursewareInfo)
+	}
 	extra["detail"] = detail
 	extra["courseware_info"] = coursewareInfo
 	return &extractor.MediaInfo{
@@ -865,7 +891,7 @@ func mddclassBuildVideoEntry(c *util.Client, sess *mddclassSession, video mddcla
 			Format:    format,
 			Size:      video.Size,
 			NeedMerge: format == "m3u8",
-			Headers:   sess.mediaHeaders(video),
+			Headers:   streamHeaders,
 		}},
 		Extra: extra,
 	}, nil

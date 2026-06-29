@@ -64,21 +64,22 @@ const (
 // Kaoyan and Column sibling patterns are registered below and routed before
 // the main-course parser.
 var patterns = []string{
-	`(?:www\.)?icourse163\.org/.*?(?:learn|course)/[%\w-]+-\d+`,
-	`(?:www\.)?icourse163\.org/columns/\d+\.htm`,
-	`(?:www\.)?icourse163\.org/column/learn/\d+(?:/.*?\.htm)?`,
+	`(?:[\w-]+\.)?icourse163\.org/(?:spoc/)?(?:learn|course)/[%\w-]+-\d+`,
+	`(?:[\w-]+\.)?icourse163\.org/columns/\d+\.htm`,
+	`(?:[\w-]+\.)?icourse163\.org/column/learn/\d+(?:/.*?\.htm)?`,
 	`kaoyan\.icourse163\.org/course/terms/\d+.*course[Ii]d=\d+`,
-	`(?:www\.)?icourse163\.org/live/.*?\d+\.htm`,
+	`kaoyan\.icourse163\.org/course/packages/\d+\.htm`,
+	`(?:[\w-]+\.)?icourse163\.org/live/.*?\d+\.htm`,
 	// App "我的课程" course-list (Icourse163_App)
-	`(?:www\.)?icourse163\.org/(?:home\.htm|mycourse)`,
+	`(?:[\w-]+\.)?icourse163\.org/(?:home\.htm|mycourse)`,
 }
 
 var moocURLRe = regexp.MustCompile(
-	`^https?://www\.icourse163\.org/(?P<mooc>[^/]*?/?)(?:learn|course)/(?P<cid>[%\w-]+-\d+)(?:.*?tid=(?P<tid>\d+))?`,
+	`^https?://[\w.-]*icourse163\.org/(?P<mooc>[^/]*?/?)(?:learn|course)/(?P<cid>[%\w-]+-\d+)(?:.*?tid=(?P<tid>\d+))?`,
 )
 
 var appURLRe = regexp.MustCompile(
-	`^https?://(?:www\.)?icourse163\.org/(?:home\.htm|mycourse)`,
+	`^https?://(?:[\w-]+\.)?icourse163\.org/(?:home\.htm|mycourse)`,
 )
 
 func init() {
@@ -99,6 +100,9 @@ func (i *ICourse163) Extract(rawURL string, opts *extractor.ExtractOpts) (*extra
 	}
 
 	c := newClient(opts.Cookies)
+	if pkg, ok := parseStudyPackage(rawURL); ok {
+		return extractKaoyanPackage(c, pkg)
+	}
 	if column, ok := parseColumnURL(rawURL); ok {
 		return extractColumn(c, column)
 	}
@@ -248,18 +252,20 @@ func entriesFromChapters(c *util.Client, chapters []chapter, memberID string) ([
 }
 
 func mediaEntry(name string, ps pickedStream) *extractor.MediaInfo {
+	stream := extractor.Stream{
+		Quality: ps.quality,
+		URLs:    []string{ps.url},
+		Format:  ps.format,
+		Size:    ps.size,
+		Headers: map[string]string{"Referer": referer},
+	}
+	if ps.format == "m3u8" {
+		stream.NeedMerge = true
+	}
 	return &extractor.MediaInfo{
-		Site:  "icourse163",
-		Title: name,
-		Streams: map[string]extractor.Stream{
-			ps.format: {
-				Quality: ps.quality,
-				URLs:    []string{ps.url},
-				Format:  ps.format,
-				Size:    ps.size,
-				Headers: map[string]string{"Referer": referer},
-			},
-		},
+		Site:      "icourse163",
+		Title:     name,
+		Streams:   map[string]extractor.Stream{ps.format: stream},
 		Subtitles: ps.subs,
 	}
 }

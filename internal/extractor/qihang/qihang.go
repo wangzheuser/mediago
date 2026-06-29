@@ -2,6 +2,8 @@
 package qihang
 
 import (
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -208,12 +210,12 @@ func resolveVideo(c *util.Client, h map[string]string, idx []int, name, vid, liv
 	title := sanitize(fmt.Sprintf("[%s]-%s", joinInts(idx), strings.TrimSuffix(name, ".mp4")))
 	if vid != "" {
 		if u, err := shared.BokeCCResolve(c, vid, bokeccSiteID, h); err == nil && u != "" {
-			return media(title, u, map[string]any{"video_id": vid})
+			return mediaWithPreparedM3U8(c, h, title, u, map[string]any{"video_id": vid})
 		}
 	}
 	if liveID != "" {
 		if u, audio, err := resolveLive(c, h, liveID, uid, learnID); err == nil && u != "" {
-			m := media(title, u, map[string]any{"live_id": liveID})
+			m := mediaWithPreparedM3U8(c, h, title, u, map[string]any{"live_id": liveID})
 			if audio != "" {
 				st := m.Streams["best"]
 				st.AudioURL = audio
@@ -291,7 +293,185 @@ func resolveFile(idx []int, name, lectureURL string) *extractor.MediaInfo {
 }
 
 func media(title, u string, extra map[string]any) *extractor.MediaInfo {
-	return &extractor.MediaInfo{Site: "qihang", Title: title, Streams: map[string]extractor.Stream{"best": {Quality: "best", URLs: []string{u}, Format: pickFormat(u), Headers: map[string]string{"Referer": referer}}}, Extra: extra}
+	format := pickFormat(u)
+	return &extractor.MediaInfo{Site: "qihang", Title: title, Streams: map[string]extractor.Stream{"best": {Quality: "best", URLs: []string{u}, Format: format, NeedMerge: format == "m3u8", Headers: map[string]string{"Referer": referer}}}, Extra: extra}
+}
+
+func mediaWithPreparedM3U8(c *util.Client, h map[string]string, title, streamURL string, extra map[string]any) *extractor.MediaInfo {
+	if preparedURL, m3u8Text, ok := prepareQihangM3U8(c, h, streamURL); ok {
+		streamURL = preparedURL
+		if extra == nil {
+			extra = map[string]any{}
+		}
+		extra["m3u8_text"] = m3u8Text
+		extra["m3u8_prepared"] = true
+	}
+	return media(title, streamURL, extra)
+}
+
+func prepareQihangM3U8(c *util.Client, h map[string]string, m3u8URL string) (string, string, bool) {
+	if c == nil || !strings.Contains(strings.ToLower(m3u8URL), ".m3u8") {
+		return "", "", false
+	}
+	headers := qihangM3U8Headers(h)
+	text, err := c.GetString(m3u8URL, headers)
+	if err != nil || !strings.Contains(text, "#EXTM3U") {
+		return "", "", false
+	}
+	rewritten := rewriteQihangM3U8(c, headers, text, m3u8URL)
+	return qihangM3U8DataURL(rewritten), rewritten, true
+}
+
+func rewriteQihangM3U8(c *util.Client, headers map[string]string, text, baseURL string) string {
+	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			out = append(out, line)
+			continue
+		}
+		if strings.HasPrefix(trimmed, "#") {
+			if strings.HasPrefix(trimmed, "#EXT-X-KEY") {
+				line = rewriteQihangM3U8KeyLine(c, headers, line, baseURL)
+			}
+			out = append(out, line)
+			continue
+		}
+		out = append(out, resolveQihangM3U8Line(baseURL, trimmed))
+	}
+	return strings.Join(out, "\n")
+}
+
+func rewriteQihangM3U8KeyLine(c *util.Client, headers map[string]string, line, baseURL string) string {
+	uri := extractQihangM3U8URI(line)
+	if uri == "" {
+		return line
+	}
+	resolvedURI := resolveQihangM3U8Line(baseURL, uri)
+	replacement := resolvedURI
+	if info := qihangM3U8InfoParam(resolvedURI); info != "" && c != nil {
+		if keyBytes, err := c.GetBytes(resolvedURI, headers); err == nil {
+			if keyHex := decryptQihangKey(keyBytes, info); keyHex != "" {
+				replacement = "0x" + keyHex
+			}
+		}
+	}
+	return replaceQihangM3U8URI(line, replacement)
+}
+
+func qihangM3U8Headers(base map[string]string) map[string]string {
+	headers := map[string]string{"Referer": referer}
+	for k, v := range base {
+		if strings.EqualFold(k, "authorization") || strings.EqualFold(k, "cookie") || strings.EqualFold(k, "user-agent") {
+			headers[k] = v
+		}
+	}
+	return headers
+}
+
+func extractQihangM3U8URI(line string) string {
+	for _, marker := range []string{`URI="`, `URI='`} {
+		idx := strings.Index(line, marker)
+		if idx < 0 {
+			continue
+		}
+		rest := line[idx+len(marker):]
+		if end := strings.IndexAny(rest, `"'`); end >= 0 {
+			return rest[:end]
+		}
+		return rest
+	}
+	return ""
+}
+
+func replaceQihangM3U8URI(line, uri string) string {
+	for _, marker := range []string{`URI="`, `URI='`} {
+		idx := strings.Index(line, marker)
+		if idx < 0 {
+			continue
+		}
+		rest := line[idx+len(marker):]
+		if end := strings.IndexAny(rest, `"'`); end >= 0 {
+			return line[:idx+len(marker)] + uri + rest[end:]
+		}
+		return line[:idx+len(marker)] + uri
+	}
+	return line
+}
+
+func qihangM3U8InfoParam(raw string) string {
+	normalized := strings.ReplaceAll(raw, "&amp;", "&")
+	if u, err := url.Parse(normalized); err == nil {
+		if info := u.Query().Get("info"); info != "" {
+			return info
+		}
+	}
+	return match1(normalized, `(?:[?&])info=(\w+)`)
+}
+
+func resolveQihangM3U8Line(baseURL, ref string) string {
+	ref = strings.TrimSpace(ref)
+	if ref == "" || strings.HasPrefix(ref, "http://") || strings.HasPrefix(ref, "https://") || strings.HasPrefix(ref, "data:") || strings.HasPrefix(ref, "0x") {
+		return ref
+	}
+	if strings.HasPrefix(ref, "//") {
+		return "https:" + ref
+	}
+	base, err := url.Parse(baseURL)
+	if err != nil {
+		return ref
+	}
+	parsed, err := url.Parse(ref)
+	if err != nil {
+		return ref
+	}
+	return base.ResolveReference(parsed).String()
+}
+
+func qihangM3U8DataURL(text string) string {
+	return "data:application/vnd.apple.mpegurl;charset=utf-8," + url.PathEscape(text)
+}
+
+var qihangKeySeeds = decodeQihangKeySeeds()
+
+func decodeQihangKeySeeds() [][]byte {
+	encoded := []string{
+		"Uglq1TA2pTi/QKOegfPX+3zjOYKbL/+HNI5DRMTe6ctUe5QypsIjPe5MlQtC+sNOCC6hZijZJLJ2W6JJbYvRJXL49mSGaJgW1KRczF1ltpJscEhQ/e252l4VRlenjZ2EkNirAIy80wr35FgFuLNFBtAsHo/KPw8Cwa+9AwETims6kRFBT2fc6pfyz87wtOZzlqx0IuetNYXi+TfoHHXfbkfxGnEdKcWJb7diDqoYvhv8Vj5LxtJ5IJrbwP54zVr0H92oM4gHxzGxEhBZJ4DsX2BRf6kZtUoNLeV6n5PJnO+g4DtNrir1sMjruzyDU5lhFysEfrp31ibhaRRjVSEMfQ==",
+		"Y1UhDH1SCWrVMDalOL9Ao56B89f7fOM5gpsv/4c0jkNExN7py1R7lDKmwiM97kyVC0L6w04ILqFmKNkksnZboklti9Elcvj2ZIZomBbUpFzMXWW2kmxwSFD97bnaXhVGV6eNnYSQ2KsAjLzTCvfkWAW4s0UG0Cwej8o/DwLBr70DAROKazqREUFPZ9zql/LPzvC05nOWrHQi5601heL5N+gcdd9uR/EacR0pxYlvt2IOqhi+G/xWPkvG0nkgmtvA/njNWvQf3agziAfHMbESEFkngOxfYFF/qRm1Sg0t5Xqfk8mc76DgO02uKvWwyOu7PINTmWEXKwR+unfWJuFpFA==",
+		"c5asdCLnrTWF4vk36Bx1325H8RpxHSnFiW+3Yg6qGL4b/FY+S8bSeSCa28D+eM1a9B/dqDOIB8cxsRIQWSeA7F9gUX+pGbVKDS3lep+TyZzvoOA7Ta4q9bDI67s8g1OZYRcrBH66d9Ym4WkUY1UhDH1SCWrVMDalOL9Ao56B89f7fOM5gpsv/4c0jkNExN7py1R7lDKmwiM97kyVC0L6w04ILqFmKNkksnZboklti9Elcvj2ZIZomBbUpFzMXWW2kmxwSFD97bnaXhVGV6eNnYSQ2KsAjLzTCvfkWAW4s0UG0Cwej8o/DwLBr70DAROKazqREUFPZ9zql/LPzvC05g==",
+	}
+	out := make([][]byte, 0, len(encoded))
+	for _, item := range encoded {
+		if decoded, err := base64.StdEncoding.DecodeString(item); err == nil {
+			out = append(out, decoded)
+		}
+	}
+	return out
+}
+
+func decryptQihangKey(encKey []byte, info string) string {
+	if len(qihangKeySeeds) != 3 || len(encKey) < 21 || len(info) < 32 {
+		return ""
+	}
+	seedIdx := int(encKey[0])
+	if seedIdx < 0 || seedIdx >= len(qihangKeySeeds) {
+		return ""
+	}
+	seed := qihangKeySeeds[seedIdx]
+	if len(seed) < 256 {
+		return ""
+	}
+	infoBytes := []byte(info)
+	out := make([]byte, 20)
+	for i := 0; i < 20; i++ {
+		keyIndex := int(encKey[i+1]) ^ int(infoBytes[i%32])
+		if keyIndex < 0 || keyIndex >= len(seed) {
+			return ""
+		}
+		out[i] = seed[keyIndex]
+	}
+	return strings.ToUpper(hex.EncodeToString(out[:16]))
 }
 
 func qihangHeaders(j http.CookieJar) map[string]string {
@@ -330,10 +510,17 @@ var (
 	learnRe    = regexp.MustCompile(`/learn/(\d+)`)
 	recordRe   = regexp.MustCompile(`/record/\d+/\d+/(\d+)`)
 	playbackRe = regexp.MustCompile(`/playback/\d+/.*?/\d+/(\d+)`)
+	catalogRe  = regexp.MustCompile(`/course/catalog/(\d+)`)
 	productRe  = regexp.MustCompile(`[?&]courseId=(\d+)`)
 )
 
 func parseIDs(raw string) (cid, learnID, productID string) {
+	if u, err := url.Parse(raw); err == nil {
+		q := u.Query()
+		cid = first(q.Get("productCurriculumId"), q.Get("curriculumId"), q.Get("cid"))
+		learnID = first(q.Get("learnId"), q.Get("lid"), q.Get("id"))
+		productID = first(q.Get("courseId"), q.Get("productId"))
+	}
 	if m := learnRe.FindStringSubmatch(raw); len(m) > 1 {
 		learnID = m[1]
 	}
@@ -346,7 +533,10 @@ func parseIDs(raw string) (cid, learnID, productID string) {
 	if m := productRe.FindStringSubmatch(raw); len(m) > 1 {
 		productID = m[1]
 	}
-	return "", learnID, productID
+	if m := catalogRe.FindStringSubmatch(raw); len(m) > 1 && cid == "" {
+		cid = m[1]
+	}
+	return cid, learnID, productID
 }
 func replayArgs(raw string) (roomID, userID, recordID string) {
 	u, err := url.Parse(strings.ReplaceAll(raw, "&amp;", "&"))
@@ -419,7 +609,8 @@ func sanitize(s string) string {
 	return s
 }
 func pickFormat(u string) string {
-	if strings.Contains(strings.ToLower(u), ".m3u8") {
+	lower := strings.ToLower(u)
+	if strings.Contains(lower, ".m3u8") || strings.Contains(lower, "mpegurl") || strings.HasPrefix(strings.TrimSpace(u), "#EXTM3U") {
 		return "m3u8"
 	}
 	return "mp4"

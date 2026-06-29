@@ -13,7 +13,7 @@
 | Minshi_Course.py:31 course_detail_api = '/api/learning/ext/courseDetails/new/courseTableDetail/{course_table_id}' | minshi.go:25 course_detail_api | ✓ |
 | Minshi_Course.py:32 material_api = '/api/learning/ext/class/material/list' | minshi.go:26 material_api | ✓ |
 | Minshi_Course.py:33 video_encrypted_api = '/api/learning/ext/course/videoEncryptedInfo/{target_id}' | minshi.go:27 video_encrypted_api | ✓ |
-| Minshi_Base.py:45 polyv_secure_url = 'https://player.polyv.net/secure/{vid}.json' | minshi.go:28 polyv_secure_url + shared.PolyvResolveSecure | ✓ |
+| Minshi_Base.py:45 polyv_secure_url = 'https://player.polyv.net/secure/{vid}.json' | minshi.go:28 polyv_secure_url + polyv.go native `getPolyvM3U8`, fallback shared.PolyvResolveSecure | ✓ |
 
 ## HTTP 调用
 
@@ -24,7 +24,7 @@
 | Minshi_Course._get_course_table_detail line 418 -> _request_api_data('GET', course_detail_api) | Extract lines 89-94 | GET | ✓ |
 | Minshi_Course._get_material_list line 619 -> _request_api_data('POST', material_api) | collectFiles lines 194-215 | POST | ✓ |
 | Minshi_Course._get_play_token line 792 -> _request_json('GET', video_encrypted_api) | getPlayToken lines 117-133 | GET | ✓ |
-| Minshi_Base.get_polyv_m3u8 line 937 -> request_get_raw(polyv_secure_url) | resolvePolyv lines 135-148 via shared.PolyvResolveSecure | GET | ✓ |
+| Minshi_Base.get_polyv_m3u8 line 937 -> request_get_raw(polyv_secure_url) | `resolvePolyv` + `polyv.go:getPolyvM3U8` | GET secure + GET m3u8/key | ✓ |
 
 ## JSON 字段映射
 
@@ -39,4 +39,4 @@
 
 ## 阻塞步骤
 
-无. Polyv 播放链按硬规则调用 `shared.PolyvResolveSecure` / `shared.PolyvPickBestManifest`, 未在站包内重写解密逻辑.
+无. Polyv 播放链先按 Minshi 源码实现 playsafe token key URL, secure body AES 解密, m3u8 绝对化和 key inline; 不可用时 fallback 到 `shared.PolyvResolveSecure` / `shared.PolyvPickBestManifest`.

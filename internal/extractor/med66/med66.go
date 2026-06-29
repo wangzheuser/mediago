@@ -16,15 +16,17 @@ import (
 )
 
 const (
-	LOGIN_URL            = "https://www.med66.com/OtherItem/loginAgain/index.shtml"
-	MEMBER_HOME_URL      = "https://member.med66.com/homes/mycourse"
-	COURSE_INFO_URL      = "https://member.med66.com/homes/mycourse/courseInfo"
-	COURSEWARE_INFO_URL   = "https://member.med66.com/homes/course/courseClassWareInfo"
-	ELEARNING_HOME_URL   = "https://elearning.med66.com/"
-	LIVE_REPLAY_INFO_URL = "https://live.cdeledu.com/liveapi/entry/getReplayInfo"
-	LIVE_REFERER_URL     = "https://live.cdeledu.com/"
-	MATERIALS_URL        = "https://elearning.med66.com/xcware/download/teachingMaterials.shtm?cwareID={cware_id}&iskcjy=1&identity={identity}"
-	MATERIAL_DOWNLOAD_URL = "https://elearning.med66.com/data2file/downloadFile/getWordVipFile?cwareID=&fileUrl={file_url}&fileReName={file_name}"
+	LOGIN_URL              = "https://www.med66.com/OtherItem/loginAgain/index.shtml"
+	MEMBER_HOME_URL        = "https://member.med66.com/homes/mycourse"
+	COURSE_INFO_URL        = "https://member.med66.com/homes/mycourse/courseInfo"
+	COURSEWARE_INFO_URL    = "https://member.med66.com/homes/course/courseClassWareInfo"
+	COURSE_UPGRADE_URL     = "https://member.med66.com/homes/course/getUpgradedCourseList"
+	COURSE_UPGRADE_REFERER = "https://member.med66.com/homes/course/luboCourse?courseId={}&classId={}&classType={}&isAi={}"
+	ELEARNING_HOME_URL     = "https://elearning.med66.com/"
+	LIVE_REPLAY_INFO_URL   = "https://live.cdeledu.com/liveapi/entry/getReplayInfo"
+	LIVE_REFERER_URL       = "https://live.cdeledu.com/"
+	MATERIALS_URL          = "https://elearning.med66.com/xcware/download/teachingMaterials.shtm?cwareID={cware_id}&iskcjy=1&identity={identity}"
+	MATERIAL_DOWNLOAD_URL  = "https://elearning.med66.com/data2file/downloadFile/getWordVipFile?cwareID=&fileUrl={file_url}&fileReName={file_name}"
 )
 
 var patterns = []string{`(?:[\w-]+\.)?med66\.com/`, `live\.cdeledu\.com/`}
@@ -38,7 +40,7 @@ type Med66 struct{}
 func (m *Med66) Patterns() []string { return patterns }
 
 var (
-	courseIDRe      = regexp.MustCompile(`(?i)(?:courseId|course_id)=((?:med)?\d+)`)
+	courseIDRe     = regexp.MustCompile(`(?i)(?:courseId|course_id)=((?:med)?\d+)`)
 	goToLiveRe     = regexp.MustCompile(`goToLive\(\s*['"]([^'"]+)['"](?:\s*,\s*['"]([^'"]*)['"])?`)
 	h5VarsRe       = regexp.MustCompile(`window\.cdelmedia\.h5Vars\s*=\s*JSON\.parse\('(?s:(.*?))'\)`)
 	openURLRe      = regexp.MustCompile(`window\.open\(["']([^"']+)["']`)
@@ -68,7 +70,14 @@ func (m *Med66) Extract(rawURL string, opts *extractor.ExtractOpts) (*extractor.
 
 	cid := extractCourseID(rawURL)
 	if cid == "" {
-		return nil, fmt.Errorf("cannot parse med66 courseId from URL: %s", rawURL)
+		courses, err := fetchCourseList(c, headers)
+		if err != nil {
+			return nil, fmt.Errorf("cannot parse med66 courseId from URL and course list unavailable: %w", err)
+		}
+		if len(courses) == 0 {
+			return nil, fmt.Errorf("cannot parse med66 courseId from URL: %s", rawURL)
+		}
+		return med66CourseListMedia(courses), nil
 	}
 
 	course, err := fetchCourse(c, headers, cid)
@@ -165,37 +174,108 @@ type med66Course struct {
 	ClassType       string
 	ClassID         string
 	LinkedCourseIDs string
+	IsAI            string
+	Raw             anyMap
 }
 
 type anyMap map[string]any
 
-func fetchCourse(c *util.Client, headers map[string]string, cid string) (med66Course, error) {
+func fetchCourseList(c *util.Client, headers map[string]string) ([]med66Course, error) {
 	body, err := c.PostForm(COURSE_INFO_URL, map[string]string{}, headers)
 	if err != nil {
-		return med66Course{}, fmt.Errorf("courseInfo: %w", err)
+		return nil, fmt.Errorf("courseInfo: %w", err)
 	}
 	var root any
 	if err := json.Unmarshal([]byte(body), &root); err != nil {
-		return med66Course{}, fmt.Errorf("parse courseInfo: %w", err)
+		return nil, fmt.Errorf("parse courseInfo: %w", err)
 	}
+	seen := map[string]bool{}
+	var out []med66Course
 	for _, obj := range collectMaps(root) {
-		courseID := strAny(obj["courseId"])
-		if courseID == "" {
-			courseID = strAny(obj["course_id"])
-		}
-		if courseID != cid {
+		course := med66CourseFromMap(obj)
+		if course.CourseID == "" || !looksLikeCourseInfo(course, obj) {
 			continue
 		}
-		return med66Course{
-			CourseID:        courseID,
-			Title:           firstString(obj, "title", "homeTitle", "selCourseTitle", "courseEduName", "listName"),
-			EduSubjectID:    firstString(obj, "eduSubjectId", "eduSubjectID"),
-			ClassType:       firstString(obj, "classType"),
-			ClassID:         firstString(obj, "classId", "viewClassId"),
-			LinkedCourseIDs: firstString(obj, "linkedCourseIds"),
-		}, nil
+		key := med66NormalizeCourseID(course.CourseID)
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, course)
+	}
+	return out, nil
+}
+
+func fetchCourse(c *util.Client, headers map[string]string, cid string) (med66Course, error) {
+	courses, err := fetchCourseList(c, headers)
+	if err != nil {
+		return med66Course{}, err
+	}
+	for _, course := range courses {
+		if med66CourseIDEqual(course.CourseID, cid) {
+			return course, nil
+		}
 	}
 	return med66Course{}, fmt.Errorf("med66 courseInfo: courseId %s not found", cid)
+}
+
+func med66CourseFromMap(obj anyMap) med66Course {
+	courseID := firstString(obj, "courseId", "course_id")
+	return med66Course{
+		CourseID:        courseID,
+		Title:           util.SanitizeFilename(firstNonEmpty(firstString(obj, "title", "homeTitle", "selCourseTitle", "courseEduName", "listName", "detailName", "eduSubjectName"), courseID)),
+		EduSubjectID:    firstString(obj, "eduSubjectId", "eduSubjectID"),
+		ClassType:       firstString(obj, "classType"),
+		ClassID:         firstString(obj, "classId", "viewClassId"),
+		LinkedCourseIDs: firstString(obj, "linkedCourseIds"),
+		IsAI:            firstString(obj, "isAi", "isAI"),
+		Raw:             obj,
+	}
+}
+
+func looksLikeCourseInfo(course med66Course, obj anyMap) bool {
+	return course.EduSubjectID != "" ||
+		course.ClassType != "" ||
+		course.ClassID != "" ||
+		course.LinkedCourseIDs != "" ||
+		firstString(obj, "title", "homeTitle", "selCourseTitle", "courseEduName", "listName", "detailName") != ""
+}
+
+func med66CourseListMedia(courses []med66Course) *extractor.MediaInfo {
+	entries := make([]*extractor.MediaInfo, 0, len(courses))
+	for _, course := range courses {
+		entries = append(entries, &extractor.MediaInfo{
+			Site:  "med66",
+			Title: firstNonEmpty(course.Title, course.CourseID),
+			Extra: map[string]any{"course_id": course.CourseID, "url": med66CourseURL(course), "course": course.Raw},
+		})
+	}
+	return &extractor.MediaInfo{Site: "med66", Title: "med66_courses", Entries: entries}
+}
+
+func med66CourseURL(course med66Course) string {
+	values := url.Values{}
+	values.Set("courseId", course.CourseID)
+	if course.ClassID != "" {
+		values.Set("classId", course.ClassID)
+	}
+	if course.ClassType != "" {
+		values.Set("classType", course.ClassType)
+	}
+	if course.IsAI != "" {
+		values.Set("isAi", course.IsAI)
+	}
+	return "https://member.med66.com/homes/course/luboCourse?" + values.Encode()
+}
+
+func med66CourseIDEqual(a, b string) bool {
+	a = strings.TrimSpace(strings.ToLower(a))
+	b = strings.TrimSpace(strings.ToLower(b))
+	return a == b || med66NormalizeCourseID(a) == med66NormalizeCourseID(b)
+}
+
+func med66NormalizeCourseID(id string) string {
+	return strings.TrimPrefix(strings.TrimSpace(strings.ToLower(id)), "med")
 }
 
 func fetchCoursewares(c *util.Client, headers map[string]string, course med66Course) ([]anyMap, error) {
@@ -561,7 +641,7 @@ func resolveReplayEntry(c *util.Client, playURL, referer, uid, title string) (*e
 	replay := payload.Replay
 	viewer := strings.TrimSpace(uid)
 	if viewer == "" {
-		viewer = payload.Query.Get("userid")
+		viewer = firstNonEmpty(payload.Query.Get("userid"), payload.Query.Get("userId"), payload.Query.Get("uid"))
 	}
 	candidates := uniqueNonEmpty(replay.AccessKey, payload.Token)
 	if len(candidates) == 0 {
@@ -573,12 +653,13 @@ func resolveReplayEntry(c *util.Client, playURL, referer, uid, title string) (*e
 	for _, token := range candidates {
 		playInfo, lastErr = shared.CssLcloudResolvePlayInfo(c, shared.CssLcloudPayload{
 			LiveRoomID:  firstNonEmpty(replay.LiveRoomID, replay.LiveID),
-			UserID:      replay.AccessID,
+			UserID:      viewer,
 			AccessID:    replay.AccessID,
 			RecordID:    replay.RecordID,
 			ViewerName:  viewer,
 			ViewerToken: token,
 			Referer:     LIVE_REFERER_URL,
+			Version:     MED66_CC_REPLAY_VERSION,
 		})
 		if lastErr == nil {
 			break
@@ -606,7 +687,7 @@ func resolveReplayEntry(c *util.Client, playURL, referer, uid, title string) (*e
 		return nil, fmt.Errorf("med66 csslcloud: no media URL")
 	}
 
-	extra := map[string]any{"recordId": replay.RecordID, "accessid": replay.AccessID, "liveRoomId": firstNonEmpty(replay.LiveRoomID, replay.LiveID)}
+	extra := map[string]any{"recordId": replay.RecordID, "accessid": replay.AccessID, "liveRoomId": firstNonEmpty(replay.LiveRoomID, replay.LiveID), "userid": viewer, "cc_replay_version": MED66_CC_REPLAY_VERSION}
 	if strings.Contains(playInfo.VideoURL, ".m3u8") {
 		if text, err := c.GetString(playInfo.VideoURL, map[string]string{"Referer": LIVE_REFERER_URL}); err == nil {
 			if rewritten, err := shared.CssLcloudRewriteM3U8Keys(c, text, LIVE_REFERER_URL); err == nil {
@@ -672,7 +753,10 @@ func resolveReplayPayload(c *util.Client, playURL, referer string) (liveReplayPa
 }
 
 func getJSONWithParams(c *util.Client, endpoint string, params url.Values, headers map[string]string) (string, error) {
-	u, _ := url.Parse(endpoint)
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return "", err
+	}
 	u.RawQuery = params.Encode()
 	return c.GetString(u.String(), headers)
 }

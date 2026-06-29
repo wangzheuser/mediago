@@ -172,6 +172,10 @@ func TestExtractMock(t *testing.T) {
 		switch {
 		case r.Host == "k.wangxiao.cn" && r.Method == http.MethodGet && r.URL.Path == "/play":
 			writeFixture(t, w, fixtures, "play_page")
+		case r.Host == "k.wangxiao.cn" && r.Method == http.MethodGet && r.URL.Path == "/Course/ProductsDirectory":
+			_, _ = w.Write([]byte(`<html></html>`))
+		case r.Host == "live.wangxiao.cn" && r.Method == http.MethodGet && r.URL.Path == "/LiveActivity/DownHandOut/":
+			_, _ = w.Write([]byte(``))
 		case r.Host == "p.bokecc.com" && r.Method == http.MethodGet && r.URL.Path == "/servlet/getvideofile":
 			writeFixture(t, w, fixtures, "bokecc")
 		default:

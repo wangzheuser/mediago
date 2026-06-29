@@ -24,7 +24,7 @@
 | `_get_catagory_info` line 199 | `resolveCourse` | GET | ✓ |
 | `_get_lesson_info` line 265 | `resolveLesson` | GET | ✓ |
 | `_get_m3u8_info` line 330 (AES decrypt live_url) | `findMediaURL` + `aesDecryptLiveURL` | - | ✓ |
-| `_get_pub_key` / `_request_watch_demand_data` | `requestWatchDemand` | GET + POST form | ✓ (plain POST; RSA crypto not implemented) |
+| `_get_pub_key` / `_decrypt_video_key` / `_request_watch_demand_data` | `getPubKey` + `requestWatchDemand` | GET public key + RSA-encrypted POST form | ✓ |
 
 ## AES Decryption
 
@@ -32,6 +32,7 @@
 |---|---|---|
 | `_get_m3u8_info` line 330: AES key `1234567898882222`, IV `8NONwyJtHesysWpM` | `aesDecryptLiveURL` with `aesKey`/`aesIV` | ✓ |
 | `_get_file` line 697: same AES key/IV for download_path | `aesDecryptLiveURL` (same function) | ✓ |
+| `_get_pub_key`: AES key/IV `wwwoffcncloudcom`; watch demand response uses random key as key/IV | `aesDecryptWithStatic` inside `requestWatchDemand` | ✓ |
 
 ## JSON 字段映射
 
@@ -47,7 +48,6 @@
 
 | 源码方法 | 状态 | 说明 |
 |---|---|---|
-| `_decrypt_video_key` / `_request_watch_demand_data` RSA crypto | blocked | requires RSA public key encryption (`rsa_encrypt`) to POST to watch_demand; DRM flow, fail closed |
 | `_download_eoffcn_board_playback` board rendering | blocked | requires Eoffcn_Local whiteboard SDK + Edge/Chrome renderer; local tool, not HTTP extraction |
 
-未解析到 `live_url` / `video_url` 时返回明确错误 (包含 RSA 提示), 不返回空 Streams.
+未解析到 `live_url` / `video_url` 且 `requestWatchDemand` 未返回媒体 URL 时返回明确错误, 不返回空 Streams.

@@ -47,6 +47,7 @@ type CssLcloudPayload struct {
 	ViewerName  string // CC viewer display name
 	ViewerToken string // CC viewer auth token (uid + ":" + lid)
 	Referer     string // parent-site referer for HTTP requests
+	Version     string // optional replay API version override
 }
 
 // CssLcloudPlayInfo is the resolved playback information.
@@ -69,6 +70,10 @@ func CssLcloudResolvePlayInfo(c *util.Client, p CssLcloudPayload) (*CssLcloudPla
 		return nil, fmt.Errorf("csslcloud: missing required liveRoomId/recordId/accessid")
 	}
 
+	version := p.Version
+	if version == "" {
+		version = CssLcloudReplayVersionV1
+	}
 	loginForm := map[string]string{
 		"liveRoomId":  p.LiveRoomID,
 		"liveid":      p.LiveRoomID, // alias accepted by some endpoints
@@ -80,7 +85,7 @@ func CssLcloudResolvePlayInfo(c *util.Client, p CssLcloudPayload) (*CssLcloudPla
 		"viewername":  p.ViewerName,
 		"viewertoken": p.ViewerToken,
 		"forcibly":    "0",
-		"version":     CssLcloudReplayVersionV1,
+		"version":     version,
 		"service":     "3",
 		"client":      "4",
 	}

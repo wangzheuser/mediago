@@ -25,6 +25,10 @@ const (
 	pcInfoURL         = "https://%s/xe.course.business.column.items.get/2.0.0"
 	memberInfoURL     = "https://%s%s/xe.course.business.member.single_items.get/2.0.0"
 	pcMemberInfoURL   = "https://%s/xe.course.business.member.single_items.get/2.0.0"
+	termURL           = "https://%s%s/xe.course.business.camp.catalog.get/2.0.0"
+	pcTermURL         = "https://%s/xe.course.business.camp.catalog.get/2.0.0"
+	nodeURL           = "https://%s%s/xe.course.business.camp.node.get/2.0.0"
+	pcNodeURL         = "https://%s/xe.course.business.camp.node.get/2.0.0"
 	videoPlayURL      = "https://%s%s/xe.material-center.play/getPlayUrl"
 	sourceURL         = "https://%s%s/xe.course.business.video.detail_info.get/2.0.0"
 	pcSourceURL       = "https://%s/xe.course.business.video.detail_info.get/2.0.0"
@@ -39,6 +43,11 @@ const (
 	pcEbookURL        = "https://%s/xe.course.business.ebook.info/2.0.0"
 	fileURL           = "https://%s%s/xe.course.business.courseware_list.get/2.0.0"
 	pcFileURL         = "https://%s/xe.course.business.courseware_list.get/2.0.0"
+	clockIntroURL     = "https://%s%s/punch_card/get_clock_introduction"
+	clockTreeURL      = "https://%s%s/punch_card/get_chapter_tree_list"
+	clockChapterURL   = "https://%s%s/punch_card/get_chapter_detail"
+	trainPCClockURL   = "https://%s%s/punch_card/get_work_clock_detail"
+	trainClockURL     = "https://%s%s/punch_card/get_punch_clock_theme_detail"
 	pageSize          = 30
 )
 
@@ -84,21 +93,35 @@ func (x *Xiaoetech) Extract(rawURL string, opts *extractor.ExtractOpts) (*extrac
 	entries := []*extractor.MediaInfo{}
 	blockedReasons := []string{}
 	seenURL, seenItem := map[string]bool{}, map[string]bool{}
-	for _, it := range items {
-		if it.id == "" || seenItem[it.id] || (ctx.cid != "" && it.id != ctx.cid) {
-			continue
-		}
-		seenItem[it.id] = true
+	var processItem func(xetItem, bool)
+	addEntry := func(it xetItem) {
 		u, extra := resolveItem(c, opts.Cookies, ctx.withItem(it), it)
 		if reason := val(extra, "blocked_reason"); reason != "" {
 			blockedReasons = append(blockedReasons, reason)
-			continue
+			return
 		}
 		if u == "" || seenURL[u] {
-			continue
+			return
 		}
 		seenURL[u] = true
 		entries = append(entries, media(firstNonEmpty(it.title, ctx.title, it.id), u, extra))
+	}
+	processItem = func(it xetItem, topLevel bool) {
+		key := it.id + "|" + normType(it.typ)
+		if it.id == "" || seenItem[key] || (topLevel && ctx.cid != "" && it.id != ctx.cid) {
+			return
+		}
+		seenItem[key] = true
+		if expanded := expandContainerItem(c, opts.Cookies, ctx.withItem(it), it); len(expanded) > 0 {
+			for _, child := range expanded {
+				processItem(child, false)
+			}
+			return
+		}
+		addEntry(it)
+	}
+	for _, it := range items {
+		processItem(it, true)
 	}
 	if len(entries) == 0 {
 		if len(blockedReasons) > 0 {
@@ -126,11 +149,13 @@ func (c xetCtx) withItem(it xetItem) xetCtx {
 			c.typ = p.typ
 		}
 	}
-	if c.cid == "" {
+	if parentID := val(it.raw, "_parent_id"); parentID != "" && c.cid == "" {
+		c.cid = parentID
+	} else if c.cid == "" {
 		c.cid = it.id
 	}
-	if c.typ == "" {
-		c.typ = normType(it.typ)
+	if typ := normType(it.typ); typ != "" {
+		c.typ = typ
 	}
 	if c.referer == "" {
 		c.referer = referer(c)
@@ -162,12 +187,19 @@ func parseCtx(raw string) xetCtx {
 			ctx.typ, ctx.cid = "video", m[6]
 		}
 	}
+	if ctx.typ == "" && strings.Contains(strings.ToLower(u.Path), "/clock/") {
+		ctx.typ = "clock"
+	}
 	q := u.Query()
 	ctx.appID = firstNonEmpty(q.Get("app_id"), q.Get("appId"), ctx.appID)
 	ctx.userID = firstNonEmpty(q.Get("user_id"), q.Get("uid"))
-	ctx.cid = firstNonEmpty(ctx.cid, q.Get("resource_id"), q.Get("product_id"), q.Get("course_id"), q.Get("id"))
+	ctx.cid = firstNonEmpty(ctx.cid, q.Get("activity_id"), q.Get("resource_id"), q.Get("product_id"), q.Get("course_id"), q.Get("id"))
 	ctx.typ = normType(ctx.typ)
-	ctx.referer = referer(ctx)
+	if ctx.typ == "clock" && raw != "" {
+		ctx.referer = raw
+	} else {
+		ctx.referer = referer(ctx)
+	}
 	return ctx
 }
 

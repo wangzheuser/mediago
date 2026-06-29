@@ -29,6 +29,7 @@ type Stream struct {
 	NeedMerge bool              `json:"need_merge"`
 	AudioURL  string            `json:"audio_url,omitempty"`
 	Headers   map[string]string `json:"headers,omitempty"`
+	Extra     map[string]any    `json:"extra,omitempty"`
 }
 
 type Chapter struct {

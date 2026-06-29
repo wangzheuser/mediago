@@ -25,6 +25,19 @@
 | `token`, `video_id`, `room_id`, `classid` | `playTokenResponse` tags + regex fallback | ✓ |
 | `data.play_info`, `data.video_url`, `data.playback_url`, `data.video[].url` | `shared.BaijiayunPlaybackResponse` | ✓ |
 
+## 云端课堂 Yunduan_Course.py
+
+| Python 参考 | Go 实现 | 说明 |
+|---|---|---|
+| `Yunduan_Course.entry_url` | `yunduanEntryURL` + `discoverYunduanDomain` | 支持 `www.baijiayun.com/entry` 页面/Cookie 中发现 `*.at.baijiayun.com` 域名 |
+| `account_url` | `validateYunduanLogin` | 使用 `ORGSUPERSESSID` 校验机构后台登录态 |
+| `course_list_url` | `fetchYunduanCourses` | 拉取 `/org/course_playback/getCourseList` 并构造课程候选 |
+| `course_lesson_url`, `api_lesson_url`, `course_recent_url` | `getYunduanCourseLessons` + `appendYunduanRecentLessonsIfIncomplete` | 合并课程课时和近期回放补全 |
+| `long_room_url`, `long_lesson_url`, `short_lesson_url`, `class_recent_url` | `fetchYunduanCourses` + `getYunduanCourseLessons` | 支持长期班课房间和长/短期班课回放 |
+| `_extract_room_token` | `extractYunduanRoomToken` | 从字段或 `play_url` query 中提取 `room_id/classid` 与 token |
+| 父类百家云回放解析 | `resolvePlayback` + `shared.BaijiayunResolvePlayback` | 复用百家云 `getPlayInfo` 回放链路 |
+
+
 ## 阻塞步骤
 
 无。

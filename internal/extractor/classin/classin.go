@@ -12,6 +12,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -88,13 +89,14 @@ var (
 
 func (ci *Classin) Extract(rawURL string, opts *extractor.ExtractOpts) (*extractor.MediaInfo, error) {
 	c := util.NewClient()
+	auth := classinAuthFromOpts(opts)
 	if opts != nil && opts.Cookies != nil {
 		c.SetCookieJar(opts.Cookies)
 	}
 	headers := map[string]string{"Referer": referer(rawURL), "User-Agent": classinUA}
 
 	if pm3u8 := extractPM3U8Path(rawURL); pm3u8 != "" {
-		mediaURL, err := resolveM3U8Token(c, pm3u8)
+		mediaURL, err := resolveM3U8Token(c, pm3u8, auth)
 		if err != nil {
 			return nil, err
 		}
@@ -103,10 +105,10 @@ func (ci *Classin) Extract(rawURL string, opts *extractor.ExtractOpts) (*extract
 	}
 
 	parsed := parseIDs(rawURL)
-	payloads := requestRecordPayloads(c, parsed)
+	payloads := requestRecordPayloads(c, parsed, auth)
 	var plays []playable
 	for _, payload := range payloads {
-		plays = append(plays, collectPlayables(c, payload)...)
+		plays = append(plays, collectPlayables(c, payload, auth)...)
 	}
 	plays = dedupePlayables(plays)
 	if len(plays) == 1 {
@@ -123,27 +125,27 @@ func (ci *Classin) Extract(rawURL string, opts *extractor.ExtractOpts) (*extract
 	// No direct media resolved from the URL. Fall back to the bulk course tree
 	// (course_list -> studentUnitList -> studentUnitActivityList -> homework/get
 	// -> file/getDownInfo), aligned with Classin_Course.pyc.
-	if course, err := ci.extractCourseTree(c, parsed, headers); err == nil && course != nil {
+	if course, err := ci.extractCourseTree(c, parsed, headers, auth); err == nil && course != nil {
 		return course, nil
 	}
 	return nil, fmt.Errorf("classin: no pm3u8/mp4 media found in record APIs")
 }
 
-func requestRecordPayloads(c *util.Client, in ids) []any {
+func requestRecordPayloads(c *util.Client, in ids, auth classinAuth) []any {
 	var out []any
 	forms := []struct {
 		api  string
 		data map[string]string
 	}{
 		{urlRecordGet, map[string]string{"getStuStatistic": "1", "activityId": in.ActivityID, "courseId": in.CourseID, "classRole": "1", "clusterRole": "0", "SID": in.SID}},
-		{urlLessonInfo, map[string]string{"flag": "1", "memberUid": classinUID, "clientClassId": firstNonEmpty(in.ClassID, in.RecordID, in.ActivityID), "clientCourseId": in.CourseID, "SID": in.SID}},
-		{urlUserRecords, map[string]string{"clientCourseId": in.CourseID, "UID": classinUID, "schoolUid": in.SID, "clientClassId": firstNonEmpty(in.ClassID, in.RecordID)}},
+		{urlLessonInfo, map[string]string{"flag": "1", "memberUid": auth.normalized().UID, "clientClassId": firstNonEmpty(in.ClassID, in.RecordID, in.ActivityID), "clientCourseId": in.CourseID, "SID": in.SID}},
+		{urlUserRecords, map[string]string{"clientCourseId": in.CourseID, "UID": auth.normalized().UID, "schoolUid": in.SID, "clientClassId": firstNonEmpty(in.ClassID, in.RecordID)}},
 	}
 	for _, form := range forms {
 		if !hasUsefulValue(form.data) {
 			continue
 		}
-		payload, err := postFormJSON(c, form.api, form.data)
+		payload, err := postFormJSON(c, form.api, form.data, auth)
 		if err == nil {
 			out = append(out, payload)
 		}
@@ -151,8 +153,8 @@ func requestRecordPayloads(c *util.Client, in ids) []any {
 	return out
 }
 
-func postFormJSON(c *util.Client, api string, data map[string]string) (any, error) {
-	headers := classinSignHeaders(data, "application/x-www-form-urlencoded")
+func postFormJSON(c *util.Client, api string, data map[string]string, auth classinAuth) (any, error) {
+	headers := classinSignHeaders(data, "application/x-www-form-urlencoded", auth)
 	body, err := c.PostForm(api, data, headers)
 	if err != nil {
 		return nil, err
@@ -166,9 +168,9 @@ func postFormJSON(c *util.Client, api string, data map[string]string) (any, erro
 
 // postFormMap is postFormJSON typed to the standard ClassIn envelope so callers
 // can read error_info/data directly without re-walking an any tree.
-func postFormMap(c *util.Client, api string, data map[string]string) (classinEnvelope, error) {
+func postFormMap(c *util.Client, api string, data map[string]string, auth classinAuth) (classinEnvelope, error) {
 	var env classinEnvelope
-	headers := classinSignHeaders(data, "application/x-www-form-urlencoded")
+	headers := classinSignHeaders(data, "application/x-www-form-urlencoded", auth)
 	body, err := c.PostForm(api, data, headers)
 	if err != nil {
 		return env, err
@@ -182,9 +184,9 @@ func postFormMap(c *util.Client, api string, data map[string]string) (classinEnv
 // postJSONMap signs the JSON body keys (course_list is the only JSON endpoint)
 // and returns the parsed envelope. The signature still hashes the flat key=value
 // pairs, matching _create_sign_headers in the Python source.
-func postJSONMap(c *util.Client, api string, data map[string]string) (classinEnvelope, error) {
+func postJSONMap(c *util.Client, api string, data map[string]string, auth classinAuth) (classinEnvelope, error) {
 	var env classinEnvelope
-	headers := classinSignHeaders(data, "application/json")
+	headers := classinSignHeaders(data, "application/json", auth)
 	payload, err := json.Marshal(jsonBody(data))
 	if err != nil {
 		return env, err
@@ -207,13 +209,13 @@ func postJSONMap(c *util.Client, api string, data map[string]string) (classinEnv
 	return env, nil
 }
 
-func resolveM3U8Token(c *util.Client, pm3u8Path string) (string, error) {
-	pub, err := generatePublicKeyPEM()
+func resolveM3U8Token(c *util.Client, pm3u8Path string, auth classinAuth) (string, error) {
+	pub, pri, err := generateRSAKeyPairPEM()
 	if err != nil {
 		return "", err
 	}
-	data := map[string]string{"publicKey": pub, "fileUrl": pm3u8Path}
-	body, err := c.PostForm(urlM3u8Token, data, classinSignHeaders(data, "application/x-www-form-urlencoded"))
+	data := map[string]string{"publicKey": strings.TrimSpace(pub), "fileUrl": pm3u8Path}
+	body, err := c.PostForm(urlM3u8Token, data, classinSignHeaders(data, "application/x-www-form-urlencoded", auth))
 	if err != nil {
 		return "", fmt.Errorf("classin getM3u8Token: %w", err)
 	}
@@ -229,21 +231,24 @@ func resolveM3U8Token(c *util.Client, pm3u8Path string) (string, error) {
 	if len(parts) > 1 {
 		manifest += "&" + strings.Join(parts[1:], "&")
 	}
+	if rewritten := rewriteClassinM3U8(c, manifest, pri); rewritten != "" {
+		return dataM3U8URL(rewritten), nil
+	}
 	return manifest, nil
 }
 
-func collectPlayables(c *util.Client, payload any) []playable {
+func collectPlayables(c *util.Client, payload any, auth classinAuth) []playable {
 	var out []playable
 	for _, node := range walkMaps(payload) {
 		title := textValue(node, "lessonName", "name", "title", "fileName")
 		if video := textValue(node, "video"); strings.HasPrefix(strings.TrimSpace(video), "[") || strings.HasPrefix(strings.TrimSpace(video), "{") {
 			var nested any
 			if json.Unmarshal([]byte(video), &nested) == nil {
-				out = append(out, collectPlayables(c, nested)...)
+				out = append(out, collectPlayables(c, nested, auth)...)
 			}
 		}
 		for _, key := range []string{"pm3u8_path", "pm3u8", "Pm3u8", "m3u8", "M3u8", "Url", "url", "mp4_url", "path"} {
-			if p := playableFromString(c, textValue(node, key), title); p.URL != "" {
+			if p := playableFromString(c, textValue(node, key), title, auth); p.URL != "" {
 				out = append(out, p)
 			}
 		}
@@ -251,13 +256,13 @@ func collectPlayables(c *util.Client, payload any) []playable {
 	return out
 }
 
-func playableFromString(c *util.Client, raw string, title string) playable {
+func playableFromString(c *util.Client, raw string, title string, auth classinAuth) playable {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return playable{}
 	}
 	if path := extractPM3U8Path(raw); path != "" {
-		mediaURL, err := resolveM3U8Token(c, path)
+		mediaURL, err := resolveM3U8Token(c, path, auth)
 		if err == nil {
 			return playable{Title: title, URL: mediaURL, Format: "m3u8"}
 		}
@@ -268,7 +273,7 @@ func playableFromString(c *util.Client, raw string, title string) playable {
 	return playable{}
 }
 
-func classinSignHeaders(data map[string]string, contentType string) map[string]string {
+func classinSignHeaders(data map[string]string, contentType string, auth classinAuth) map[string]string {
 	ts := fmt.Sprint(time.Now().Unix())
 	pairs := make([]string, 0, len(data)+1)
 	for k, v := range data {
@@ -276,14 +281,28 @@ func classinSignHeaders(data map[string]string, contentType string) map[string]s
 	}
 	pairs = append(pairs, "timeStamp="+ts)
 	sort.Strings(pairs)
-	sign := util.MD5(strings.Join(pairs, "&") + "&key=" + classinKey)
+	auth = auth.normalized()
+	sign := util.MD5(strings.Join(pairs, "&") + "&key=" + auth.Key)
 	return map[string]string{
-		"Accept":       "application/json, text/plain, */*",
-		"Content-Type": contentType,
-		"User-Agent":   classinUA,
-		"x-eeo-uid":    classinUID,
-		"x-eeo-sign":   sign,
-		"x-eeo-ts":     ts,
+		"EEO-Cache-Control":     "no-cache",
+		"Accept":                "application/json, text/plain, */*",
+		"Accept-Language":       "zh-CN,en,*",
+		"Connection":            "Keep-Alive",
+		"Content-Type":          contentType,
+		"User-Agent":            classinUA,
+		"X-EEO-DEVICE-MAP":      "source=1,version=6.0.3.2611,brand=11th%20Gen%20Intel%28R%29%20Core%28TM%29%20i7-11800H%20%402.30GHz,model=MECHREVO,release=Windows%2011%20%2824H2%29",
+		"X-EEO-DEVICE-ID":       "b80dea19-1f06-4067-bf4b-5a8c8c1ea36f_B0:25:AA:4C:DE:F9",
+		"X-EEO-CLIENT-VER":      "6.0.3.2611",
+		"X-EEO-CLIENT-TYPE":     "9",
+		"X-EEO-CLIENT-OS-FLAG":  "3",
+		"X-EEO-CLIENT-MODEL":    "MECHREVO",
+		"X-EEO-CLIENT-LANGUAGE": "zh-CN",
+		"X-EEO-CLIENT-FLAG":     "b80dea19-1f06-4067-bf4b-5a8c8c1ea36f_B0:25:AA:4C:DE:F9",
+		"X-EEO-CLIENT-BRAND":    "11th%20Gen%20Intel%28R%29%20Core%28TM%29%20i7-11800H%20%402.30GHz",
+		"X-APP-ID":              "classin",
+		"x-eeo-uid":             auth.UID,
+		"x-eeo-sign":            sign,
+		"x-eeo-ts":              ts,
 	}
 }
 
@@ -327,16 +346,130 @@ func extractPM3U8Path(raw string) string {
 	return ""
 }
 
-func generatePublicKeyPEM() (string, error) {
+func generateRSAKeyPairPEM() (string, string, error) {
 	key, err := rsa.GenerateKey(rand.Reader, 1024)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	der, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	return string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der})), nil
+	pub := string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}))
+	pri := string(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}))
+	return pub, pri, nil
+}
+
+func rewriteClassinM3U8(c *util.Client, manifestURL, privateKeyPEM string) string {
+	body, err := c.GetString(manifestURL, classinMediaHeaders(manifestURL))
+	if err != nil || !strings.Contains(body, "#EXTM3U") {
+		return ""
+	}
+	rewritten := rewriteClassinM3U8Text(c, body, manifestURL, privateKeyPEM)
+	if strings.TrimSpace(rewritten) == "" {
+		return ""
+	}
+	return rewritten
+}
+
+var classinKeyURIRe = regexp.MustCompile(`URI="([^"]+)"`)
+
+func rewriteClassinM3U8Text(c *util.Client, text, manifestURL, privateKeyPEM string) string {
+	base := manifestBaseURL(manifestURL)
+	changed := false
+	lines := strings.Split(text, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "#EXT-X-KEY:") {
+			if m := classinKeyURIRe.FindStringSubmatch(line); len(m) > 1 {
+				keyURL := resolveClassinURI(m[1], base)
+				encrypted, err := c.GetBytes(keyURL, classinMediaHeaders(manifestURL))
+				if err == nil {
+					if key, derr := decryptClassinM3U8Key(encrypted, privateKeyPEM); derr == nil && len(key) == 16 {
+						dataURI := "data:application/octet-stream;base64," + base64.StdEncoding.EncodeToString(key)
+						lines[i] = strings.Replace(line, m[1], dataURI, 1)
+						changed = true
+					}
+				}
+			}
+			continue
+		}
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") || isClassinAbsoluteURI(trimmed) {
+			continue
+		}
+		lines[i] = resolveClassinURI(trimmed, base)
+		changed = true
+	}
+	if !changed {
+		return text
+	}
+	return strings.Join(lines, "\n")
+}
+
+func decryptClassinM3U8Key(encrypted []byte, privateKeyPEM string) ([]byte, error) {
+	block, _ := pem.Decode([]byte(privateKeyPEM))
+	if block == nil {
+		return nil, fmt.Errorf("classin: invalid private key PEM")
+	}
+	key, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+	if err != nil {
+		parsed, perr := x509.ParsePKCS8PrivateKey(block.Bytes)
+		if perr != nil {
+			return nil, err
+		}
+		var ok bool
+		key, ok = parsed.(*rsa.PrivateKey)
+		if !ok {
+			return nil, fmt.Errorf("classin: private key is not RSA")
+		}
+	}
+	plain, err := rsa.DecryptPKCS1v15(rand.Reader, key, encrypted)
+	if err != nil {
+		return nil, err
+	}
+	if len(plain) > 16 {
+		plain = plain[:16]
+	}
+	return plain, nil
+}
+
+func classinMediaHeaders(rawURL string) map[string]string {
+	return map[string]string{"Referer": "https://www.eeo.cn", "User-Agent": classinUA}
+}
+
+func dataM3U8URL(text string) string {
+	return "data:application/vnd.apple.mpegurl;charset=utf-8," + url.PathEscape(text)
+}
+
+func manifestBaseURL(rawURL string) string {
+	if idx := strings.LastIndex(rawURL, "/"); idx >= 0 {
+		return rawURL[:idx+1]
+	}
+	return rawURL
+}
+
+func resolveClassinURI(rawURI, baseURL string) string {
+	rawURI = strings.TrimSpace(rawURI)
+	if rawURI == "" || isClassinAbsoluteURI(rawURI) {
+		if strings.HasPrefix(rawURI, "//") {
+			return "https:" + rawURI
+		}
+		return rawURI
+	}
+	base, err := url.Parse(baseURL)
+	if err != nil {
+		return strings.TrimRight(baseURL, "/") + "/" + strings.TrimLeft(rawURI, "/")
+	}
+	ref, err := url.Parse(rawURI)
+	if err != nil {
+		return rawURI
+	}
+	return base.ResolveReference(ref).String()
+}
+
+func isClassinAbsoluteURI(s string) bool {
+	low := strings.ToLower(strings.TrimSpace(s))
+	return strings.HasPrefix(low, "http://") || strings.HasPrefix(low, "https://") || strings.HasPrefix(low, "data:") || strings.HasPrefix(low, "//")
 }
 
 func walkMaps(v any) []map[string]any {

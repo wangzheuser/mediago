@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/url"
-	"sort"
 	"strings"
 
 	"github.com/Sophomoresty/mediago/internal/extractor"
@@ -28,6 +27,8 @@ const (
 	open_course_detail_api = "https://www.sieredu.com/web/opencourse/openCourseCouMaterialDetail"
 	open_course_check_api  = "https://www.sieredu.com/web/play/checkOpenCoursePlay"
 	getplayinfo_api        = "https://playvideo.vodplayvideo.net/getplayinfo/v4/%s/%s"
+	SIER_APP_SECRET        = "e1018d3bb5664bada75ef6a619a07900"
+	SIER_APP_KEY           = "10000"
 	SIER_TOKEN_AES_KEY_B64 = "3q2+7JIh4SLfKp9mAXFv7A=="
 	SIER_VOD_DEFAULT_APPID = "1500015546"
 )
@@ -71,11 +72,16 @@ type cookieInfo struct{ Cookie, SID, DeviceID string }
 type courseRef struct{ ID, Title string }
 type videoInfo struct {
 	VideoID, CatalogID, MaterialID, VerificationCode, Title, DirectURL string
+	CourseID, BuyCourseID, PrevCatalogID, OpenCourseID                 string
 	Open                                                               bool
 }
+type fileInfo struct {
+	Name, URL, Format, CatalogID, MaterialID string
+}
 type playInfo struct {
-	URL  string
-	Size int64
+	URL      string
+	Size     int64
+	M3U8Text string
 }
 
 func extractOpenCourse(c *util.Client, h map[string]string, id string) (*extractor.MediaInfo, error) {
@@ -87,10 +93,20 @@ func extractOpenCourse(c *util.Client, h map[string]string, id string) (*extract
 	title := sanitize(first(textAt(entity, "name", "courseName", "openCourseName", "title"), "sier_open_"+id))
 	materials := extractLists(entity, "openCourseMaterialList", "materialList", "list")
 	var videos []videoInfo
+	var files []fileInfo
 	for i, m := range materials {
-		videos = append(videos, videoInfo{VideoID: first(textAt(m, "videoId", "fileId"), textAt(unwrapMap(m["playUrl"]), "videoId", "fileId")), MaterialID: first(textAt(m, "id", "materialId"), fmt.Sprint(i+1)), VerificationCode: textAt(m, "verificationCode"), Title: fmt.Sprintf("[%d]--%s", i+1, first(textAt(m, "name", "title", "materialName"), "视频")), DirectURL: directPlayURL(m), Open: true})
+		kind := strings.ToLower(textAt(m, "typeKey", "type", "materialTypeKey"))
+		direct := videoPlayURL(m)
+		if direct != "" || strings.Contains(kind, "video") {
+			videos = append(videos, videoInfo{VideoID: first(textAt(m, "videoId", "fileId"), textAt(unwrapMap(m["playUrl"]), "videoId", "fileId")), MaterialID: first(textAt(m, "id", "materialId"), fmt.Sprint(i+1)), VerificationCode: textAt(m, "verificationCode"), Title: fmt.Sprintf("[%d]--%s", i+1, first(textAt(m, "name", "title", "materialName"), "视频")), DirectURL: direct, OpenCourseID: id, Open: true})
+			continue
+		}
+		if f := fileFromNode(m, "资料", first(textAt(m, "id", "materialId"), fmt.Sprint(i+1))); f.URL != "" {
+			f.Name = fmt.Sprintf("(%d)--%s", len(files)+1, sanitize(first(f.Name, "资料")))
+			files = append(files, f)
+		}
 	}
-	return buildCourse(c, h, title, id, videos)
+	return buildCourse(c, h, title, id, videos, files)
 }
 func extractNormalCourse(c *util.Client, h map[string]string, id string) (*extractor.MediaInfo, error) {
 	title := "sier_" + id
@@ -106,6 +122,7 @@ func extractNormalCourse(c *util.Client, h map[string]string, id string) (*extra
 		return nil, fmt.Errorf("sier plan list: %w", err)
 	}
 	var videos []videoInfo
+	var files []fileInfo
 	for _, p := range extractLists(unwrapMap(plan), "list", "records", "courseList") {
 		for _, cat := range extractLists(p, "catalogList", "children", "nodeList") {
 			catalogID := first(textAt(cat, "catalogId", "id"), textAt(unwrapMap(cat["resource"]), "catalogId", "id"))
@@ -113,19 +130,25 @@ func extractNormalCourse(c *util.Client, h map[string]string, id string) (*extra
 				continue
 			}
 			detail, _ := requestJSON(c, "POST", catalog_api, nil, map[string]any{"courseId": id, "catalogId": catalogID}, h, "https://study.sieredu.com/")
-			collected := collectVideos(unwrapMap(detail), id, catalogID)
+			detailMap := unwrapMap(detail)
+			collected := collectVideos(detailMap, id, catalogID)
+			files = append(files, collectFiles(detailMap, catalogID)...)
 			if len(collected) == 0 {
 				collected = collectVideos(cat, id, catalogID)
 			}
+			files = append(files, collectFiles(cat, catalogID)...)
 			videos = append(videos, collected...)
 		}
 	}
 	if len(videos) == 0 {
 		videos = collectVideos(unwrapMap(plan), id, "")
 	}
-	return buildCourse(c, h, sanitize(title), id, videos)
+	if len(files) == 0 {
+		files = collectFiles(unwrapMap(plan), "")
+	}
+	return buildCourse(c, h, sanitize(title), id, videos, files)
 }
-func buildCourse(c *util.Client, h map[string]string, title, courseID string, videos []videoInfo) (*extractor.MediaInfo, error) {
+func buildCourse(c *util.Client, h map[string]string, title, courseID string, videos []videoInfo, files []fileInfo) (*extractor.MediaInfo, error) {
 	seen := map[string]bool{}
 	var entries []*extractor.MediaInfo
 	for i, v := range videos {
@@ -139,10 +162,31 @@ func buildCourse(c *util.Client, h map[string]string, title, courseID string, vi
 			continue
 		}
 		name := sanitize(first(v.Title, fmt.Sprintf("[%d]--视频", i+1)))
-		entries = append(entries, &extractor.MediaInfo{Site: "sier", Title: name, Streams: map[string]extractor.Stream{"best": {Quality: "best", URLs: []string{play.URL}, Format: pickFormat(play.URL), Size: play.Size, Headers: map[string]string{"Referer": referer}}}, Extra: map[string]any{"video_id": v.VideoID, "catalog_id": v.CatalogID, "material_id": v.MaterialID}})
+		format := pickFormat(play.URL)
+		stream := extractor.Stream{Quality: "best", URLs: []string{play.URL}, Format: format, Size: play.Size, Headers: map[string]string{"Referer": referer}}
+		if format == "m3u8" {
+			stream.NeedMerge = true
+		}
+		extra := map[string]any{"video_id": v.VideoID, "catalog_id": v.CatalogID, "material_id": v.MaterialID}
+		if play.M3U8Text != "" {
+			extra["m3u8_text"] = play.M3U8Text
+			extra["source_type"] = "m3u8_text"
+		}
+		entries = append(entries, &extractor.MediaInfo{Site: "sier", Title: name, Streams: map[string]extractor.Stream{"best": stream}, Extra: extra})
+	}
+	for i, f := range files {
+		key := first(f.URL, f.CatalogID, f.MaterialID)
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		format := first(f.Format, pickFormat(f.URL))
+		name := sanitize(first(f.Name, fmt.Sprintf("(%d)--资料", i+1)))
+		stream := extractor.Stream{Quality: "best", URLs: []string{f.URL}, Format: format, Headers: map[string]string{"Referer": referer}}
+		entries = append(entries, &extractor.MediaInfo{Site: "sier", Title: name, Streams: map[string]extractor.Stream{"best": stream}, Extra: map[string]any{"type": "file", "catalog_id": f.CatalogID, "material_id": f.MaterialID}})
 	}
 	if len(entries) == 0 {
-		return nil, fmt.Errorf("sier: no playable videos found from catalog/play APIs")
+		return nil, fmt.Errorf("sier: no playable videos/materials found from catalog/play APIs")
 	}
 	return &extractor.MediaInfo{Site: "sier", Title: title, Entries: entries, Extra: map[string]any{"course_id": courseID}}, nil
 }
@@ -168,9 +212,19 @@ func collectVideos(v any, courseID, fallbackCatalog string) []videoInfo {
 			kind := strings.ToLower(first(textAt(t, "discriminator", "materialTypeKey", "typeKey", "resourceType", "type"), textAt(unwrapMap(t["material"]), "typeKey")))
 			res, mat := unwrapMap(t["resource"]), unwrapMap(t["material"])
 			vid := first(textAt(res, "videoId", "fileId", "id"), textAt(mat, "videoId", "fileId"), textAt(t, "videoId", "fileId", "resourceId"))
-			direct := first(directPlayURL(t), directPlayURL(res), directPlayURL(mat))
+			direct := first(videoPlayURL(t), videoPlayURL(res), videoPlayURL(mat))
 			if vid != "" || direct != "" || strings.Contains(kind, "video") || strings.Contains(kind, "live") || kind == "tc" {
-				out = append(out, videoInfo{VideoID: vid, CatalogID: first(textAt(t, "catalogId", "id"), fallbackCatalog), VerificationCode: first(textAt(t, "verificationCode"), textAt(res, "verificationCode"), textAt(mat, "verificationCode")), Title: first(textAt(t, "catalogName", "lessonName", "name", "title"), textAt(res, "name", "title"), textAt(mat, "name", "title"), "视频"), DirectURL: direct})
+				catalogID := first(textAt(t, "catalogId", "id"), fallbackCatalog)
+				out = append(out, videoInfo{
+					VideoID:          vid,
+					CatalogID:        catalogID,
+					CourseID:         courseID,
+					BuyCourseID:      first(textAt(t, "buyCourseId", "buy_course_id"), courseID),
+					PrevCatalogID:    first(textAt(t, "prevCatalogId", "prev_catalog_id"), "0"),
+					VerificationCode: first(textAt(t, "verificationCode"), textAt(res, "verificationCode"), textAt(mat, "verificationCode")),
+					Title:            first(textAt(t, "catalogName", "lessonName", "name", "title"), textAt(res, "name", "title"), textAt(mat, "name", "title"), "视频"),
+					DirectURL:        direct,
+				})
 			}
 			for _, k := range []string{"children", "nodeList", "childList", "syllabus", "courseList", "unitList", "catalogList"} {
 				walk(t[k])
@@ -182,16 +236,20 @@ func collectVideos(v any, courseID, fallbackCatalog string) []videoInfo {
 		}
 	}
 	walk(v)
-	_ = courseID
 	return out
 }
 func resolveVideo(c *util.Client, h map[string]string, v videoInfo) playInfo {
 	if strings.HasPrefix(v.DirectURL, "http") {
 		return playInfo{URL: v.DirectURL}
 	}
-	checkURL, params := check_play_api, map[string]string{"catalogId": v.CatalogID, "courseId": "", "buyCourseId": "", "prevCatalogId": "0"}
+	checkURL, params := check_play_api, map[string]string{
+		"catalogId":     v.CatalogID,
+		"courseId":      v.CourseID,
+		"buyCourseId":   first(v.BuyCourseID, v.CourseID),
+		"prevCatalogId": first(v.PrevCatalogID, "0"),
+	}
 	if v.Open {
-		checkURL, params = open_course_check_api, map[string]string{"openCourseId": "", "materialId": v.MaterialID}
+		checkURL, params = open_course_check_api, map[string]string{"openCourseId": v.OpenCourseID, "materialId": v.MaterialID}
 	}
 	checked, _ := requestJSON(c, "POST", checkURL, params, nil, h, referer)
 	entity := unwrapMap(checked)
@@ -199,7 +257,7 @@ func resolveVideo(c *util.Client, h map[string]string, v videoInfo) playInfo {
 		loaded, _ := requestJSON(c, "POST", load_play_data_api, map[string]string{"sign": sign}, nil, h, referer)
 		entity = mergeMaps(entity, unwrapMap(loaded))
 	}
-	if u := first(directPlayURL(entity), findURL(entity)); u != "" {
+	if u := first(videoPlayURL(entity), findURL(entity)); u != "" {
 		return playInfo{URL: u}
 	}
 	fileID := first(v.VideoID, textAt(entity, "videoId", "fileId"))
@@ -234,33 +292,21 @@ func getTokenInfo(c *util.Client, h map[string]string, fileID, verification stri
 }
 func requestVODPlayInfo(c *util.Client, h map[string]string, appID, fileID, psign string) playInfo {
 	api := fmt.Sprintf(getplayinfo_api, url.PathEscape(appID), url.PathEscape(fileID))
-	resp, err := requestJSON(c, "GET", api, map[string]string{"psign": psign}, nil, h, referer)
-	if err != nil {
-		return playInfo{}
-	}
-	var plays []playInfo
-	var walk func(any)
-	walk = func(x any) {
-		switch t := x.(type) {
-		case map[string]any:
-			if u := textAt(t, "url", "playUrl", "hlsUrl"); strings.HasPrefix(u, "http") {
-				plays = append(plays, playInfo{URL: insertDRMToken(u, textAt(t, "drmToken")), Size: int64(numAt(t, "size"))})
-			}
-			for _, v := range t {
-				walk(v)
-			}
-		case []any:
-			for _, v := range t {
-				walk(v)
-			}
+	for _, overlay := range sierVODOverlays {
+		playURL := buildSierPlayInfoURL(api, psign, overlay)
+		body, err := c.GetString(playURL, map[string]string{"Referer": referer, "User-Agent": user_agent})
+		if err != nil {
+			continue
+		}
+		var resp any
+		if err := json.Unmarshal([]byte(body), &resp); err != nil || !sierPlayInfoOK(resp) {
+			continue
+		}
+		if play := extractSierPlayInfo(c, h, resp, overlay); play.URL != "" {
+			return play
 		}
 	}
-	walk(resp)
-	if len(plays) == 0 {
-		return playInfo{}
-	}
-	sort.SliceStable(plays, func(i, j int) bool { return plays[i].Size > plays[j].Size })
-	return plays[0]
+	return playInfo{}
 }
 func requestJSON(c *util.Client, method, api string, params map[string]string, jsonBody any, h map[string]string, ref string) (any, error) {
 	u, err := url.Parse(api)
@@ -282,12 +328,16 @@ func requestJSON(c *util.Client, method, api string, params map[string]string, j
 		}
 	}
 	var body string
+	if strings.EqualFold(method, "POST") && jsonBody != nil {
+		b, _ := json.Marshal(jsonBody)
+		body = string(b)
+		hh["Content-Type"] = "application/json;charset=UTF-8"
+	}
+	applySierSignature(method, u, params, body, hh)
 	if strings.EqualFold(method, "POST") {
 		var r io.Reader = strings.NewReader("")
-		if jsonBody != nil {
-			b, _ := json.Marshal(jsonBody)
-			r = bytes.NewReader(b)
-			hh["Content-Type"] = "application/json;charset=UTF-8"
+		if body != "" {
+			r = bytes.NewReader([]byte(body))
 		}
 		resp, err := c.Post(u.String(), r, hh)
 		if err != nil {

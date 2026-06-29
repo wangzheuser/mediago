@@ -45,6 +45,7 @@ func (s *Wowtiku) Patterns() []string { return patterns }
 
 type wtSession struct{ token string }
 type wtVideo struct{ title, vid, directURL string }
+type wtFile struct{ title, rawURL, format string }
 
 func (s *Wowtiku) Extract(rawURL string, opts *extractor.ExtractOpts) (*extractor.MediaInfo, error) {
 	if opts == nil || opts.Cookies == nil {
@@ -72,11 +73,18 @@ func (s *Wowtiku) Extract(rawURL string, opts *extractor.ExtractOpts) (*extracto
 		return nil, err
 	}
 	videos := collectVideos(detail)
-	for _, classID := range classIDs(detail) {
+	files := collectFiles(detail)
+	ids := classIDs(detail)
+	for _, classID := range ids {
 		if subset, err := requestData(c, sess, subsetAPI, map[string]string{"stage_goods_id": cid, "class_id": classID}, nil, "GET", "", "v1"); err == nil {
 			videos = append(videos, collectVideos(subset)...)
+			files = append(files, collectFiles(subset)...)
+		}
+		if docs, err := requestData(c, sess, documentAPI, map[string]string{"class_id": classID}, nil, "GET", "", "v1"); err == nil {
+			files = append(files, collectFiles(docs)...)
 		}
 	}
+	files = dedupeFiles(files)
 	entries := []*extractor.MediaInfo{}
 	seen := map[string]bool{}
 	for _, v := range videos {
@@ -90,8 +98,19 @@ func (s *Wowtiku) Extract(rawURL string, opts *extractor.ExtractOpts) (*extracto
 			entries = append(entries, entry)
 		}
 	}
+	for i, f := range files {
+		entry := fileEntry(sess, f, i+1)
+		if entry == nil || len(entry.Streams) == 0 {
+			continue
+		}
+		u := entry.Streams["default"].URLs[0]
+		if u != "" && !seen["file:"+u] {
+			seen["file:"+u] = true
+			entries = append(entries, entry)
+		}
+	}
 	if len(entries) == 0 {
-		return nil, fmt.Errorf("wowtiku: no playable Aliyun/direct video resolved")
+		return nil, fmt.Errorf("wowtiku: no playable Aliyun/direct video or downloadable file resolved")
 	}
 	return &extractor.MediaInfo{Site: "wowtiku", Title: detailTitle(detail, cid), Entries: entries}, nil
 }
@@ -188,7 +207,10 @@ func collectVideos(data any) []wtVideo {
 func classIDs(data any) []string {
 	out, seen := []string{}, map[string]bool{}
 	for _, m := range mapsUnder(data) {
-		id := firstNonEmpty(val(m, "class_id"), val(m, "classId"), val(m, "id"))
+		id := firstNonEmpty(val(m, "class_id"), val(m, "classId"))
+		if id == "" && hasAnyKey(m, "subject_info", "subject_id", "subject_name", "class_name", "child") {
+			id = val(m, "id")
+		}
 		if id != "" && !seen[id] {
 			seen[id] = true
 			out = append(out, id)
@@ -198,7 +220,7 @@ func classIDs(data any) []string {
 }
 func resolveVideo(c *util.Client, sess wtSession, v wtVideo, opts *extractor.ExtractOpts) (*extractor.MediaInfo, error) {
 	if v.directURL != "" {
-		return media(v.title, normalizeURL(v.directURL), mediaFormat(v.directURL), map[string]any{"vid": v.vid}), nil
+		return media(sess, v.title, normalizeURL(v.directURL), mediaFormat(v.directURL), map[string]any{"vid": v.vid, "source_type": "video_url"}), nil
 	}
 	if v.vid == "" {
 		return nil, fmt.Errorf("wowtiku: empty vid")
@@ -241,11 +263,13 @@ func resolveVideo(c *util.Client, sess wtSession, v wtVideo, opts *extractor.Ext
 				}
 				text = rewritten
 			}
+			text = absolutizeM3U8Text(text, playURL)
 			extra["m3u8_text"] = text
 			extra["source_type"] = "m3u8_text"
+			playURL = dataM3U8URL(text)
 		}
 	}
-	return media(v.title, playURL, firstNonEmpty(info.Format, mediaFormat(playURL)), extra), nil
+	return media(sess, v.title, playURL, firstNonEmpty(info.Format, mediaFormat(playURL)), extra), nil
 }
 func aliyunPlayURL(c *util.Client, sts any, vid string) (string, error) {
 	m := firstMap(sts)
@@ -382,13 +406,17 @@ func normalizeURL(raw string) string {
 	if strings.HasPrefix(raw, "//") {
 		return "https:" + raw
 	}
+	if strings.HasPrefix(raw, "/") {
+		return originURL + raw
+	}
+	raw = strings.ReplaceAll(raw, " ", "%20")
 	return raw
 }
-func media(title, u, fmtName string, extra map[string]any) *extractor.MediaInfo {
+func media(sess wtSession, title, u, fmtName string, extra map[string]any) *extractor.MediaInfo {
 	if title == "" {
 		title = "video"
 	}
-	stream := extractor.Stream{Quality: "best", URLs: []string{u}, Format: fmtName, Headers: map[string]string{"Referer": refererURL}}
+	stream := extractor.Stream{Quality: "best", URLs: []string{u}, Format: fmtName, Headers: downloadHeaders(sess)}
 	if strings.Contains(strings.ToLower(fmtName), "m3u8") {
 		stream.NeedMerge = true
 	}
@@ -438,4 +466,176 @@ func qualityFromOpts(opts *extractor.ExtractOpts) string {
 		return ""
 	}
 	return opts.Quality
+}
+
+func collectFiles(data any) []wtFile {
+	var out []wtFile
+	seen := map[string]bool{}
+	var walk func(any, []int)
+	walk = func(v any, index []int) {
+		switch x := v.(type) {
+		case map[string]any:
+			if f := parseFileInfo(x, index); f.rawURL != "" && !seen[f.rawURL] {
+				seen[f.rawURL] = true
+				out = append(out, f)
+			}
+			for _, child := range x {
+				walk(child, index)
+			}
+		case []any:
+			for i, child := range x {
+				walk(child, append(append([]int{}, index...), i+1))
+			}
+		}
+	}
+	walk(data, nil)
+	return out
+}
+
+func parseFileInfo(m map[string]any, index []int) wtFile {
+	rawURL := ""
+	for _, key := range []string{"file_url", "download_url", "document_url", "documentUrl", "url", "path", "file_path", "src"} {
+		if u := val(m, key); strings.TrimSpace(u) != "" {
+			rawURL = normalizeURL(u)
+			break
+		}
+	}
+	if rawURL == "" || isVideoMediaURL(rawURL) {
+		return wtFile{}
+	}
+	if !strings.HasPrefix(strings.ToLower(rawURL), "http") {
+		return wtFile{}
+	}
+	name := firstNonEmpty(val(m, "file_name"), val(m, "name"), val(m, "title"), urlBaseName(rawURL), "资料")
+	format := strings.Trim(strings.ToLower(firstNonEmpty(val(m, "file_fmt"), val(m, "extension"), val(m, "ext"), val(m, "suffix"), fileExt(rawURL))), ". ")
+	if format == "" {
+		format = "bin"
+	}
+	if strings.Contains(name, ".") {
+		name = strings.TrimSuffix(name, "."+format)
+	}
+	return wtFile{title: fmt.Sprintf("(%s)--%s", indexString(index), name), rawURL: rawURL, format: format}
+}
+
+func dedupeFiles(files []wtFile) []wtFile {
+	seen := map[string]bool{}
+	out := make([]wtFile, 0, len(files))
+	for _, f := range files {
+		key := strings.Join([]string{f.rawURL, f.title, f.format}, "\x00")
+		if f.rawURL == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, f)
+	}
+	return out
+}
+
+func fileEntry(sess wtSession, f wtFile, index int) *extractor.MediaInfo {
+	if f.rawURL == "" {
+		return nil
+	}
+	title := firstNonEmpty(f.title, fmt.Sprintf("(%d)--资料", index))
+	format := firstNonEmpty(f.format, fileExt(f.rawURL), "bin")
+	stream := extractor.Stream{Quality: format, URLs: []string{f.rawURL}, Format: format, Headers: downloadHeaders(sess)}
+	if strings.Contains(strings.ToLower(format), "m3u8") {
+		stream.NeedMerge = true
+	}
+	return &extractor.MediaInfo{Site: "wowtiku", Title: title, Streams: map[string]extractor.Stream{"default": stream}, Extra: map[string]any{"type": "file", "file_url": f.rawURL}}
+}
+
+func downloadHeaders(sess wtSession) map[string]string {
+	h := map[string]string{"Referer": refererURL, "User-Agent": "Mozilla/5.0"}
+	if sess.token != "" {
+		h["Authorization"] = "Bearer " + sess.token
+		h["token"] = sess.token
+	}
+	return h
+}
+
+func hasAnyKey(m map[string]any, keys ...string) bool {
+	for _, key := range keys {
+		if _, ok := m[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func isVideoMediaURL(raw string) bool {
+	lower := strings.ToLower(raw)
+	return strings.Contains(lower, ".m3u8") || strings.Contains(lower, ".mp4") || strings.Contains(lower, ".flv") || strings.Contains(lower, ".m4v") || strings.Contains(lower, ".mov")
+}
+
+func fileExt(raw string) string {
+	u, err := url.Parse(raw)
+	path := raw
+	if err == nil {
+		path = u.Path
+	}
+	if idx := strings.LastIndex(path, "."); idx >= 0 && idx+1 < len(path) {
+		return strings.ToLower(path[idx+1:])
+	}
+	return ""
+}
+
+func urlBaseName(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	path := strings.Trim(u.Path, "/")
+	if path == "" {
+		return ""
+	}
+	if idx := strings.LastIndex(path, "/"); idx >= 0 {
+		return path[idx+1:]
+	}
+	return path
+}
+
+func indexString(index []int) string {
+	if len(index) == 0 {
+		return "1"
+	}
+	parts := make([]string, len(index))
+	for i, n := range index {
+		parts[i] = fmt.Sprint(n)
+	}
+	return strings.Join(parts, ".")
+}
+
+func absolutizeM3U8Text(text, source string) string {
+	lines := strings.Split(strings.ReplaceAll(strings.ReplaceAll(text, "\r\n", "\n"), "\r", "\n"), "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		lines[i] = resolveM3U8URI(trimmed, source)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func resolveM3U8URI(raw, source string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://") || strings.HasPrefix(raw, "data:") {
+		return raw
+	}
+	if strings.HasPrefix(raw, "//") {
+		return "https:" + raw
+	}
+	base, err := url.Parse(source)
+	if err != nil {
+		return raw
+	}
+	ref, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	return base.ResolveReference(ref).String()
+}
+
+func dataM3U8URL(text string) string {
+	return "data:application/vnd.apple.mpegurl;base64," + base64.StdEncoding.EncodeToString([]byte(text))
 }

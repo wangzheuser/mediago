@@ -29,9 +29,9 @@ func parsePlaybackParams(raw string) (playbackParams, bool) {
 		return playbackParams{}, false
 	}
 	q := u.Query()
-	token := q.Get("token")
-	roomID := firstNonEmpty(q.Get("room_id"), q.Get("classid"))
-	vid := q.Get("vid")
+	token := firstNonEmpty(q.Get("token"), q.Get("session_id"), q.Get("play_token"), q.Get("playToken"), q.Get("player_token"), q.Get("playerToken"), q.Get("access_token"), q.Get("accessToken"))
+	roomID := firstNonEmpty(q.Get("room_id"), q.Get("roomId"), q.Get("classid"), q.Get("class_id"), q.Get("classId"))
+	vid := firstNonEmpty(q.Get("vid"), q.Get("video_id"), q.Get("videoId"))
 	if token != "" && roomID != "" {
 		return playbackParams{roomID: roomID, token: token}, true
 	}
@@ -53,16 +53,17 @@ func parseCourseURL(raw string) (courseURL, bool) {
 	}
 	q := u.Query()
 	cid := firstNonEmpty(q.Get("course_id"), q.Get("courseId"))
+	ctype := firstNonEmpty(q.Get("ctype"), q.Get("course_type"), q.Get("courseType"), q.Get("study_type"), q.Get("studyType"))
 	domain := u.Host
 	if cid == "" {
 		if m := coursePathRe.FindStringSubmatch(raw); m != nil {
 			domain, cid = m[1], m[2]
 		}
 	}
-	if cid == "" || !strings.Contains(domain, "baijiayunxiao") {
+	if !strings.Contains(domain, "baijiayunxiao") {
 		return courseURL{}, false
 	}
-	return courseURL{domain: domain, cid: cid}, true
+	return courseURL{domain: domain, cid: cid, ctype: ctype}, true
 }
 
 func findPlaybackURLInText(text string) string {
@@ -154,9 +155,9 @@ func pickFormat(mediaURL string) string {
 	case strings.Contains(lower, ".m3u8"):
 		return "m3u8"
 	case strings.Contains(lower, ".ev1"):
-		return ".ev1"
+		return "ev1"
 	case strings.Contains(lower, ".ev2"):
-		return ".ev2"
+		return "ev2"
 	case strings.Contains(lower, ".mp4"):
 		return "mp4"
 	}
@@ -257,9 +258,14 @@ func fetchPreviewVideoURL(c *util.Client, domain, videoID string, headers map[st
 // normalizeMediaURL prepends https: to protocol-relative URLs.
 // Source: _normalize_media_url
 func normalizeMediaURL(u string) string {
-	u = strings.TrimSpace(u)
+	u = strings.TrimSpace(strings.ReplaceAll(u, `\u0026`, "&"))
 	if strings.HasPrefix(u, "//") {
 		u = "https:" + u
+	}
+	if strings.HasPrefix(strings.ToLower(u), "bjcloudvod://") {
+		if decoded := decodeBjcloudvod(u); decoded != "" {
+			return decoded
+		}
 	}
 	return u
 }

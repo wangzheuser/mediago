@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net/http"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -46,6 +47,7 @@ func (o *Open163) Patterns() []string { return patterns }
 var (
 	vipCourseRe = regexp.MustCompile(`/courses/([0-9A-Za-z]+)|courseId=([0-9A-Za-z]+)|cid=([0-9A-Za-z]+)`)
 	freePidRe   = regexp.MustCompile(`(?:pid=|/free\?pid=)([0-9A-Za-z]+)`)
+	freePlidRe  = regexp.MustCompile(`(?i)plid\s*:\s*["']([0-9A-Za-z]+)["']`)
 	freeMP4Re   = regexp.MustCompile(`"(https?:[^,]*?\.mp4[^"']*)"`)
 	titleRe     = regexp.MustCompile(`<title>(.+?)</title>`)
 )
@@ -53,6 +55,11 @@ var (
 func (o *Open163) Extract(rawURL string, opts *extractor.ExtractOpts) (*extractor.MediaInfo, error) {
 	if pid := parseFreePID(rawURL); pid != "" {
 		return o.extractFree(pid)
+	}
+	if isFreeOpen163URL(rawURL) {
+		if info, err := o.extractFreeFromURL(rawURL); err == nil {
+			return info, nil
+		}
 	}
 	if opts == nil || opts.Cookies == nil {
 		return nil, fmt.Errorf("open163 requires login cookies")
@@ -66,7 +73,7 @@ func (o *Open163) Extract(rawURL string, opts *extractor.ExtractOpts) (*extracto
 	cid, courseUID := parseOpen163CourseIDs(rawURL)
 	if cid == "" && courseUID == "" {
 		// Fallback: fetch purchased courses from myOrders.do (source: Open163_App.prepare -> _select_my_course)
-		return o.extractMyOrders(c)
+		return o.extractMyOrders(c, opts.Cookies)
 	}
 	course, err := loadOpen163Course(c, cid, courseUID)
 	if err != nil {
@@ -75,6 +82,7 @@ func (o *Open163) Extract(rawURL string, opts *extractor.ExtractOpts) (*extracto
 	info := course.Data.CourseInfo
 	title := sanitizeTitle(firstText(info.Title, info.Name, cid, courseUID, "open163"))
 	entries := make([]*extractor.MediaInfo, 0)
+	downloadHeaders := open163DownloadHeaders(opts.Cookies, urlVipReferer)
 	chapterTypes := []struct {
 		items []open163Chapter
 		kind  string
@@ -86,7 +94,7 @@ func (o *Open163) Extract(rawURL string, opts *extractor.ExtractOpts) (*extracto
 		for chapterIndex, chapter := range group.items {
 			chapterTitle := sanitizeTitle(firstText(chapter.Title, chapter.Name, "章节"))
 			for contentIndex, content := range chapter.ContentList {
-				item := buildOpen163Entry(chapterTitle, chapterIndex+1, contentIndex+1, content, group.kind)
+				item := buildOpen163Entry(chapterTitle, chapterIndex+1, contentIndex+1, content, group.kind, downloadHeaders)
 				if item != nil {
 					entries = append(entries, item)
 				}
@@ -106,6 +114,22 @@ func (o *Open163) extractFree(pid string) (*extractor.MediaInfo, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open163 free page: %w", err)
 	}
+	return buildOpen163FreeMedia(pid, body)
+}
+
+func (o *Open163) extractFreeFromURL(rawURL string) (*extractor.MediaInfo, error) {
+	c := util.NewClient()
+	body, err := c.GetString(rawURL, map[string]string{"Referer": urlFreeReferer})
+	if err != nil {
+		return nil, fmt.Errorf("open163 free page: %w", err)
+	}
+	if pid := firstFreePID(rawURL, body); pid != "" {
+		return o.extractFree(pid)
+	}
+	return buildOpen163FreeMedia("", body)
+}
+
+func buildOpen163FreeMedia(pid, body string) (*extractor.MediaInfo, error) {
 	title := pid
 	if m := titleRe.FindStringSubmatch(body); len(m) > 1 {
 		title = sanitizeTitle(strings.TrimSpace(strings.Split(m[1], "-")[0]))
@@ -215,7 +239,7 @@ func loadOpen163Course(c *util.Client, cid, courseUID string) (*open163CourseRes
 	return nil, fmt.Errorf("open163 load course data: %w", lastErr)
 }
 
-func buildOpen163Entry(chapterTitle string, chapterIndex, contentIndex int, content open163Content, kind string) *extractor.MediaInfo {
+func buildOpen163Entry(chapterTitle string, chapterIndex, contentIndex int, content open163Content, kind string, headers map[string]string) *extractor.MediaInfo {
 	title := sanitizeTitle(firstText(content.Title, content.Name, chapterTitle, kind))
 	media := selectOpen163MediaInfo(content.MediaInfoList, kind)
 	if media == nil {
@@ -229,7 +253,11 @@ func buildOpen163Entry(chapterTitle string, chapterIndex, contentIndex int, cont
 	if mediaURL == "" {
 		return nil
 	}
-	stream := extractor.Stream{Quality: mediaQuality(media.Type), URLs: []string{mediaURL}, Format: mediaExt(mediaURL), Headers: map[string]string{"Referer": urlVipReferer}}
+	streamHeaders := copyStringMap(headers)
+	if len(streamHeaders) == 0 {
+		streamHeaders = map[string]string{"Referer": urlVipReferer}
+	}
+	stream := extractor.Stream{Quality: mediaQuality(media.Type), URLs: []string{mediaURL}, Format: mediaExt(mediaURL), Headers: streamHeaders}
 	if stream.Format == "m3u8" {
 		stream.NeedMerge = true
 	}
@@ -337,6 +365,12 @@ func parseOpen163CourseIDs(rawURL string) (cid, courseUID string) {
 			}
 			return "", v
 		}
+		if v := q.Get("courseUid"); v != "" {
+			if v[0] >= '0' && v[0] <= '9' {
+				return v, v
+			}
+			return "", v
+		}
 		if v := q.Get("pid"); v != "" {
 			return "", v
 		}
@@ -352,6 +386,25 @@ func parseFreePID(rawURL string) string {
 		if v := u.Query().Get("pid"); v != "" {
 			return v
 		}
+	}
+	return ""
+}
+
+func isFreeOpen163URL(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(u.Host)
+	return strings.HasSuffix(host, "open.163.com") && !strings.HasPrefix(host, "vip.")
+}
+
+func firstFreePID(rawURL, body string) string {
+	if pid := parseFreePID(rawURL); pid != "" {
+		return pid
+	}
+	if m := freePlidRe.FindStringSubmatch(body); len(m) > 1 {
+		return m[1]
 	}
 	return ""
 }
@@ -489,7 +542,7 @@ type open163OrderItem struct {
 // extractMyOrders fetches the purchased-course list from myOrders.do and
 // returns each purchased course as a separate entry with its media items.
 // This matches source Open163_App.prepare -> _select_my_course -> _get_course_list.
-func (o *Open163) extractMyOrders(c *util.Client) (*extractor.MediaInfo, error) {
+func (o *Open163) extractMyOrders(c *util.Client, jar http.CookieJar) (*extractor.MediaInfo, error) {
 	headers := map[string]string{
 		"Referer":          urlVipReferer,
 		"Origin":           urlVipReferer,
@@ -552,6 +605,7 @@ func (o *Open163) extractMyOrders(c *util.Client) (*extractor.MediaInfo, error) 
 
 	// For each purchased course, try to load its full data and build entries
 	var allEntries []*extractor.MediaInfo
+	downloadHeaders := open163DownloadHeaders(jar, urlVipReferer)
 	for _, item := range courses {
 		uid := strings.TrimSpace(coalesceStr(item.CourseUID, item.ProductID))
 		pid := strings.TrimSpace(item.ProductID)
@@ -601,7 +655,7 @@ func (o *Open163) extractMyOrders(c *util.Client) (*extractor.MediaInfo, error) 
 			for chapterIndex, chapter := range group.items {
 				chapterTitle := sanitizeTitle(firstText(chapter.Title, chapter.Name, "章节"))
 				for contentIndex, content := range chapter.ContentList {
-					entry := buildOpen163Entry(chapterTitle, chapterIndex+1, contentIndex+1, content, group.kind)
+					entry := buildOpen163Entry(chapterTitle, chapterIndex+1, contentIndex+1, content, group.kind, downloadHeaders)
 					if entry != nil {
 						entries = append(entries, entry)
 					}
@@ -708,4 +762,49 @@ func isNumeric(s string) bool {
 		}
 	}
 	return true
+}
+
+func open163DownloadHeaders(jar http.CookieJar, referer string) map[string]string {
+	h := map[string]string{"Referer": referer}
+	cookie := open163CookieHeader(jar,
+		"https://vip.open.163.com/",
+		"https://open.163.com/",
+		"https://c.open.163.com/",
+	)
+	if cookie != "" {
+		h["Cookie"] = cookie
+		h["cookie"] = cookie
+	}
+	return h
+}
+
+func open163CookieHeader(jar http.CookieJar, rawURLs ...string) string {
+	if jar == nil {
+		return ""
+	}
+	seen := map[string]bool{}
+	var parts []string
+	for _, raw := range rawURLs {
+		u, err := url.Parse(raw)
+		if err != nil {
+			continue
+		}
+		for _, ck := range jar.Cookies(u) {
+			key := ck.Name + "=" + ck.Value
+			if key == "=" || seen[key] {
+				continue
+			}
+			seen[key] = true
+			parts = append(parts, key)
+		}
+	}
+	return strings.Join(parts, "; ")
+}
+
+func copyStringMap(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }

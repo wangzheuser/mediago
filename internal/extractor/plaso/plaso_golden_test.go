@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -26,6 +27,97 @@ func TestExtractMock(t *testing.T) {
 		t.Fatalf("Extract returned error: %v", err)
 	}
 	goldenAssertMedia(t, "plaso", got)
+}
+
+func TestEndpointVariantsAndAccessToken(t *testing.T) {
+	cases := []struct {
+		raw      string
+		base     string
+		platform string
+	}{
+		{"https://www.plaso.cn/course?id=1", "https://www.plaso.cn", "plaso"},
+		{"https://www.aiwenyun.cn/course?id=1", "https://www.aiwenyun.cn", "aiwenyun"},
+		{"https://jhpy.plaso.cn/course?id=1", "https://jhpy.plaso.cn", "jhpy"},
+	}
+	for _, tc := range cases {
+		eps := newPlasoEndpoints(tc.raw)
+		if eps.base != tc.base || eps.platform != tc.platform {
+			t.Fatalf("endpoint %q = (%q,%q), want (%q,%q)", tc.raw, eps.base, eps.platform, tc.base, tc.platform)
+		}
+	}
+	jar := goldenNewJar(t)
+	goldenSetCookie(t, jar, "https://www.plaso.cn", "access_token", "tok-1")
+	h := newPlasoEndpoints("https://www.plaso.cn/").headers(jar)
+	if h["access-token"] != "tok-1" || !strings.Contains(h["Cookie"], "access_token=tok-1") {
+		t.Fatalf("headers missing access token/cookie: %#v", h)
+	}
+}
+
+func TestPlasoAlgorithms(t *testing.T) {
+	if got := plasoPlayerURLEncrypt("abc"); got != "d54bdf" {
+		t.Fatalf("plasoPlayerURLEncrypt = %q, want d54bdf", got)
+	}
+	u, q := pickPlayURL(map[string]any{"playUrls": map[string]any{"hd": map[string]any{"url": "https://cdn.example/hd.m3u8"}, "ld": "https://cdn.example/ld.m3u8"}}, "hd")
+	if u != "https://cdn.example/hd.m3u8" || q != "hd" {
+		t.Fatalf("pickPlayURL = (%q,%q)", u, q)
+	}
+	signed := buildPlasoCourseSTSSignedURL("course/file.pdf", plasoSTS{AccessKeyID: "ak", AccessKeySecret: "sk", SecurityToken: "tok", Region: "cn-shanghai", Bucket: "bucket"}, time.Date(2026, 6, 29, 9, 0, 0, 0, time.UTC))
+	pu, err := url.Parse(signed)
+	if err != nil {
+		t.Fatalf("parse signed URL: %v", err)
+	}
+	qv := pu.Query()
+	if pu.Host != "bucket.oss-cn-shanghai.aliyuncs.com" || qv.Get("x-oss-signature-version") != "OSS4-HMAC-SHA256" || qv.Get("x-oss-security-token") != "tok" || len(qv.Get("x-oss-signature")) != 64 {
+		t.Fatalf("unexpected v4 signed URL: %s", signed)
+	}
+}
+
+func TestCollectFileItemsWithChapters(t *testing.T) {
+	payload := map[string]any{"courseChapterList": []any{
+		map[string]any{
+			"title": "第一章",
+			"children": []any{
+				map[string]any{"name": "第1节", "files": []any{
+					map[string]any{"fileId": "V1", "name": "视频", "url": "https://cdn.example/v1.m3u8", "type": "video"},
+					map[string]any{"fileId": "D1", "name": "讲义", "location": "docs/a.pdf", "type": "pdf"},
+				}},
+			},
+		},
+	}}
+	files := collectFileItems(payload)
+	if len(files) != 2 {
+		t.Fatalf("collectFileItems len=%d, want 2: %#v", len(files), files)
+	}
+	if files[0].Chapter != "第一章 / 第1节" || !reflect.DeepEqual(files[0].Index, []int{1, 1, 1}) {
+		t.Fatalf("first item chapter/index = %q/%v", files[0].Chapter, files[0].Index)
+	}
+	if files[1].ID != "D1" || files[1].Chapter != "第一章 / 第1节" {
+		t.Fatalf("document item not preserved: %#v", files[1])
+	}
+}
+
+func TestExtractPackageChaptersAndFiles(t *testing.T) {
+	routes := map[string]json.RawMessage{
+		"__default":                   json.RawMessage(`{"code":0,"data":{},"list":[]}`),
+		"POST /sc/nc/newGetShareInfo": json.RawMessage(`{"code":0,"data":{}}`),
+		"POST /course/api/v1/nct/m/package/task/list": json.RawMessage(`{"code":0,"obj":{"courseChapterList":[{"title":"第一章","files":[{"fileId":"V1","name":"正课","url":"https://cdn.example/plaso/v1.m3u8","type":"video"},{"fileId":"D1","name":"讲义","url":"https://cdn.example/plaso/a.pdf","type":"pdf"}]}]}}`),
+	}
+	goldenInstallTransport(t, routes)
+	got, err := (&Plaso{}).Extract("https://www.plaso.cn/course?packageId=P1", &extractor.ExtractOpts{Cookies: goldenNewJar(t)})
+	if err != nil {
+		t.Fatalf("Extract returned error: %v", err)
+	}
+	if len(got.Entries) != 2 {
+		t.Fatalf("entries len=%d, want 2: %#v", len(got.Entries), got.Entries)
+	}
+	video := got.Entries[0]
+	if video.Extra["chapter"] != "第一章" || video.Streams["best"].Extra["chapter"] != "第一章" || video.Streams["best"].Format != "m3u8" {
+		t.Fatalf("video chapter/stream not propagated: %#v / %#v", video.Extra, video.Streams["best"])
+	}
+	doc := got.Entries[1]
+	if doc.Streams["best"].Format != "pdf" || doc.Extra["source_type"] != "direct" {
+		t.Fatalf("document stream not resolved: %#v / %#v", doc.Extra, doc.Streams["best"])
+	}
 }
 
 func goldenLoadRoutes(t *testing.T) map[string]json.RawMessage {

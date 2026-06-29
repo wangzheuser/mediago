@@ -133,6 +133,16 @@ func extractAliyunPlayResponse(root map[string]any, quality string) map[string]a
 		a, b := plays[i], plays[j]
 		da, db := strings.ToUpper(firstString(a, "Definition")), strings.ToUpper(firstString(b, "Definition"))
 		ra, rb := rank[da], rank[db]
+		if ra == 0 {
+			if _, ok := rank[da]; !ok {
+				ra = len(rank) + 1
+			}
+		}
+		if rb == 0 {
+			if _, ok := rank[db]; !ok {
+				rb = len(rank) + 1
+			}
+		}
 		if ra != rb {
 			return ra < rb
 		}

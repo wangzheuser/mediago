@@ -189,7 +189,8 @@ func luffyFetchCourseList(c *util.Client, sess *luffySession) []luffyTarget {
 // courses to the list.  Mirrors Luffycity_Course._append_vip_card_courses.
 //
 // Source: GET /study/vip-card/  -> list of cards
-//         GET /study/vip-card/{number}/ -> card detail with category_courses
+//
+//	GET /study/vip-card/{number}/ -> card detail with category_courses
 func luffyAppendVIPCardCourses(c *util.Client, sess *luffySession, out *[]luffyTarget, seen map[string]bool) {
 	cardsRaw := luffyGetData(c, "/study/vip-card/", nil, sess.Headers)
 	cards, ok := cardsRaw.([]any)
@@ -367,7 +368,11 @@ func luffyBuildEntry(c *util.Client, sess *luffySession, item luffyItem) (*extra
 	if err != nil || source.URL == "" {
 		return nil, fmt.Errorf("luffycity: empty source for section=%s", item.SectionID)
 	}
-	return &extractor.MediaInfo{Site: "luffycity", Title: item.Title, Streams: map[string]extractor.Stream{"default": {Quality: "default", URLs: []string{source.URL}, Format: mediaExt(source.URL), Size: source.Size, Headers: sess.Headers}}, Extra: map[string]any{"section_id": item.SectionID, "source_type": source.Type}}, nil
+	extra := map[string]any{"section_id": item.SectionID, "source_type": source.Type}
+	for k, v := range source.Extra {
+		extra[k] = v
+	}
+	return &extractor.MediaInfo{Site: "luffycity", Title: item.Title, Streams: map[string]extractor.Stream{"default": {Quality: "default", URLs: []string{source.URL}, Format: mediaExt(source.URL), Size: source.Size, NeedMerge: mediaExt(source.URL) == "m3u8", Headers: sess.Headers}}, Extra: extra}, nil
 }
 
 func luffyResolvePlaySource(c *util.Client, sess *luffySession, item luffyItem) (luffySource, error) {
@@ -385,7 +390,14 @@ func luffyResolvePlaySource(c *util.Client, sess *luffySession, item luffyItem) 
 		sec, err := shared.PolyvResolveSecure(c, vid, sess.Headers)
 		if err == nil {
 			if u, err := shared.PolyvPickBestManifest(sec); err == nil {
-				return luffySource{URL: u, Type: "m3u8_url"}, nil
+				src := luffySource{URL: u, Type: "m3u8_url", Extra: map[string]any{"polyv_vid": vid}}
+				if text, err := c.GetString(u, sess.Headers); err == nil {
+					if rewritten, err := shared.PolyvRewriteM3U8Keys(c, text, sec.Data.Playsafe.Token, urlReferer); err == nil {
+						src.Extra["m3u8_text"] = rewritten
+						src.Type = "m3u8_text"
+					}
+				}
+				return src, nil
 			}
 		}
 	}

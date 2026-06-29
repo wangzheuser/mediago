@@ -28,55 +28,75 @@ func normalizeType(kind string) string {
 
 func collectContentItems(v any) []contentItem {
 	var out []contentItem
-	var walk func(any)
-	walk = func(x any) {
+	var walk func(any, bool)
+	walk = func(x any, inList bool) {
 		switch vv := x.(type) {
 		case map[string]any:
 			id := valueString(vv, "content_id", "contentId", "id")
 			title := valueString(vv, "content_title", "title", "name")
 			kind := normalizeType(firstNonEmpty(valueString(vv, "content_type", "type"), "single"))
-			if id != "" && (hasAny(vv, "content_id", "contentId") || hasAny(vv, "content_type", "is_test")) {
+			if id != "" && (inList || hasAny(vv, "content_id", "contentId", "content_type", "type", "is_test", "raw_title")) {
 				out = append(out, contentItem{ID: id, Title: title, Kind: kind, Test: truthy(vv["is_test"])})
 			}
 			for _, k := range []string{"content_list", "list", "items", "data", "response"} {
 				if child, ok := vv[k]; ok {
-					walk(child)
+					childInList := inList || duanshuContentListKey(k) || (k == "data" && hasAny(vv, "page", "last_page", "total_pages"))
+					walk(child, childInList)
 				}
 			}
 		case []any:
 			for _, child := range vv {
-				walk(child)
+				walk(child, inList)
 			}
 		}
 	}
-	walk(v)
+	walk(v, false)
 	return out
 }
 
 func collectClassItems(v any) []contentItem {
 	var out []contentItem
-	var walk func(any, string)
-	walk = func(x any, prefix string) {
+	var walk func(any, string, bool)
+	walk = func(x any, prefix string, inList bool) {
 		switch vv := x.(type) {
 		case map[string]any:
 			title := firstNonEmpty(valueString(vv, "title", "name"), prefix)
 			classID := valueString(vv, "class_id", "classId", "id")
-			if classID != "" && (hasAny(vv, "class_id", "classId") || hasAny(vv, "course_id", "chapter_idx")) {
+			if classID != "" && (inList || hasAny(vv, "class_id", "classId") || hasAny(vv, "course_id", "chapter_idx")) {
 				out = append(out, contentItem{Class: classID, Title: title})
 			}
 			for _, k := range []string{"classes", "class_list", "classList", "contents", "children", "list", "data", "response"} {
 				if child, ok := vv[k]; ok {
-					walk(child, title)
+					childInList := inList || duanshuClassListKey(k) || (k == "data" && hasAny(vv, "page", "last_page", "total_pages"))
+					walk(child, title, childInList)
 				}
 			}
 		case []any:
 			for _, child := range vv {
-				walk(child, prefix)
+				walk(child, prefix, inList)
 			}
 		}
 	}
-	walk(v, "")
+	walk(v, "", false)
 	return out
+}
+
+func duanshuContentListKey(key string) bool {
+	switch key {
+	case "content_list", "list", "items":
+		return true
+	default:
+		return false
+	}
+}
+
+func duanshuClassListKey(key string) bool {
+	switch key {
+	case "classes", "class_list", "classList", "contents", "children", "list":
+		return true
+	default:
+		return false
+	}
 }
 
 func findMediaURL(v any) string {
@@ -193,14 +213,8 @@ func hasNextPage(v any, page int) bool {
 }
 
 func mediaInfo(title, mediaURL string, headers map[string]string) *extractor.MediaInfo {
-	format := "mp4"
-	if strings.Contains(strings.ToLower(mediaURL), ".m3u8") {
-		format = "m3u8"
-	}
-	if strings.Contains(strings.ToLower(mediaURL), ".mp3") {
-		format = "mp3"
-	}
-	return &extractor.MediaInfo{Site: "duanshu", Title: util.SanitizeFilename(title), Streams: map[string]extractor.Stream{"best": {Quality: "best", URLs: []string{mediaURL}, Format: format, Headers: headers}}}
+	format := formatFromURL(mediaURL)
+	return &extractor.MediaInfo{Site: "duanshu", Title: util.SanitizeFilename(title), Streams: map[string]extractor.Stream{"best": {Quality: "best", URLs: []string{mediaURL}, Format: format, NeedMerge: format == "m3u8", Headers: headers}}}
 }
 
 func valueString(m map[string]any, keys ...string) string {
@@ -235,7 +249,54 @@ func normalizeURL(s string) string {
 
 func isMediaURL(s string) bool {
 	low := strings.ToLower(s)
-	return strings.HasPrefix(low, "http") && (strings.Contains(low, ".mp4") || strings.Contains(low, ".m3u8") || strings.Contains(low, ".mp3") || strings.Contains(low, ".flv") || strings.Contains(low, ".m4a"))
+	return strings.HasPrefix(low, "http") && (strings.Contains(low, ".mp4") || strings.Contains(low, ".m3u8") || strings.Contains(low, ".mp3") || strings.Contains(low, ".flv") || strings.Contains(low, ".m4a") || isDownloadURL(low))
+}
+
+func isDownloadURL(s string) bool {
+	low := strings.ToLower(strings.TrimSpace(s))
+	if !strings.HasPrefix(low, "http") {
+		return false
+	}
+	for _, ext := range []string{".pdf", ".ppt", ".pptx", ".doc", ".docx", ".xls", ".xlsx", ".zip", ".rar", ".7z", ".txt"} {
+		if strings.Contains(low, ext) {
+			return true
+		}
+	}
+	return false
+}
+
+func firstValueByKeys(v any, keys ...string) string {
+	sought := map[string]bool{}
+	for _, key := range keys {
+		sought[key] = true
+	}
+	var out string
+	var walk func(any)
+	walk = func(x any) {
+		if out != "" {
+			return
+		}
+		switch vv := x.(type) {
+		case map[string]any:
+			for key, value := range vv {
+				if sought[key] {
+					out = strings.TrimSpace(fmt.Sprint(value))
+					if out != "" && out != "<nil>" {
+						return
+					}
+				}
+			}
+			for _, child := range vv {
+				walk(child)
+			}
+		case []any:
+			for _, child := range vv {
+				walk(child)
+			}
+		}
+	}
+	walk(v)
+	return out
 }
 
 func intValue(v any) int {

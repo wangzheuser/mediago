@@ -270,7 +270,10 @@ func mashibingBuildDocumentEntry(c *util.Client, sess *mashibingSession, item ma
 
 func mashibingGetJSON(c *util.Client, apiURL string, params map[string]string, headers map[string]string) (map[string]any, error) {
 	if len(params) > 0 {
-		u, _ := url.Parse(apiURL)
+		u, err := url.Parse(apiURL)
+		if err != nil {
+			return nil, err
+		}
 		q := u.Query()
 		for k, v := range params {
 			q.Set(k, v)

@@ -36,50 +36,73 @@ type Meeting struct{}
 func (m *Meeting) Patterns() []string { return patterns }
 
 type mediaItem struct{ URL, Title, Kind, CourseID string }
+type meetingBatchItem struct{ URL, Password, Title string }
 
 var (
-	meetlogRe = regexp.MustCompile(`https?://meeting\.tencent\.com/meetlog/detail/index\.html\?[^\s#]*?s=([\w-]+)`) // source _fallback_course_id
-	liveRe    = regexp.MustCompile(`https?://meeting\.tencent\.com/live/(\d+)`)
-	shareRe   = regexp.MustCompile(`https?://meeting\.tencent\.com/(?:(cw)|(cr?m)|(ctm?))/([\w-]+)|https?://meeting\.tencent\.com/.*?/share.*?id=([\w-]+)`)
-	jsonURLRe = regexp.MustCompile(`(?i)"(?:origin_video_url|video_url|replay_url_long|download_url|url)"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"`)
-	titleRe   = regexp.MustCompile(`(?is)<title>(.*?)</title>|"(?:title|filename|file_name)"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"`)
+	meetlogRe         = regexp.MustCompile(`https?://meeting\.tencent\.com/meetlog/detail/index\.html\?[^\s#]*?s=([\w-]+)`) // source _fallback_course_id
+	liveRe            = regexp.MustCompile(`https?://meeting\.tencent\.com/live/(\d+)`)
+	shareRe           = regexp.MustCompile(`https?://meeting\.tencent\.com/(?:(cw)|(cr?m)|(ctm?))/([\w-]+)|https?://meeting\.tencent\.com/.*?/share.*?id=([\w-]+)`)
+	meetingURLTextRe  = regexp.MustCompile(`https?://meeting\.tencent\.com/[^\s，,。；;）)】》」]+`)
+	passwordContextRe = regexp.MustCompile(`(?i)(?:访问密码|文件密码|提取码|访问码|口令|密码|访问|passcode|password)\s*[:：]?\s*([A-Za-z0-9_-]{1,32})\b`)
+	titleLabelRe      = regexp.MustCompile(`(?i)^\s*(?:\d+\s*[.、．]\s*)?(?:录制|标题|名称|文件名)\s*[:：]?\s*(.+?)\s*$`)
+	skipTitleLineRe   = regexp.MustCompile(`(?i)^\s*(?:上课视频|视频文件|录制文件|会议链接|链接|地址|访问密码|文件密码|提取码|访问码|口令|密码|访问|passcode|password)\s*[:：]?\s*$`)
+	jsonURLRe         = regexp.MustCompile(`(?i)"(?:origin_video_url|video_url|replay_url_long|download_url|play_url|url)"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"`)
+	titleRe           = regexp.MustCompile(`(?is)<title>(.*?)</title>|"(?:title|filename|file_name)"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"`)
 )
 
 func (m *Meeting) Extract(rawURL string, opts *extractor.ExtractOpts) (*extractor.MediaInfo, error) {
 	if opts == nil || opts.Cookies == nil {
 		return nil, fmt.Errorf("meeting.tencent requires login cookies")
 	}
-	id, typ := parseID(rawURL)
-	if id == "" {
+	items := parseMeetingBatchText(rawURL)
+	if len(items) == 0 {
+		if id, _ := parseID(rawURL); id != "" {
+			items = []meetingBatchItem{{URL: rawURL, Password: passwordFromURL(rawURL)}}
+		}
+	}
+	if len(items) == 0 {
 		return nil, fmt.Errorf("cannot parse meeting.tencent id from URL")
 	}
-	pwd := passwordFromURL(rawURL)
 	c := util.NewClient()
 	c.SetCookieJar(opts.Cookies)
 	h := map[string]string{"Referer": referer, "Origin": referer, "Accept": "application/json, text/plain, */*"}
 
-	items, pageTitle := resolveMeeting(c, rawURL, id, typ, pwd, h)
-	if len(items) == 0 {
+	entries, pageTitle := resolveMeetingBatch(c, items, h)
+	if len(entries) == 0 {
 		return nil, fmt.Errorf("meeting.tencent: no playable origin_video_url/video_url/replay_url_long found")
 	}
-	entries := make([]*extractor.MediaInfo, 0, len(items))
-	seen := map[string]bool{}
-	for i, it := range items {
-		u := strings.TrimSpace(it.URL)
-		if u == "" || seen[u] {
-			continue
-		}
-		seen[u] = true
-		title := clean(first(it.Title, pageTitle, "腾讯会议录制_"+strconv.Itoa(i+1)))
-		entries = append(entries, &extractor.MediaInfo{Site: "meeting", Title: title, Streams: map[string]extractor.Stream{"best": {Quality: "best", URLs: []string{u}, Format: formatOf(u), Headers: h}}, Extra: map[string]any{"course_id": first(it.CourseID, id), "kind": it.Kind}})
-	}
-	if len(entries) == 0 {
-		return nil, fmt.Errorf("meeting.tencent: playable fields parsed but empty after normalization")
-	}
-	if len(entries) == 1 {
+	if len(entries) == 1 && len(items) == 1 {
 		return entries[0], nil
 	}
 	return &extractor.MediaInfo{Site: "meeting", Title: clean(first(pageTitle, "腾讯会议批量")), Entries: entries}, nil
+}
+
+func resolveMeetingBatch(c *util.Client, batch []meetingBatchItem, h map[string]string) ([]*extractor.MediaInfo, string) {
+	entries := make([]*extractor.MediaInfo, 0, len(batch))
+	seen := map[string]bool{}
+	pageTitle := ""
+	for _, item := range batch {
+		id, typ := parseID(item.URL)
+		if id == "" {
+			continue
+		}
+		pwd := first(item.Password, passwordFromURL(item.URL))
+		items, title := resolveMeeting(c, item.URL, id, typ, pwd, h)
+		pageTitle = first(pageTitle, title, item.Title)
+		for i, it := range items {
+			u := strings.TrimSpace(it.URL)
+			if u == "" || seen[u] {
+				continue
+			}
+			seen[u] = true
+			title := clean(first(it.Title, title, "腾讯会议录制_"+strconv.Itoa(i+1)))
+			if item.Title != "" {
+				title = mergeMeetingBatchTitle(item.Title, title)
+			}
+			entries = append(entries, &extractor.MediaInfo{Site: "meeting", Title: title, Streams: map[string]extractor.Stream{"best": {Quality: "best", URLs: []string{u}, Format: formatOf(u), Headers: h}}, Extra: map[string]any{"course_id": first(it.CourseID, id), "kind": it.Kind, "source_url": item.URL}})
+		}
+	}
+	return entries, pageTitle
 }
 
 func resolveMeeting(c *util.Client, rawURL, id, typ, pwd string, h map[string]string) ([]mediaItem, string) {
@@ -138,15 +161,6 @@ func parseID(rawURL string) (string, string) {
 		return m[5], "share"
 	}
 	return "", ""
-}
-
-func passwordFromURL(rawURL string) string {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return ""
-	}
-	q := u.Query()
-	return first(q.Get("pwd"), q.Get("password"), q.Get("pw"))
 }
 
 func parseMediaFromText(text, id string) []mediaItem {

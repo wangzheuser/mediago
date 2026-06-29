@@ -61,7 +61,8 @@ func (x *hdCtx) mediaFromSources(sources []hdSource) (*extractor.MediaInfo, erro
 		fmtv := firstNonEmpty(src.Format, extFormat(src.URL))
 		extra := ensureExtra(src.Extra)
 		extra["kind"] = firstNonEmpty(src.Kind, "video")
-		entries = append(entries, &extractor.MediaInfo{Site: "houdu", Title: cleanName(firstNonEmpty(src.Name, src.URL)), Streams: map[string]extractor.Stream{"best": {Quality: "best", URLs: []string{src.URL}, Format: fmtv, NeedMerge: src.NeedMerge || fmtv == "m3u8", Headers: map[string]string{"Referer": referer, "Cookie": x.cookie, "Authorization": x.token, "User-Agent": USER_AGENT}}}, Extra: extra})
+		streamExtra := cloneAnyMap(extra)
+		entries = append(entries, &extractor.MediaInfo{Site: "houdu", Title: cleanName(firstNonEmpty(src.Name, src.URL)), Streams: map[string]extractor.Stream{"best": {Quality: "best", URLs: []string{src.URL}, Format: fmtv, NeedMerge: src.NeedMerge || fmtv == "m3u8", Headers: map[string]string{"Referer": referer, "Cookie": x.cookie, "Authorization": x.token, "User-Agent": USER_AGENT}, Extra: streamExtra}}, Extra: extra})
 	}
 	if len(entries) == 0 {
 		return nil, fmt.Errorf("houdu: empty media entries")
@@ -74,6 +75,17 @@ func ensureExtra(m map[string]any) map[string]any {
 		return map[string]any{}
 	}
 	return m
+}
+
+func cloneAnyMap(in map[string]any) map[string]any {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 func isFlatLessonList(items []map[string]any) bool {

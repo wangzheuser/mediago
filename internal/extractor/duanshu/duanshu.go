@@ -67,14 +67,29 @@ func (d *Duanshu) Extract(rawURL string, opts *extractor.ExtractOpts) (*extracto
 		return nil, fmt.Errorf("duanshu requires login cookies")
 	}
 	info := parseDuanshuURL(rawURL)
-	if info.ContentID == "" {
-		return nil, fmt.Errorf("cannot parse duanshu content id from URL: %s", rawURL)
+	if info.Shop == "" {
+		return nil, fmt.Errorf("duanshu: cannot parse shop subdomain from URL")
 	}
 
 	c := util.NewClient()
 	c.SetCookieJar(opts.Cookies)
 	headers := duanshuHeaders(rawURL, opts.Cookies, info.Shop)
-	_, _ = requestJSON(c, user_detail_url, headers)
+	if headers["x-member"] == "" {
+		return nil, fmt.Errorf("duanshu requires x-member login cookie")
+	}
+	if detail, err := requestJSON(c, user_detail_url, headers); err == nil {
+		applyShopID(headers, detail)
+	}
+	if info.ContentID == "" {
+		items, err := fetchCourseList(c, headers)
+		if err != nil {
+			return nil, err
+		}
+		if len(items) == 0 {
+			return nil, fmt.Errorf("duanshu: no purchased course list entries found")
+		}
+		return courseListMedia(info.Shop, items), nil
+	}
 
 	if info.ClassID != "" {
 		entry, err := resolveClass(c, headers, info.ContentID, info.ClassID, "")
@@ -103,10 +118,13 @@ func resolveSingle(c *util.Client, headers map[string]string, contentID, kind, f
 	if media == "" {
 		media = resolveVideoPlayInfo(c, headers, payload)
 	}
+	title := util.SanitizeFilename(firstNonEmpty(pickTitle(payload), fallback, contentID))
 	if media == "" {
+		if doc := documentInfo(title, payload, headers); doc != nil {
+			return doc, nil
+		}
 		return nil, fmt.Errorf("duanshu: no media URL in %s %s", firstNonEmpty(kind, "single"), contentID)
 	}
-	title := util.SanitizeFilename(firstNonEmpty(pickTitle(payload), fallback, contentID))
 	return mediaInfo(title, media, headers), nil
 }
 
@@ -177,10 +195,13 @@ func resolveClass(c *util.Client, headers map[string]string, courseID, classID, 
 	if media == "" {
 		media = resolveVideoPlayInfo(c, headers, payload)
 	}
+	title := util.SanitizeFilename(firstNonEmpty(pickTitle(payload), fallback, classID))
 	if media == "" {
+		if doc := documentInfo(title, payload, headers); doc != nil {
+			return doc, nil
+		}
 		return nil, fmt.Errorf("duanshu: no media URL in class %s", classID)
 	}
-	title := util.SanitizeFilename(firstNonEmpty(pickTitle(payload), fallback, classID))
 	return mediaInfo(title, media, headers), nil
 }
 
@@ -201,6 +222,42 @@ func requestJSON(c *util.Client, api string, headers map[string]string) (any, er
 		return nil, err
 	}
 	return payload, nil
+}
+
+func fetchCourseList(c *util.Client, headers map[string]string) ([]contentItem, error) {
+	var out []contentItem
+	seen := map[string]bool{}
+	for page := 1; page <= 50; page++ {
+		api := user_column_url + "?page=" + fmt.Sprint(page) + "&count=20"
+		payload, err := requestJSON(c, api, headers)
+		if err != nil {
+			return out, fmt.Errorf("fetch duanshu course list: %w", err)
+		}
+		items := collectContentItems(payload)
+		if len(items) == 0 {
+			break
+		}
+		for _, item := range items {
+			if item.ID == "" {
+				continue
+			}
+			kind := normalizeType(item.Kind)
+			if kind == "single" {
+				kind = "course"
+			}
+			key := kind + ":" + item.ID
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			item.Kind = kind
+			out = append(out, item)
+		}
+		if !hasNextPage(payload, page) {
+			break
+		}
+	}
+	return out, nil
 }
 
 func fetchColumnItems(c *util.Client, headers map[string]string, contentID string) ([]contentItem, error) {
@@ -264,6 +321,15 @@ func parseDuanshuURL(raw string) duanshuURL {
 		out.ClassID = firstNonEmpty(q.Get("class_id"), q.Get("classId"))
 	}
 	return out
+}
+
+func applyShopID(headers map[string]string, payload any) {
+	if headers["x-shop"] != "" {
+		return
+	}
+	if shopID := firstValueByKeys(payload, "shop_id", "shopId"); shopID != "" {
+		headers["x-shop"] = shopID
+	}
 }
 
 func duanshuHeaders(raw string, jar http.CookieJar, shop string) map[string]string {

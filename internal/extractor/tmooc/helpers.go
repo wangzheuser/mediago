@@ -30,10 +30,16 @@ func headersFromJar(j http.CookieJar) map[string]string {
 func media(site, title, u string, extra map[string]any) *extractor.MediaInfo {
 	return &extractor.MediaInfo{Site: site, Title: sanitize(title), Streams: map[string]extractor.Stream{"best": {Quality: "best", URLs: []string{u}, Format: pickFormat(u), Headers: map[string]string{"Referer": referer, "User-Agent": USER_AGENT}}}, Extra: extra}
 }
+var attrRe = regexp.MustCompile(`(?is)([\w:-]+)\s*=\s*(?:"([^"]*?)"|'([^']*?)')`)
+
 func parseAttrs(s string) map[string]string {
 	out := map[string]string{}
-	for _, m := range regexp.MustCompile(`(?is)([\w:-]+)\s*=\s*(['"])(.*?)\2`).FindAllStringSubmatch(s, -1) {
-		out[strings.ToLower(m[1])] = html.UnescapeString(m[3])
+	for _, m := range attrRe.FindAllStringSubmatch(s, -1) {
+		val := m[2]
+		if val == "" {
+			val = m[3]
+		}
+		out[strings.ToLower(m[1])] = html.UnescapeString(val)
 	}
 	return out
 }

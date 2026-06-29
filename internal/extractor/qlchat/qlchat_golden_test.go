@@ -170,6 +170,8 @@ func TestExtractMock(t *testing.T) {
 	fixtures := loadFixtures(t)
 	installMockTransport(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.Method == http.MethodPost && r.Host == "m.qlchat.com" && r.URL.Path == "/api/wechat/member/memberInfo":
+			writeFixture(t, w, fixtures, "member_info")
 		case r.Method == http.MethodPost && r.Host == "m.qlchat.com" && r.URL.Path == "/api/wechat/transfer/h5/live/purchaseCourse":
 			if pageNo(t, r) == 1 {
 				writeFixture(t, w, fixtures, "course_list")

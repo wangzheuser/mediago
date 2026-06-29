@@ -166,8 +166,14 @@ func normalizeURL(s string) string {
 		return "https:" + s
 	}
 	if strings.HasPrefix(s, "/") {
-		base, _ := url.Parse(refererURL)
-		ref, _ := url.Parse(s)
+		base, err := url.Parse(refererURL)
+		if err != nil {
+			return s
+		}
+		ref, err := url.Parse(s)
+		if err != nil {
+			return s
+		}
 		return base.ResolveReference(ref).String()
 	}
 	if strings.HasPrefix(strings.ToLower(s), "http://") || strings.HasPrefix(strings.ToLower(s), "https://") {
@@ -181,10 +187,11 @@ func qcloudURL(appID, fileID string) string {
 }
 func media(title, raw string, vi xsVideo) *extractor.MediaInfo {
 	format := "mp4"
-	if strings.Contains(strings.ToLower(raw), ".m3u8") {
+	lower := strings.ToLower(raw)
+	if strings.Contains(lower, ".m3u8") || strings.HasPrefix(lower, "data:application/vnd.apple.mpegurl") {
 		format = "m3u8"
 	}
-	return &extractor.MediaInfo{Site: "xsteach", Title: title, Streams: map[string]extractor.Stream{"default": {Quality: "default", URLs: []string{raw}, Format: format, Headers: map[string]string{"Referer": refererURL}}}, Extra: map[string]any{"period_id": vi.periodID, "teach_coach_id": vi.teachCoachID}}
+	return &extractor.MediaInfo{Site: "xsteach", Title: title, Streams: map[string]extractor.Stream{"default": {Quality: "default", URLs: []string{raw}, Format: format, NeedMerge: format == "m3u8", Headers: map[string]string{"Referer": refererURL}}}, Extra: map[string]any{"period_id": vi.periodID, "teach_coach_id": vi.teachCoachID}}
 }
 func mapsUnder(v any) []map[string]any {
 	out := []map[string]any{}

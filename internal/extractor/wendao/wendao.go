@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path"
 	"regexp"
 	"strings"
 
@@ -45,7 +46,10 @@ type wdLesson struct {
 	typ            int
 }
 
-var cidRe = regexp.MustCompile(`(?i)(?:[?&#]|^)(?:id|courseId|course_id)=(\d+)|/(?:course|detail)/(\d+)`)
+var (
+	cidRe      = regexp.MustCompile(`(?i)(?:[?&#]|^)(?:id|courseId|course_id)=(\d+)|/(?:course|detail)/(\d+)`)
+	bareHostRe = regexp.MustCompile(`(?i)^[\w.-]+\.[a-z]{2,}(?:/|$)`)
+)
 
 func (s *Wendao) Extract(rawURL string, opts *extractor.ExtractOpts) (*extractor.MediaInfo, error) {
 	if opts == nil || opts.Cookies == nil {
@@ -84,7 +88,12 @@ func (s *Wendao) Extract(rawURL string, opts *extractor.ExtractOpts) (*extractor
 			continue
 		}
 		seen[u] = true
-		entries = append(entries, &extractor.MediaInfo{Site: "wendao", Title: firstNonEmpty(les.title, "lesson_"+les.id), Streams: map[string]extractor.Stream{"default": {Quality: "source", URLs: []string{u}, Format: mediaFormat(u), Headers: headers(sess, false)}}})
+		format := mediaFormat(u)
+		stream := extractor.Stream{Quality: "source", URLs: []string{u}, Format: format, Headers: headers(sess, false)}
+		if format == "m3u8" {
+			stream.NeedMerge = true
+		}
+		entries = append(entries, &extractor.MediaInfo{Site: "wendao", Title: firstNonEmpty(les.title, "lesson_"+les.id), Streams: map[string]extractor.Stream{"default": stream}})
 	}
 	if len(entries) == 0 {
 		return nil, fmt.Errorf("wendao: no media lesson URL resolved")
@@ -161,7 +170,19 @@ func requestJSON(c *util.Client, sess wdSession, host, path string, body map[str
 func lessonsFromDetail(detail map[string]any) []wdLesson {
 	lessons := []wdLesson{}
 	for _, m := range mapsUnder(detail) {
-		u := firstNonEmpty(val(m, "courseDirectoryUrl"), val(m, "studyFileUrl"), val(m, "videoUrl"), val(m, "audioUrl"), val(m, "fileUrl"), val(m, "url"))
+		u := firstNonEmpty(
+			val(m, "courseDirectoryUrl"),
+			val(m, "studyFileUrl"),
+			val(m, "videoUrl"),
+			val(m, "audioUrl"),
+			val(m, "fileUrl"),
+			val(m, "materialUrl"),
+			val(m, "coursewareUrl"),
+			val(m, "attachmentUrl"),
+			val(m, "downloadUrl"),
+			val(m, "resourceUrl"),
+			val(m, "url"),
+		)
 		if u == "" {
 			continue
 		}
@@ -254,20 +275,33 @@ func normalizeURL(raw string) string {
 	if strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://") {
 		return raw
 	}
+	if bareHostRe.MatchString(raw) {
+		return "https://" + raw
+	}
 	return wapAPIHost + "/" + strings.TrimLeft(raw, "/")
 }
 func isMediaURL(u string) bool {
-	l := strings.ToLower(u)
-	return strings.Contains(l, ".mp4") || strings.Contains(l, ".m3u8") || strings.Contains(l, ".mp3") || strings.Contains(l, ".m4a") || strings.Contains(l, ".aac") || strings.Contains(l, ".wav")
+	return mediaFormat(u) != ""
 }
 func mediaFormat(u string) string {
-	l := strings.ToLower(u)
-	for _, ext := range []string{"m3u8", "mp3", "m4a", "aac", "wav"} {
-		if strings.Contains(l, "."+ext) {
-			return ext
-		}
+	parsed, err := url.Parse(u)
+	target := u
+	if err == nil {
+		target = parsed.Path
 	}
-	return "mp4"
+	ext := strings.TrimPrefix(strings.ToLower(path.Ext(target)), ".")
+	switch ext {
+	case "m3u8", "mp4", "flv", "mp3", "m4a", "aac", "wav", "pdf", "ppt", "pptx", "doc", "docx", "xls", "xlsx", "zip", "rar", "7z", "txt", "md":
+		return ext
+	default:
+		l := strings.ToLower(u)
+		for _, fallback := range []string{"m3u8", "mp4", "flv", "mp3", "m4a", "aac", "wav", "pdf"} {
+			if strings.Contains(l, "."+fallback) {
+				return fallback
+			}
+		}
+		return ""
+	}
 }
 func toInt(v any) int {
 	var n int

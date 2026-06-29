@@ -8,6 +8,8 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+
+	"github.com/Sophomoresty/mediago/internal/extractor"
 )
 
 func parseCourseID(raw string) (string, string) {
@@ -188,4 +190,98 @@ func pickFormat(u string) string {
 		return p[i+1:]
 	}
 	return "mp4"
+}
+
+func documentEntries(docs []map[string]any, defaultName string, h map[string]string) []*extractor.MediaInfo {
+	entries := make([]*extractor.MediaInfo, 0, len(docs))
+	for i, doc := range docs {
+		rawURL := first(textAt(doc, "file_url", "fileUrl", "url", "downloadUrl", "resourceUrl"), findURLInAny(doc))
+		if rawURL == "" {
+			continue
+		}
+		docURL := normalizeDocURL(rawURL)
+		if docURL == "" {
+			continue
+		}
+		format := pickFormat(docURL)
+		title := first(textAt(doc, "name", "file_name", "fileName", "title"), defaultName, fmt.Sprintf("课件_%02d", i+1))
+		title = strings.TrimSuffix(sanitize(title), "."+format)
+		entries = append(entries, &extractor.MediaInfo{
+			Site:  "renrenjiang",
+			Title: title,
+			Streams: map[string]extractor.Stream{"best": {
+				Quality: "best",
+				URLs:    []string{docURL},
+				Format:  format,
+				Headers: docHeaders(h),
+			}},
+			Extra: map[string]any{"type": "document", "raw": doc},
+		})
+	}
+	return entries
+}
+
+func normalizeDocURL(raw string) string {
+	raw = strings.TrimSpace(html.UnescapeString(strings.Trim(raw, `"'`)))
+	raw = strings.ReplaceAll(raw, `\/`, `/`)
+	if raw == "" {
+		return ""
+	}
+	if strings.HasPrefix(raw, "//") {
+		return "https:" + raw
+	}
+	if strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://") {
+		return raw
+	}
+	if strings.HasPrefix(raw, "/") {
+		return ORIGIN + raw
+	}
+	return raw
+}
+
+func docHeaders(h map[string]string) map[string]string {
+	out := map[string]string{"Referer": REFERER, "Origin": ORIGIN}
+	for k, v := range h {
+		if strings.EqualFold(k, "Authorization") || strings.EqualFold(k, "Cookie") || strings.EqualFold(k, "cookie") {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+func dedupeDocuments(docs []map[string]any) []map[string]any {
+	seen := map[string]bool{}
+	out := make([]map[string]any, 0, len(docs))
+	for _, doc := range docs {
+		key := first(textAt(doc, "id"), textAt(doc, "file_url", "fileUrl", "url"), textAt(doc, "name", "file_name"))
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, doc)
+	}
+	return out
+}
+
+func dedupeEntries(in []*extractor.MediaInfo) []*extractor.MediaInfo {
+	seen := map[string]bool{}
+	out := make([]*extractor.MediaInfo, 0, len(in))
+	for _, entry := range in {
+		if entry == nil {
+			continue
+		}
+		key := entry.Title
+		for _, stream := range entry.Streams {
+			if len(stream.URLs) > 0 {
+				key += "|" + stream.URLs[0]
+				break
+			}
+		}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, entry)
+	}
+	return out
 }

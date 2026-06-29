@@ -60,6 +60,9 @@ func (g *BilibiliGongfang) Extract(rawURL string, opts *extractor.ExtractOpts) (
 
 	client := util.NewClient()
 	client.SetCookieJar(opts.Cookies)
+	if err := ensureBilibiliLogin(client, opts.Cookies); err != nil {
+		return nil, err
+	}
 	headers := gongfangHeaders()
 
 	title, price, _ := fetchGongfangOrderTitle(client, headers, orderID)
@@ -207,7 +210,7 @@ func fetchGongfangDownloadURL(client *util.Client, headers map[string]string, or
 	return parseGongfangDownloadData(resp.Data), nil
 }
 
-// parseGongfangDownloadData mirrors _get_source_url: it reads data.get('url', '').
+// parseGongfangDownloadData mirrors _get_source_url: it reads data.get('url', ”).
 // The source only ever reads the "url" key from the data object; no other key is
 // guessed. A bare-string data payload is also accepted defensively.
 func parseGongfangDownloadData(raw json.RawMessage) string {

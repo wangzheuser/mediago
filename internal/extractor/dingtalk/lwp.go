@@ -2,11 +2,11 @@
 // for DingTalk live replay resolution.
 //
 // LWP is a JSON-over-WebSocket RPC layer. The protocol is:
-//   1. Connect to wss://webalfa-cm3.dingtalk.com/long
-//   2. Send registration: {"lwp":"/reg","headers":{"app-key":"...","token":"<cookie-token>","ua":"...","mid":"0 0"}}
-//   3. Receive registration ack with code 200
-//   4. Make RPC calls: {"lwp":"<uri>","headers":{"mid":"<N> 0"},"body":[...]}
-//   5. Match response by mid header
+//  1. Connect to wss://webalfa-cm3.dingtalk.com/long
+//  2. Send registration: {"lwp":"/reg","headers":{"app-key":"...","token":"<cookie-token>","ua":"...","mid":"0 0"}}
+//  3. Receive registration ack with code 200
+//  4. Make RPC calls: {"lwp":"<uri>","headers":{"mid":"<N> 0"},"body":[...]}
+//  5. Match response by mid header
 //
 // Ported from Dingtalk_Live_Client.pyc (LwpClient class, ~170 lines of core logic).
 package dingtalk
@@ -26,6 +26,7 @@ import (
 const (
 	wsURL      = "wss://webalfa-cm3.dingtalk.com/long"
 	liveAppKey = "5b46698304b45807569d343fcc5a2b61"
+	docWebUA   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36 DingWeb/3.4.0 LANG/zh_CN"
 	pcUA       = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.5359.125 Safari/537.36 dingtalk-win/1.0.0 nw(0.14.7) DingTalk(7.8.10-Release.250724002) Mojo/1.0.0 Native AppType(release) Channel/201200 Architecture/x86_64"
 	referer    = "https://www.dingtalk.com"
 )
@@ -56,6 +57,9 @@ type lwpClient struct {
 	conn       *websocket.Conn
 	token      string
 	cookie     string
+	deviceID   string
+	userAgent  string
+	docWebReg  bool
 	midCounter int
 	mu         sync.Mutex
 	timeout    time.Duration
@@ -74,9 +78,21 @@ func newLwpClient(cookie string) (*lwpClient, error) {
 	return &lwpClient{
 		token:      token,
 		cookie:     cookie,
+		deviceID:   deviceID,
+		userAgent:  pcUA,
 		midCounter: 5101000,
 		timeout:    20 * time.Second,
 	}, nil
+}
+
+func newDocLwpClient(cookie string) (*lwpClient, error) {
+	client, err := newLwpClient(cookie)
+	if err != nil {
+		return nil, err
+	}
+	client.userAgent = docWebUA
+	client.docWebReg = true
+	return client, nil
 }
 
 // connect establishes the WebSocket connection and sends the /reg handshake.
@@ -96,13 +112,8 @@ func (c *lwpClient) connect() error {
 
 	// Send /reg message
 	regMsg := lwpMessage{
-		LWP: "/reg",
-		Headers: map[string]string{
-			"app-key": liveAppKey,
-			"token":   c.token,
-			"ua":      pcUA,
-			"mid":     "0 0",
-		},
+		LWP:     "/reg",
+		Headers: c.buildRegHeaders(),
 	}
 	if err := c.sendJSON(regMsg); err != nil {
 		c.close()
@@ -125,6 +136,34 @@ func (c *lwpClient) connect() error {
 		return fmt.Errorf("LWP /reg failed: code=%d reason=%s", code, reason)
 	}
 	return nil
+}
+
+func (c *lwpClient) buildRegHeaders() map[string]string {
+	ua := c.userAgent
+	if ua == "" {
+		ua = pcUA
+	}
+	if c.docWebReg {
+		return map[string]string{
+			"mid":          "0 0",
+			"did":          c.deviceID,
+			"reg-type":     "",
+			"set-ver":      "0",
+			"sync":         "0,0;0;0;",
+			"wv":           "im:0,au:0,sy:6",
+			"dt":           "j",
+			"ua":           ua,
+			"token":        c.token,
+			"app-key":      liveAppKey,
+			"cache-header": "app-key token ua wv",
+		}
+	}
+	return map[string]string{
+		"app-key": liveAppKey,
+		"token":   c.token,
+		"ua":      ua,
+		"mid":     "0 0",
+	}
 }
 
 // call makes an LWP RPC call and waits for the matching response.

@@ -24,11 +24,17 @@ func (x *chaoxingContext) resolveCourse(rawURL string) (*extractor.MediaInfo, st
 		if body, err := x.getString(rawURL); err == nil {
 			page = body
 			x.extractAccessFromText(body)
+			x.extractPortalParams(body)
 			pageObjectID = extractObjectIDFromPage(body)
 			if x.title == "" {
 				x.title = parseChaoxingTitle(body)
 			}
 		}
+	}
+	x.extractPortalParams(rawURL)
+	portalLike := isPortalLikeURL(rawURL, page)
+	if portalLike {
+		x.resolvePortalAccess(rawURL, page)
 	}
 
 	coursePage := page
@@ -36,6 +42,7 @@ func (x *chaoxingContext) resolveCourse(rawURL string) (*extractor.MediaInfo, st
 		if body, err := x.getString(u); err == nil && strings.TrimSpace(body) != "" {
 			coursePage = body
 			x.extractAccessFromText(body)
+			x.extractPortalParams(body)
 			if x.title == "" {
 				x.title = parseChaoxingTitle(body)
 			}
@@ -49,29 +56,11 @@ func (x *chaoxingContext) resolveCourse(rawURL string) (*extractor.MediaInfo, st
 	if pid := firstNonEmpty(queryValue(rawURL, "chapterId"), queryValue(rawURL, "chapterid")); pid != "" && !chapterSeen(chapters, pid) {
 		chapters = append(chapters, chaoxingChapter{ID: pid, Title: "chapter_" + pid, Index: len(chapters) + 1})
 	}
-	if len(chapters) == 0 {
-		return nil, pageObjectID, fmt.Errorf("chaoxing: no chapter/knowledge ids found")
-	}
-
 	seen := map[string]bool{}
 	entries := make([]*extractor.MediaInfo, 0, len(chapters))
 	for _, ch := range chapters {
 		for _, entry := range x.resolveChapter(ch) {
-			if entry == nil || len(entry.Streams) == 0 {
-				continue
-			}
-			key := entry.Title
-			for _, st := range entry.Streams {
-				if len(st.URLs) > 0 {
-					key += "|" + st.URLs[0]
-					break
-				}
-			}
-			if seen[key] {
-				continue
-			}
-			seen[key] = true
-			entries = append(entries, entry)
+			entries = appendUniqueEntry(entries, entry, seen)
 		}
 	}
 	// Course-data attachment/material branch (Chaoxing_Course._get_file_list).
@@ -80,25 +69,24 @@ func (x *chaoxingContext) resolveCourse(rawURL string) (*extractor.MediaInfo, st
 	// fail closed for this branch rather than guess a value.
 	if x.openc != "" {
 		for _, entry := range x.resolveFileEntries(x.openc) {
-			if entry == nil || len(entry.Streams) == 0 {
-				continue
-			}
-			key := entry.Title
-			for _, st := range entry.Streams {
-				if len(st.URLs) > 0 {
-					key += "|" + st.URLs[0]
-					break
-				}
-			}
-			if seen[key] {
-				continue
-			}
-			seen[key] = true
-			entries = append(entries, entry)
+			entries = appendUniqueEntry(entries, entry, seen)
+		}
+	}
+	if portalLike {
+		for _, entry := range x.resolvePortalResourceEntries() {
+			entries = appendUniqueEntry(entries, entry, seen)
+		}
+	}
+	if x.shouldTryPublicCourseFallback(rawURL, page, chapters, entries) {
+		for _, entry := range x.resolvePublicCourseEntries() {
+			entries = appendUniqueEntry(entries, entry, seen)
 		}
 	}
 
 	if len(entries) == 0 {
+		if len(chapters) == 0 {
+			return nil, pageObjectID, fmt.Errorf("chaoxing: no chapter/knowledge ids found")
+		}
 		return nil, pageObjectID, fmt.Errorf("chaoxing: no resources resolved from course cards")
 	}
 	return &extractor.MediaInfo{
@@ -190,13 +178,30 @@ func (x *chaoxingContext) buildCoursePageURL() string {
 		return ""
 	}
 	values := url.Values{}
-	values.Set("courseId", x.courseID)
+	if x.newCourse {
+		values.Set("courseid", x.courseID)
+	} else {
+		values.Set("courseId", x.courseID)
+	}
 	values.Set("clazzid", x.clazzID)
 	if x.cpi != "" {
 		values.Set("cpi", x.cpi)
 	}
 	values.Set("enc", x.enc)
+	if x.newCourse {
+		base := strings.TrimRight(x.newCourseURL, "/")
+		prefix := x.newCoursePrefix()
+		return base + prefix + "/mycourse/studentcourse?" + values.Encode()
+	}
 	return x.abs("/mycourse/studentcourse") + "?" + values.Encode()
+}
+
+func (x *chaoxingContext) newCoursePrefix() string {
+	prefix := strings.TrimRight(x.pathPrefix, "/")
+	if strings.HasPrefix(prefix, "/mooc2-ans") {
+		return prefix
+	}
+	return "/mooc2-ans"
 }
 
 func (x *chaoxingContext) extractAccessFromURL(raw string) {
@@ -220,7 +225,14 @@ func (x *chaoxingContext) extractAccessFromURL(raw string) {
 				x.cpi = firstNonEmpty(x.cpi, vals[0])
 			case "openc":
 				x.openc = firstNonEmpty(x.openc, vals[0])
+			case "mooc2":
+				if vals[0] == "1" {
+					x.newCourse = true
+				}
 			}
+		}
+		if strings.Contains(strings.ToLower(u.Path), "/mooc2-ans/") {
+			x.newCourse = true
 		}
 	}
 	x.courseID = firstNonEmpty(x.courseID, regexpFirst(raw, `(?i)(?:courseId|courseid|course_id|moocId)=([0-9]+)`), regexpFirst(raw, `(?i)["']courseId["']\s*[:=]\s*["']?([0-9]+)`))
@@ -228,6 +240,9 @@ func (x *chaoxingContext) extractAccessFromURL(raw string) {
 	x.enc = firstNonEmpty(x.enc, regexpFirst(raw, `(?i)(?:\?|&|&amp;)enc=([a-z0-9]+)`), regexpFirst(raw, `(?i)["']enc["']\s*[:=]\s*["']([a-z0-9]+)`))
 	x.cpi = firstNonEmpty(x.cpi, regexpFirst(raw, `(?i)(?:\?|&|&amp;)cpi=([0-9]+)`), regexpFirst(raw, `(?i)["']cpi["']\s*[:=]\s*["']?([0-9]+)`))
 	x.openc = firstNonEmpty(x.openc, regexpFirst(raw, `(?i)(?:\?|&|&amp;)openc=([\w\d]+)`), regexpFirst(raw, `(?i)["']openc["']\s*[:=]\s*["']([\w\d]+)`))
+	if strings.Contains(strings.ToLower(raw), "/mooc2-ans/") || regexpFirst(raw, `(?i)(?:\?|&|&amp;)mooc2=([01])`) == "1" {
+		x.newCourse = true
+	}
 }
 
 func (x *chaoxingContext) extractAccessFromText(text string) {
@@ -263,6 +278,25 @@ func (x *chaoxingContext) extractAccessFromText(text string) {
 		x.enc = firstNonEmpty(x.enc, m[1])
 		x.cpi = firstNonEmpty(x.cpi, m[2])
 	}
+	x.extractPortalParams(text)
+}
+
+func appendUniqueEntry(entries []*extractor.MediaInfo, entry *extractor.MediaInfo, seen map[string]bool) []*extractor.MediaInfo {
+	if entry == nil || len(entry.Streams) == 0 {
+		return entries
+	}
+	key := entry.Title
+	for _, st := range entry.Streams {
+		if len(st.URLs) > 0 {
+			key += "|" + st.URLs[0]
+			break
+		}
+	}
+	if seen[key] {
+		return entries
+	}
+	seen[key] = true
+	return append(entries, entry)
 }
 
 func collectChaoxingChapters(text string) []chaoxingChapter {

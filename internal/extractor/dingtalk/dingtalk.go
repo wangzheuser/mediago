@@ -51,7 +51,20 @@ func (d *DingTalk) Extract(rawURL string, opts *extractor.ExtractOpts) (*extract
 		return nil, fmt.Errorf("dingtalk requires login cookies (use --cookies or --cookies-from-browser)")
 	}
 
-	// Document preview (REST, no LWP)
+	// Alidocs notable/record links contain sheet row metadata and may embed
+	// media directly in document payloads or via CSpace file metas.
+	if meta := extractNotableRecordMeta(rawURL); meta.Valid() {
+		return extractNotableRecord(opts, meta)
+	}
+
+	// Alidocs video/file preview (LWP CSpace flow).  The source first fetches
+	// the page because some share URLs only expose space/file ids in HTML or
+	// redirected query strings.
+	if meta := hydratePreviewDentryMeta(opts, extractPreviewDentryMeta(rawURL)); meta.SpaceID != "" && meta.FileID != "" {
+		return previewDentry(opts, meta)
+	}
+
+	// Legacy document preset/download preview (REST, no LWP)
 	if dentryKey := extractDentryKey(rawURL); dentryKey != "" {
 		return previewDoc(opts, dentryKey)
 	}
@@ -146,6 +159,9 @@ func buildMediaInfo(result *liveReplayResult) (*extractor.MediaInfo, error) {
 	if result.PlaybackToken != "" {
 		extra["playback_token"] = result.PlaybackToken
 	}
+	for k, v := range result.Extra {
+		extra[k] = v
+	}
 
 	info := &extractor.MediaInfo{
 		Site:    "dingtalk",
@@ -213,11 +229,11 @@ func previewDoc(opts *extractor.ExtractOpts, dentryKey string) (*extractor.Media
 // ---------------------------------------------------------------------------
 
 var (
-	liveRoomRe     = regexp.MustCompile(`live-room/[^?]*\?(?:[^&]*&)*?roomId=([^&]+)`)
-	groupShareRe   = regexp.MustCompile(`group-live-share/[^?]*\?(?:[^&]*&)*?encCid=([^&]+)`)
-	liveUUIDRe     = regexp.MustCompile(`(?:liveUuid|uuid)=([^&]+)`)
-	pcCodeRe       = regexp.MustCompile(`pcCode=([^&]+)`)
-	dentryKeyRe    = regexp.MustCompile(`(?:dentryKey|dentryUuid)=([^&\s]+)`)
+	liveRoomRe      = regexp.MustCompile(`live-room/[^?]*\?(?:[^&]*&)*?roomId=([^&]+)`)
+	groupShareRe    = regexp.MustCompile(`group-live-share/[^?]*\?(?:[^&]*&)*?encCid=([^&]+)`)
+	liveUUIDRe      = regexp.MustCompile(`(?:liveUuid|uuid)=([^&]+)`)
+	pcCodeRe        = regexp.MustCompile(`pcCode=([^&]+)`)
+	dentryKeyRe     = regexp.MustCompile(`(?:dentryKey|dentryUuid)=([^&\s]+)`)
 	transcribeURIRe = regexp.MustCompile(`/transcribes/([\w-]+)`)
 )
 
@@ -264,15 +280,31 @@ func cookieString(opts *extractor.ExtractOpts) string {
 	if opts == nil || opts.Cookies == nil {
 		return ""
 	}
-	// Build cookie header string from the jar for dingtalk.com
-	parsedURL, _ := url.Parse("https://www.dingtalk.com")
-	if parsedURL == nil {
-		return ""
+	// Build a cookie header from the DingTalk hosts used by live replay,
+	// shanji minutes, alidocs, and the LWP WebSocket registration.
+	origins := []string{
+		"https://www.dingtalk.com/",
+		"https://n.dingtalk.com/",
+		"https://h5.dingtalk.com/",
+		"https://live.dingtalk.com/",
+		"https://shanji.dingtalk.com/",
+		"https://alidocs.dingtalk.com/",
+		"https://webalfa-cm3.dingtalk.com/",
 	}
-	cookies := opts.Cookies.Cookies(parsedURL)
+	seen := map[string]bool{}
 	var parts []string
-	for _, c := range cookies {
-		parts = append(parts, c.Name+"="+c.Value)
+	for _, origin := range origins {
+		parsedURL, _ := url.Parse(origin)
+		if parsedURL == nil {
+			continue
+		}
+		for _, c := range opts.Cookies.Cookies(parsedURL) {
+			if c.Name == "" || seen[c.Name] {
+				continue
+			}
+			seen[c.Name] = true
+			parts = append(parts, c.Name+"="+c.Value)
+		}
 	}
 	return strings.Join(parts, "; ")
 }

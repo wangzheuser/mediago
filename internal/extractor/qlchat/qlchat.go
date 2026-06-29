@@ -3,6 +3,10 @@ package qlchat
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -21,6 +25,7 @@ const (
 	trainReferer            = "https://m.qianliao.net"
 	course_list_url         = "https://m.qlchat.com/api/wechat/transfer/h5/live/purchaseCourse"
 	learn_list_url          = "https://m.qlchat.com/api/wechat/transfer/h5/topic/listRecentLearn"
+	member_info_url         = "https://m.qlchat.com/api/wechat/member/memberInfo"
 	info_url                = "https://m.qlchat.com/api/wechat/transfer/h5/interact/getCourseList"
 	video_url               = "https://m.qlchat.com/api/wechat/topic/getMediaActualUrl"
 	h5_video_url            = "https://m.qlchat.com/api/wechat/topic/media-url?topicId=%s"
@@ -53,6 +58,8 @@ const (
 	train_live_url          = "https://m.qianliao.net/financial/tc-public-live?topicId=%s&periodId=%s&roomId=%s"
 	train_m3u8_url          = "https://playvideo.qcloud.com/getplayinfo/v4/%s/%s?psign=%s"
 	train_order_url         = "https://m.qianliao.net/financial/api/transfer?url=/gate/order/getOrderListDerail"
+	qlchatAESKey            = "711AAB17E204816B783374025FD08DE8"
+	qlchatAESIV             = "0102030405060708"
 )
 
 var patterns = []string{
@@ -78,6 +85,9 @@ func (q *Qlchat) Extract(rawURL string, opts *extractor.ExtractOpts) (*extractor
 	c := util.NewClient()
 	c.SetCookieJar(opts.Cookies)
 	h := map[string]string{"Referer": referer, "Accept": "application/json, text/plain, */*"}
+	if err := checkQlchatLogin(c, h); err != nil {
+		return nil, err
+	}
 	state := parseInput(rawURL)
 	if state.topicID != "" {
 		loadTopicIntro(c, h, &state)
@@ -141,6 +151,7 @@ func (q *Qlchat) Extract(rawURL string, opts *extractor.ExtractOpts) (*extractor
 			if article := resolveTopicArticle(c, h, id, name); article != nil {
 				entries = append(entries, article)
 			}
+			entries = append(entries, resolveTopicSpeakVideos(c, h, state.liveID, id, name)...)
 		case "file":
 			fileIdx++
 			fileURL := buildFileURL(it.FilePo.URL, it.FilePo.AuthKey)
@@ -215,6 +226,52 @@ func loadTopicIntro(c *util.Client, h map[string]string, st *qState) {
 	st.title = sanitize(first(st.title, match1(body, `"channelName"\s*:\s*"(.*?)"`), match1(body, `"topic"\s*:\s*"(.*?)"`)))
 	st.liveID = first(st.liveID, match1(body, `"liveId"\s*:\s*"?(.*?)"?[,}]`))
 }
+
+func checkQlchatLogin(c *util.Client, h map[string]string) error {
+	body, err := postJSON(c, member_info_url, map[string]any{}, h)
+	if err != nil {
+		return fmt.Errorf("qlchat login check: %w", err)
+	}
+	if strings.Contains(body, "无权限访问") {
+		return fmt.Errorf("qlchat login check failed: memberInfo returned anonymous/forbidden response")
+	}
+	var payload any
+	if err := json.Unmarshal([]byte(body), &payload); err != nil {
+		return fmt.Errorf("qlchat login check parse: %w", err)
+	}
+	if qlchatMemberInfoHasIdentity(payload) {
+		return nil
+	}
+	return fmt.Errorf("qlchat login check failed: memberInfo has no member identity")
+}
+
+func qlchatMemberInfoHasIdentity(v any) bool {
+	switch x := v.(type) {
+	case map[string]any:
+		for _, key := range []string{"name", "nickname", "nickName", "userName", "memberName", "avatar", "headImgUrl", "uid", "userId", "memberId"} {
+			if jstr(x[key]) != "" {
+				return true
+			}
+		}
+		code := strings.TrimSpace(jstr(x["code"]))
+		if code != "" && code != "0" {
+			return false
+		}
+		for _, key := range []string{"data", "member", "memberInfo", "user", "result"} {
+			if child, ok := x[key]; ok && qlchatMemberInfoHasIdentity(child) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range x {
+			if qlchatMemberInfoHasIdentity(child) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func fetchCourseList(c *util.Client, h map[string]string) ([]qCourse, error) {
 	var out []qCourse
 	for page := 1; page < 100; page++ {
@@ -299,7 +356,7 @@ func resolveVideo(c *util.Client, h map[string]string, topicID string, isLive bo
 		if postJSONInto(c, live_url, map[string]any{"topicId": topicID}, h, &resp) == nil {
 			for _, v := range resp.Data.List {
 				if v.Type == "END_VOD" && v.PlayURL != "" {
-					return v.PlayURL
+					return qlchatDecryptPlayURL(v.PlayURL)
 				}
 			}
 		}
@@ -320,7 +377,7 @@ func resolveVideo(c *util.Client, h map[string]string, topicID string, isLive bo
 	sort.Slice(resp.Data.Video, func(i, j int) bool {
 		return resp.Data.Video[i].Height*10000+resp.Data.Video[i].Width > resp.Data.Video[j].Height*10000+resp.Data.Video[j].Width
 	})
-	return resp.Data.Video[0].PlayURL
+	return qlchatDecryptPlayURL(resp.Data.Video[0].PlayURL)
 }
 func resolveAudio(c *util.Client, h map[string]string, topicID string) string {
 	var resp struct {
@@ -331,7 +388,7 @@ func resolveAudio(c *util.Client, h map[string]string, topicID string) string {
 		} `json:"data"`
 	}
 	_ = getJSONInto(c, fmt.Sprintf(audio_url, url.QueryEscape(topicID)), h, &resp)
-	return resp.Data.Audio.PlayURL
+	return qlchatDecryptPlayURL(resp.Data.Audio.PlayURL)
 }
 func sourceTopicID(c *util.Client, h map[string]string, id string) string {
 	body, _ := c.GetString(fmt.Sprintf(topic_url, url.QueryEscape(id)), h)
@@ -420,6 +477,71 @@ func fetchDocIDList(c *util.Client, h map[string]string, liveID, topicID string)
 		lastTime = last.CreateTime
 	}
 	return docIDs
+}
+
+func resolveTopicSpeakVideos(c *util.Client, h map[string]string, liveID, topicID, parentName string) []*extractor.MediaInfo {
+	urls := fetchTopicSpeakVideoURLs(c, h, liveID, topicID)
+	if len(urls) == 0 {
+		return nil
+	}
+	entries := make([]*extractor.MediaInfo, 0, len(urls))
+	for i, u := range urls {
+		title := sanitize(fmt.Sprintf("%s_视频_%d", parentName, i+1))
+		entries = append(entries, &extractor.MediaInfo{
+			Site:  "qlchat",
+			Title: title,
+			Streams: map[string]extractor.Stream{"best": {
+				Quality: "best",
+				URLs:    []string{u},
+				Format:  pickFormat(u),
+				Headers: map[string]string{"Referer": referer},
+			}},
+			Extra: map[string]any{"topic_id": topicID, "resource_type": "speak_video"},
+		})
+	}
+	return entries
+}
+
+func fetchTopicSpeakVideoURLs(c *util.Client, h map[string]string, liveID, topicID string) []string {
+	var urls []string
+	seen := map[string]bool{}
+	lastTime := 0
+	for i := 0; i < 100; i++ {
+		var resp struct {
+			Data struct {
+				LiveSpeakViews []struct {
+					Type       string `json:"type"`
+					Content    string `json:"content"`
+					CreateTime int    `json:"createTime"`
+				} `json:"liveSpeakViews"`
+			} `json:"data"`
+		}
+		payload := map[string]any{"time": lastTime, "beforeOrAfter": "after", "liveId": liveID, "topicId": topicID}
+		if err := postJSONInto(c, video_list_url, payload, h, &resp); err != nil {
+			break
+		}
+		if len(resp.Data.LiveSpeakViews) == 0 {
+			break
+		}
+		for _, sp := range resp.Data.LiveSpeakViews {
+			u := strings.TrimSpace(sp.Content)
+			if isMP4URL(u) && !seen[u] {
+				seen[u] = true
+				urls = append(urls, u)
+			}
+		}
+		last := resp.Data.LiveSpeakViews[len(resp.Data.LiveSpeakViews)-1]
+		if last.Type == "end" || last.CreateTime == lastTime {
+			break
+		}
+		lastTime = last.CreateTime
+	}
+	return urls
+}
+
+func isMP4URL(raw string) bool {
+	low := strings.ToLower(strings.TrimSpace(raw))
+	return (strings.HasPrefix(low, "http://") || strings.HasPrefix(low, "https://")) && strings.Contains(low, ".mp4")
 }
 
 type docFileResult struct {
@@ -527,8 +649,90 @@ func resolveTopicArticle(c *util.Client, h map[string]string, topicID, parentNam
 	return &extractor.MediaInfo{
 		Site:  "qlchat",
 		Title: title,
+		Streams: map[string]extractor.Stream{"html": {
+			Quality: "html",
+			URLs:    []string{dataHTMLURL(content)},
+			Format:  "html",
+		}},
 		Extra: map[string]any{"topic_id": topicID, "resource_type": "article", "article_content": content},
 	}
+}
+
+func qlchatDecryptPlayURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || strings.HasPrefix(strings.ToLower(raw), "http") {
+		return raw
+	}
+	cipherTextCandidates := decodeCiphertextCandidates(raw)
+	keyCandidates := [][]byte{[]byte(qlchatAESKey)}
+	if key, err := hex.DecodeString(qlchatAESKey); err == nil {
+		keyCandidates = append(keyCandidates, key)
+	}
+	for _, key := range keyCandidates {
+		if len(key) != 16 && len(key) != 24 && len(key) != 32 {
+			continue
+		}
+		block, err := aes.NewCipher(key)
+		if err != nil {
+			continue
+		}
+		iv := []byte(qlchatAESIV)
+		if len(iv) != block.BlockSize() {
+			continue
+		}
+		for _, cipherText := range cipherTextCandidates {
+			if len(cipherText) == 0 || len(cipherText)%block.BlockSize() != 0 {
+				continue
+			}
+			plain := make([]byte, len(cipherText))
+			cipher.NewCBCDecrypter(block, iv).CryptBlocks(plain, cipherText)
+			plain = pkcs7Unpad(plain, block.BlockSize())
+			decoded := strings.TrimSpace(string(plain))
+			if strings.HasPrefix(strings.ToLower(decoded), "http") {
+				return decoded
+			}
+		}
+	}
+	return raw
+}
+
+func decodeCiphertextCandidates(raw string) [][]byte {
+	candidates := [][]byte{}
+	for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
+		if b, err := enc.DecodeString(padBase64(raw)); err == nil {
+			candidates = append(candidates, b)
+		}
+		if b, err := enc.DecodeString(raw); err == nil {
+			candidates = append(candidates, b)
+		}
+	}
+	if b, err := hex.DecodeString(raw); err == nil {
+		candidates = append(candidates, b)
+	}
+	return candidates
+}
+
+func padBase64(s string) string {
+	if rem := len(s) % 4; rem != 0 {
+		return s + strings.Repeat("=", 4-rem)
+	}
+	return s
+}
+
+func pkcs7Unpad(data []byte, blockSize int) []byte {
+	if len(data) == 0 {
+		return data
+	}
+	pad := int(data[len(data)-1])
+	if pad <= 0 || pad > blockSize || pad > len(data) {
+		return bytes.TrimRight(data, "\x00")
+	}
+	for _, b := range data[len(data)-pad:] {
+		if int(b) != pad {
+			return bytes.TrimRight(data, "\x00")
+		}
+	}
+	return data[:len(data)-pad]
 }
 
 func postJSONInto(c *util.Client, api string, payload any, h map[string]string, out any) error {
@@ -608,4 +812,8 @@ func pickFormat(u string) string {
 		return p[i+1:]
 	}
 	return "mp4"
+}
+
+func dataHTMLURL(content string) string {
+	return "data:text/html;charset=utf-8," + url.PathEscape(content)
 }

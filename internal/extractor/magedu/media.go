@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -87,29 +86,34 @@ func sortMagedu(items []map[string]any) {
 }
 
 func mageduVideoItem(sec map[string]any, prefix []int) mageduItem {
-	vid := firstText(sec["content"], sec["videoId"], sec["vid"])
-	if vid == "" {
+	raw := firstText(sec["content"], sec["videoId"], sec["vid"])
+	if raw == "" {
 		return mageduItem{}
 	}
-	title := strings.TrimSpace(firstText(sec["title"], sec["name"], sec["sectionName"], vid))
-	title = regexp.MustCompile(`(?i)\.(?:mp4|m3u8)$`).ReplaceAllString(title, "")
-	return mageduItem{Kind: "video", Title: indexedTitle(prefix, title), VideoID: vid, SectionID: firstText(sec["id"]), StorageID: firstText(sec["videoStorageId"]), Size: int64(numOf(sec["size"]))}
+	title := mageduSectionTitle(sec, raw)
+	sectionID := firstText(sec["id"], sec["sectionId"])
+	storageID := firstText(sec["videoStorageId"], sec["video_storage_id"])
+	size := int64(numOf(sec["size"]))
+	if mageduLooksLikeVideoURL(raw) {
+		u := normalizeURL(raw)
+		return mageduItem{Kind: "video", Title: indexedTitle(prefix, title), FileURL: u, FileFmt: mediaExt(u), SectionID: sectionID, StorageID: storageID, Size: size}
+	}
+	if !mageduLooksLikePolyvID(raw) {
+		return mageduItem{}
+	}
+	return mageduItem{Kind: "video", Title: indexedTitle(prefix, title), VideoID: strings.TrimSpace(raw), SectionID: sectionID, StorageID: storageID, Size: size}
 }
 
 func mageduInlineFile(sec map[string]any, prefix []int) mageduItem {
 	if firstText(sec["sectionType"]) != "2" {
 		return mageduItem{}
 	}
-	u := firstText(sec["content"])
-	if u == "" {
+	u := normalizeURL(firstText(sec["content"]))
+	if !mageduLooksLikeDownloadURL(u) {
 		return mageduItem{}
 	}
-	u = normalizeURL(u)
-	if u == "" {
-		return mageduItem{}
-	}
-	title := indexedFileTitle(prefix, firstText(sec["title"], sec["name"], sec["sectionName"], "课件"))
-	return mageduItem{Kind: "file", Title: title, FileURL: u, FileFmt: mediaExt(u)}
+	title := indexedFileTitle(prefix, mageduSectionTitle(sec, "课件"))
+	return mageduItem{Kind: "file", Title: title, FileURL: u, FileFmt: mediaExt(u), Size: int64(numOf(sec["size"]))}
 }
 
 func normalizeURL(u string) string {

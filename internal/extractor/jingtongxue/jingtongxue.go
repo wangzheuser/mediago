@@ -23,7 +23,6 @@ import (
 	"strings"
 
 	"github.com/Sophomoresty/mediago/internal/extractor"
-	"github.com/Sophomoresty/mediago/internal/extractor/shared"
 	"github.com/Sophomoresty/mediago/internal/util"
 )
 
@@ -99,7 +98,7 @@ func (s *Jingtongxue) Extract(rawURL string, opts *extractor.ExtractOpts) (*extr
 		title = "jingtongxue_" + courseID
 	}
 
-	chapters, err := fetchJingtongxueChapters(c, courseID, classTypeID, headers)
+	chapters, err := fetchJingtongxueChapters(c, courseID, classTypeID, detail, headers)
 	if err != nil {
 		return nil, err
 	}
@@ -110,16 +109,19 @@ func (s *Jingtongxue) Extract(rawURL string, opts *extractor.ExtractOpts) (*extr
 			continue
 		}
 		chapterModuleID := firstText(chapter.ModuleID, moduleID)
-		lectures, err := fetchJingtongxueLectures(c, classTypeID, chapterID, headers)
+		lectures, err := fetchJingtongxueLectures(c, classTypeID, chapterID, detail, headers)
 		if err != nil {
 			continue
 		}
 		for lectureIndex, lecture := range lectures {
 			video := normalizeJingtongxueVideo(lecture, chapterModuleID, classTypeID)
+			if video.FileType != "" && !strings.EqualFold(video.FileType, "video") {
+				continue
+			}
 			if targetLectureID != "" && video.LectureID != targetLectureID {
 				continue
 			}
-			entry, err := buildJingtongxueEntry(c, headers, video, chapterIndex+1, lectureIndex+1)
+			entry, err := buildJingtongxueEntry(c, headers, video, chapterIndex+1, lectureIndex+1, opts.Quality)
 			if err != nil {
 				continue
 			}
@@ -300,10 +302,14 @@ type jtxChapter struct {
 	ModuleID    any    `json:"moduleId"`
 }
 
-func fetchJingtongxueChapters(c *util.Client, commodityID, classTypeID string, headers map[string]string) ([]jtxChapter, error) {
+func fetchJingtongxueChapters(c *util.Client, commodityID, classTypeID string, detail jtxDetail, headers map[string]string) ([]jtxChapter, error) {
 	var out jtxEnvelope[any]
 	path := fmt.Sprintf(pathChapter, url.PathEscape(commodityID), url.PathEscape(classTypeID))
-	if err := jtxGetJSON(c, path, nil, headers, &out); err != nil {
+	params := map[string]string{}
+	if jtxVideoIsBuyParam(detail) {
+		params["videoIsBuy"] = "1"
+	}
+	if err := jtxGetJSON(c, path, params, headers, &out); err != nil {
 		return nil, fmt.Errorf("jingtongxue chapters: %w", err)
 	}
 	if !out.ok() {
@@ -320,6 +326,14 @@ func fetchJingtongxueChapters(c *util.Client, commodityID, classTypeID string, h
 	return chapters, nil
 }
 
+func jtxVideoIsBuyParam(detail jtxDetail) bool {
+	priceFlag := int64FromAny(detail.PriceFlag)
+	if priceFlag == 0 {
+		return false
+	}
+	return jtxTruthy(detail.BuyFlag) || stringValue(detail.UserVIPFlag) == "1"
+}
+
 type jtxLecture struct {
 	ID          any      `json:"id"`
 	LectureID   any      `json:"lectureId"`
@@ -333,6 +347,8 @@ type jtxLecture struct {
 	VideoCcID   any      `json:"videoCcId"`
 	WebVideoID  any      `json:"webVideoId"`
 	SiteID      any      `json:"siteid"`
+	SiteIDAlt   any      `json:"siteId"`
+	StorageType string   `json:"storageType"`
 	Video       jtxVideo `json:"video"`
 }
 
@@ -343,14 +359,19 @@ type jtxVideo struct {
 	WebVideoID  any    `json:"webVideoId"`
 	StorageType string `json:"storageType"`
 	SiteID      any    `json:"siteid"`
+	SiteIDAlt   any    `json:"siteId"`
 	VideoSize   any    `json:"videoSize"`
 	VodeoSize   any    `json:"vodeoSize"`
 }
 
-func fetchJingtongxueLectures(c *util.Client, classTypeID, chapterID string, headers map[string]string) ([]jtxLecture, error) {
+func fetchJingtongxueLectures(c *util.Client, classTypeID, chapterID string, detail jtxDetail, headers map[string]string) ([]jtxLecture, error) {
 	var out jtxEnvelope[any]
 	path := fmt.Sprintf(pathLecture, url.PathEscape(classTypeID), url.PathEscape(chapterID))
-	if err := jtxGetJSON(c, path, nil, headers, &out); err != nil {
+	params := map[string]string{}
+	if jtxVideoIsBuyParam(detail) {
+		params["videoIsBuy"] = "1"
+	}
+	if err := jtxGetJSON(c, path, params, headers, &out); err != nil {
 		return nil, fmt.Errorf("jingtongxue lectures: %w", err)
 	}
 	if !out.ok() {
@@ -377,6 +398,7 @@ type jtxVideoInfo struct {
 	WebVideoID  string
 	StorageType string
 	SiteID      string
+	FileType    string
 	Size        int64
 	Raw         jtxLecture
 }
@@ -390,30 +412,32 @@ func normalizeJingtongxueVideo(lecture jtxLecture, moduleID, classTypeID string)
 		VideoID:     firstText(lecture.VideoID, lecture.Video.ID),
 		VideoCcID:   firstText(lecture.VideoCcID, lecture.Video.VideoCcID),
 		WebVideoID:  firstText(lecture.WebVideoID, lecture.Video.WebVideoID),
-		StorageType: firstText(lecture.Video.StorageType),
-		SiteID:      firstText(lecture.SiteID, lecture.Video.SiteID),
+		StorageType: firstText(lecture.StorageType, lecture.Video.StorageType),
+		SiteID:      firstText(lecture.SiteID, lecture.SiteIDAlt, lecture.Video.SiteID, lecture.Video.SiteIDAlt),
+		FileType:    strings.ToLower(firstText(lecture.FileType)),
 		Size:        int64FromAny(firstText(lecture.Video.VideoSize, lecture.Video.VodeoSize)),
 		Raw:         lecture,
 	}
 }
 
-func buildJingtongxueEntry(c *util.Client, headers map[string]string, video jtxVideoInfo, chapterIndex, lectureIndex int) (*extractor.MediaInfo, error) {
+func buildJingtongxueEntry(c *util.Client, headers map[string]string, video jtxVideoInfo, chapterIndex, lectureIndex int, quality string) (*extractor.MediaInfo, error) {
 	if video.LectureID == "" && video.VideoID == "" && video.VideoCcID == "" {
 		return nil, fmt.Errorf("jingtongxue lecture has no video id")
 	}
-	playURL, siteID, err := resolveJingtongxuePlayURL(c, headers, video)
+	playURL, siteID, err := resolveJingtongxuePlayURL(c, headers, video, quality)
 	if err != nil {
 		return nil, err
 	}
 	format := mediaExt(playURL)
-	stream := extractor.Stream{Quality: "best", URLs: []string{playURL}, Format: format, Size: video.Size, Headers: map[string]string{"Referer": urlReferer}}
+	streamQuality := firstText(quality, "best")
+	stream := extractor.Stream{Quality: streamQuality, URLs: []string{playURL}, Format: format, Size: video.Size, Headers: map[string]string{"Referer": urlReferer}}
 	if format == "m3u8" {
 		stream.NeedMerge = true
 	}
 	return &extractor.MediaInfo{Site: "jingtongxue", Title: fmt.Sprintf("[%d.%d]--%s", chapterIndex, lectureIndex, video.Title), Streams: map[string]extractor.Stream{"best": stream}, Extra: map[string]any{"lecture_id": video.LectureID, "module_id": video.ModuleID, "class_type_id": video.ClassTypeID, "video_id": video.VideoID, "video_cc_id": video.VideoCcID, "siteid": siteID}}, nil
 }
 
-func resolveJingtongxuePlayURL(c *util.Client, headers map[string]string, video jtxVideoInfo) (string, string, error) {
+func resolveJingtongxuePlayURL(c *util.Client, headers map[string]string, video jtxVideoInfo, quality string) (string, string, error) {
 	var play any
 	if video.ModuleID != "" && video.ClassTypeID != "" && video.LectureID != "" {
 		var out jtxEnvelope[any]
@@ -422,25 +446,36 @@ func resolveJingtongxuePlayURL(c *util.Client, headers map[string]string, video 
 			play = out.Data
 		}
 	}
-	if direct := findDirectJingtongxueURL(play); direct != "" {
+	playMap := jtxAsMap(play)
+	playMsg := jtxAsMap(playMap["msg"])
+	if len(playMsg) == 0 {
+		playMsg = playMap
+	}
+	storageType := firstText(video.StorageType, findStringKey(playMsg, "storageType"), findStringKey(play, "storageType"))
+	videoCCID := firstText(video.VideoCcID, findStringKey(playMsg, "videoCcId"), findStringKey(playMsg, "video_cc_id"), findStringKey(play, "videoCcId"), findStringKey(play, "video_cc_id"))
+	if videoCCID == "" && strings.EqualFold(storageType, "VIDEO_STORAGE_TYPE_CC") {
+		videoCCID = video.VideoID
+	}
+	direct := findDirectJingtongxueURL(play)
+	if direct != "" && (jtxIsDirectStorage(storageType) || (storageType == "" && videoCCID == "")) {
 		return direct, video.SiteID, nil
 	}
-	if video.VideoCcID == "" && strings.EqualFold(video.StorageType, "VIDEO_STORAGE_TYPE_CC") {
-		video.VideoCcID = video.VideoID
-	}
-	if video.VideoCcID != "" {
-		siteID := firstText(video.SiteID, findStringKey(play, "siteid"), findStringKey(play, "ccUserId"))
+	if videoCCID != "" || strings.EqualFold(storageType, "VIDEO_STORAGE_TYPE_CC") {
+		siteID := firstText(video.SiteID, findStringKey(playMsg, "siteid"), findStringKey(playMsg, "siteId"), findStringKey(playMsg, "ccUserId"), findStringKey(play, "siteid"), findStringKey(play, "siteId"), findStringKey(play, "ccUserId"))
 		if siteID == "" {
 			siteID = fetchJingtongxueSiteIDFromVideoInfo(c, headers, video)
 		}
 		if siteID == "" {
-			return "", "", fmt.Errorf("jingtongxue bokecc: missing siteid for vid=%s", video.VideoCcID)
+			return "", "", fmt.Errorf("jingtongxue bokecc: missing siteid for vid=%s", videoCCID)
 		}
-		playURL, err := shared.BokeCCResolve(c, video.VideoCcID, siteID, map[string]string{"Referer": urlBokeCCReferer})
+		playURL, err := resolveJingtongxueBokeCC(c, videoCCID, siteID, map[string]string{"Referer": urlBokeCCReferer}, quality)
 		if err != nil {
 			return "", siteID, err
 		}
 		return playURL, siteID, nil
+	}
+	if direct != "" {
+		return direct, video.SiteID, nil
 	}
 	return "", video.SiteID, fmt.Errorf("jingtongxue: no direct or BokeCC play URL for lecture=%s", video.LectureID)
 }
@@ -495,11 +530,7 @@ func fetchJingtongxueResourceMenu(c *util.Client, classTypeID string, headers ma
 	if err := jtxGetJSON(c, pathResourceMenu, map[string]string{"classTypeId": classTypeID}, headers, &out); err != nil || !out.ok() {
 		return nil
 	}
-	// data is expected to be a list; if not, return empty
-	dataList, ok := out.Data.([]any)
-	if !ok || len(dataList) == 0 {
-		return nil
-	}
+	dataList := jtxExtractRecords(out.Data)
 	var items []jtxResourceMenuItem
 	for _, rec := range dataList {
 		b, _ := json.Marshal(rec)
@@ -513,7 +544,8 @@ func fetchJingtongxueResourceMenu(c *util.Client, classTypeID string, headers ma
 
 // fetchJingtongxueResourceList fetches resources under one menu category.
 // Source: _get_source_info calls resource_api with commodity_id, class_type_id,
-//         page, pageSize, and optional firstMenuId.
+//
+//	page, pageSize, and optional firstMenuId.
 func fetchJingtongxueResourceList(c *util.Client, commodityID, classTypeID, menuID string, headers map[string]string) []jtxResourceFile {
 	params := map[string]string{"page": "1", "pageSize": "100"}
 	if menuID != "" {
@@ -538,7 +570,8 @@ func fetchJingtongxueResourceList(c *util.Client, commodityID, classTypeID, menu
 
 // fetchJingtongxueDownloadLink resolves a download URL via the download_link_api.
 // Source: _get_file_url calls download_link_api.format(resource_id) when no
-//         direct URL is available on the resource record.
+//
+//	direct URL is available on the resource record.
 func fetchJingtongxueDownloadLink(c *util.Client, resourceID string, headers map[string]string) string {
 	path := fmt.Sprintf(pathDownloadLink, url.PathEscape(resourceID))
 	var out jtxEnvelope[any]
@@ -661,7 +694,7 @@ func fetchJingtongxueResources(c *util.Client, commodityID, classTypeID string, 
 				name = fmt.Sprintf("resource_%d_%d", menuIdx+1, fileIdx+1)
 			}
 
-			displayTitle := fmt.Sprintf("(%d.%d)--%s", menuIdx+1, fileIdx+1, name)
+			displayTitle := fmt.Sprintf("(%d.%d.%d)--%s", 1, menuIdx+1, fileIdx+1, name)
 			format := ext
 			if format == "" {
 				format = "pdf"
@@ -722,6 +755,12 @@ func jtxExtractRecords(v any) []any {
 	switch x := v.(type) {
 	case []any:
 		return x
+	case []map[string]any:
+		out := make([]any, 0, len(x))
+		for _, item := range x {
+			out = append(out, item)
+		}
+		return out
 	case map[string]any:
 		for _, key := range []string{"records", "rows", "list", "items", "data"} {
 			if recs := jtxExtractRecords(x[key]); len(recs) > 0 {
@@ -730,6 +769,18 @@ func jtxExtractRecords(v any) []any {
 		}
 	}
 	return nil
+}
+
+func jtxAsMap(v any) map[string]any {
+	if m, ok := v.(map[string]any); ok {
+		return m
+	}
+	return nil
+}
+
+func jtxIsDirectStorage(storageType string) bool {
+	storageType = strings.ToUpper(strings.TrimSpace(storageType))
+	return strings.Contains(storageType, "VIDEO_STORAGE_TYPE_OTHER") || strings.Contains(storageType, "VIDEO_STORAGE_TYPE_ZS") || strings.Contains(storageType, "OTHER") || strings.Contains(storageType, "ZS")
 }
 
 func findDirectJingtongxueURL(v any) string {
@@ -850,4 +901,9 @@ func int64FromAny(v any) int64 {
 	}
 	n, _ := strconv.ParseInt(s, 10, 64)
 	return n
+}
+
+func jtxTruthy(v any) bool {
+	s := strings.ToLower(stringValue(v))
+	return s != "" && s != "0" && s != "false" && s != "no" && s != "none" && s != "<nil>"
 }

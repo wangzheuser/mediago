@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"regexp"
 	"strconv"
+	"strings"
 
 	"github.com/Sophomoresty/mediago/internal/extractor"
 	"github.com/Sophomoresty/mediago/internal/util"
@@ -28,6 +29,7 @@ const (
 	episode_detail_url               = "https://ke.fenbi.com/win/%s/v3/episodes/%s"
 	episode_detail_api_url           = "https://ke.fenbi.com/api/%s/v3/episodes/%s"
 	media_meta_url                   = "https://ke.fenbi.com/win/%s/v3/episodes/%s/mediafile/meta"
+	metapath_url                     = "https://webapi.fenbi.com/class/api/metapath/%s/%s/%s"
 	material_url                     = "https://live.fenbi.com/win/%s/v3/livereplay/materials/%s/path"
 	vertical_material_url            = "https://ke.fenbi.com/win/v3/vertical_feed/material/path"
 	page_size                        = 200
@@ -94,6 +96,7 @@ func (f *Fenbi) Extract(rawURL string, opts *extractor.ExtractOpts) (*extractor.
 		"Referer":          referer,
 		"X-Requested-With": "XMLHttpRequest",
 	}
+	headers = withFenbiCookieHeader(opts.Cookies, headers)
 	_ = checkLogin(c, headers)
 
 	if ids.LectureID == "" && ids.EpisodeID == "" {
@@ -445,18 +448,149 @@ func resolveEpisode(c *util.Client, headers map[string]string, prefix, episodeID
 			mergeVideoInfo(videoInfo, p)
 		}
 	}
+	metapath, hasMetapath := loadMetapath(c, headers, videoInfo)
 	for _, payload := range payloads {
 		if media := findMediaURL(payload); media != "" {
 			title := util.SanitizeFilename(firstNonEmpty(pickTitle(payload), fallbackTitle, episodeID))
 			entry := mediaInfo(title, media, headers)
 			files := materialEntries(c, headers, videoInfo, payloads)
+			if board := metapathEntry(title, metapath, headers); board != nil {
+				files = append(files, board)
+			}
 			if len(files) > 0 {
 				entry.Extra = map[string]any{"materials": materialSummaries(files)}
+			}
+			if hasMetapath {
+				if entry.Extra == nil {
+					entry.Extra = map[string]any{}
+				}
+				entry.Extra["metapath"] = metapathSummary(metapath)
 			}
 			return entry, files, nil
 		}
 	}
+	if hasMetapath {
+		title := util.SanitizeFilename(firstNonEmpty(fallbackTitle, pickTitle(metapath), "fenbi_board_"+episodeID))
+		if board := metapathEntry(title, metapath, headers); board != nil {
+			return board, nil, nil
+		}
+	}
 	return nil, nil, fmt.Errorf("fenbi: no media meta URL for episode %s", episodeID)
+}
+
+func loadMetapath(c *util.Client, headers map[string]string, videoInfo map[string]any) (map[string]any, bool) {
+	episodeID := infoString(videoInfo, "episode_id", "episodeId")
+	if episodeID == "" {
+		return nil, false
+	}
+	rootIDs := appendUnique(nil, infoString(videoInfo, "lecture_id", "lectureId"))
+	rootIDs = appendUnique(rootIDs, infoString(videoInfo, "content_id", "contentId"))
+	rootIDs = appendUnique(rootIDs, infoString(videoInfo, "biz_id", "bizId"))
+	bizTypes := appendUnique(nil, infoString(videoInfo, "biz_type", "bizType"))
+	for _, candidate := range []string{"0", "-10", "1", "2"} {
+		bizTypes = appendUnique(bizTypes, candidate)
+	}
+	for _, rootID := range rootIDs {
+		for _, bizType := range bizTypes {
+			api := fmt.Sprintf(metapath_url, url.PathEscape(rootID), url.PathEscape(episodeID), url.PathEscape(bizType))
+			payload, err := requestJSON(c, api, headers)
+			if err != nil {
+				continue
+			}
+			data, ok := unwrapData(payload).(map[string]any)
+			if !ok || !validMetapathData(data) {
+				continue
+			}
+			out := cloneAnyMap(data)
+			out["lecture_id"] = rootID
+			out["episode_id"] = episodeID
+			out["biz_type"] = bizType
+			out["metapath_url"] = api
+			out["source_api"] = "webapi.fenbi.com/class/api/metapath"
+			return out, true
+		}
+	}
+	return nil, false
+}
+
+func validMetapathData(data map[string]any) bool {
+	if len(data) == 0 {
+		return false
+	}
+	for _, key := range []string{"duration", "pageToPoints", "commandChunks", "rtpChunksNew", "rtpChunks"} {
+		if value, ok := data[key]; ok && value != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func metapathEntry(title string, meta map[string]any, headers map[string]string) *extractor.MediaInfo {
+	if len(meta) == 0 {
+		return nil
+	}
+	body, err := json.Marshal(meta)
+	if err != nil {
+		return nil
+	}
+	return &extractor.MediaInfo{
+		Site:  "fenbi",
+		Title: util.SanitizeFilename(firstNonEmpty(title, "fenbi_board") + "_板书"),
+		Streams: map[string]extractor.Stream{"board": {
+			Quality: "board",
+			URLs:    []string{"data:application/json;charset=utf-8," + url.PathEscape(string(body))},
+			Format:  "json",
+			Headers: headers,
+		}},
+		Extra: map[string]any{"kind": "metapath_board", "metapath": metapathSummary(meta)},
+	}
+}
+
+func metapathSummary(meta map[string]any) map[string]any {
+	return map[string]any{
+		"duration":             meta["duration"],
+		"page_count":           lenAny(meta["pageToPoints"]),
+		"command_chunks_count": lenAny(meta["commandChunks"]),
+		"rtp_chunks_new_count": lenAny(meta["rtpChunksNew"]),
+		"rtp_chunks_count":     lenAny(meta["rtpChunks"]),
+		"lecture_id":           meta["lecture_id"],
+		"episode_id":           meta["episode_id"],
+		"biz_type":             meta["biz_type"],
+		"metapath_url":         meta["metapath_url"],
+	}
+}
+
+func lenAny(v any) int {
+	switch x := v.(type) {
+	case []any:
+		return len(x)
+	case []map[string]any:
+		return len(x)
+	case map[string]any:
+		return len(x)
+	case string:
+		if strings.TrimSpace(x) == "" {
+			return 0
+		}
+		var decoded any
+		if json.Unmarshal([]byte(x), &decoded) == nil {
+			return lenAny(decoded)
+		}
+		return 1
+	default:
+		if v == nil {
+			return 0
+		}
+		return 1
+	}
+}
+
+func cloneAnyMap(in map[string]any) map[string]any {
+	out := make(map[string]any, len(in)+4)
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 func mediaMetaParamSets(videoInfo map[string]any) []map[string]string {

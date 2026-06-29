@@ -192,11 +192,14 @@ func fetchKeqqCoursePage(c *util.Client, cid, tid string, headers map[string]str
 }
 
 func keqqPageTitle(page *keqqPageData, html, cid string) string {
+	if page == nil {
+		return "keqq_" + cid
+	}
 	title := strings.TrimSpace(page.Title)
 	if title == "" {
 		title = "keqq_" + cid
 	}
-	if page == nil || page.Next == nil {
+	if page.Next == nil {
 		return title
 	}
 	courseInfo := nestedMap(page.Next, "props", "pageProps", "courseInfo")

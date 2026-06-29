@@ -2,6 +2,7 @@ package dingtalk
 
 import (
 	"crypto/md5"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -29,6 +30,22 @@ var mediaURLKeys = append(playbackURLKeys,
 var videoExtensions = []string{
 	".m3u8", ".mp4", ".mov", ".m4v", ".flv", ".avi",
 	".wmv", ".mkv", ".webm", ".ts",
+}
+
+var mediaURLRe = regexp.MustCompile(`https?://[^\s"'<>\\]+`)
+
+var embeddedMediaQueryKeys = map[string]bool{
+	"videoPlayUrl": true,
+	"playbackUrl":  true,
+	"playUrl":      true,
+	"videoUrl":     true,
+	"video_url":    true,
+	"previewUrl":   true,
+	"fileUrl":      true,
+	"downloadUrl":  true,
+	"signedUrl":    true,
+	"url":          true,
+	"src":          true,
 }
 
 // findPlaybackURLs walks a JSON value and collects M3U8 playback URLs.
@@ -79,6 +96,14 @@ func findPlaybackURLs(payload any) []string {
 func findMediaURLs(payload any) []string {
 	var urls []string
 	seen := map[string]bool{}
+	appendOne := func(s string) {
+		s = strings.TrimSpace(s)
+		if s == "" || seen[s] {
+			return
+		}
+		seen[s] = true
+		urls = append(urls, s)
+	}
 
 	walkJSON(payload, func(key string, val any) {
 		s, ok := val.(string)
@@ -86,16 +111,23 @@ func findMediaURLs(payload any) []string {
 			return
 		}
 		s = strings.TrimSpace(s)
-		if !strings.HasPrefix(s, "http") {
-			return
+		if strings.HasPrefix(s, "http") && (isMediaURL(s) || isForceMediaKey(key)) {
+			appendOne(s)
 		}
-		if isMediaURL(s) || isForceMediaKey(key) {
-			if !seen[s] {
-				seen[s] = true
-				urls = append(urls, s)
-			}
+		for _, embedded := range extractEmbeddedMediaURLs(s, 3) {
+			appendOne(embedded)
 		}
 	})
+
+	// Last resort: media URLs sometimes appear inside JSON-encoded strings or
+	// escaped text values; mirror the Python source's regex scan over payload.
+	if raw, err := json.Marshal(payload); err == nil {
+		for _, match := range mediaURLRe.FindAllString(string(raw), -1) {
+			for _, embedded := range extractEmbeddedMediaURLs(match, 2) {
+				appendOne(embedded)
+			}
+		}
+	}
 
 	return urls
 }
@@ -108,6 +140,76 @@ func isMediaURL(u string) bool {
 		}
 	}
 	return false
+}
+
+func isDirectMediaURL(text string) bool {
+	if !strings.HasPrefix(text, "http://") && !strings.HasPrefix(text, "https://") {
+		return false
+	}
+	parsed, err := url.Parse(text)
+	lower := strings.ToLower(text)
+	if err == nil {
+		lower = strings.ToLower(parsed.Path)
+	}
+	for _, ext := range videoExtensions {
+		if strings.Contains(lower, ext) {
+			return true
+		}
+	}
+	return false
+}
+
+func extractEmbeddedMediaURLs(text string, maxDepth int) []string {
+	if maxDepth <= 0 {
+		return nil
+	}
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil
+	}
+	seenTexts := map[string]bool{}
+	seenURLs := map[string]bool{}
+	var out []string
+	var walk func(string, int)
+	walk = func(value string, depth int) {
+		if depth <= 0 {
+			return
+		}
+		value = strings.Trim(strings.TrimSpace(value), `"'`)
+		if value == "" || seenTexts[value] {
+			return
+		}
+		seenTexts[value] = true
+		if decoded, err := url.QueryUnescape(value); err == nil && decoded != value {
+			walk(decoded, depth-1)
+		}
+		if isDirectMediaURL(value) && !seenURLs[value] {
+			seenURLs[value] = true
+			out = append(out, value)
+		}
+		if parsed, err := url.Parse(value); err == nil {
+			for key, vals := range parsed.Query() {
+				if !embeddedMediaQueryKeys[key] {
+					continue
+				}
+				for _, v := range vals {
+					walk(v, depth-1)
+				}
+			}
+		}
+		for _, match := range mediaURLRe.FindAllString(value, -1) {
+			match = strings.TrimRight(match, `\.,;)]}`)
+			if isDirectMediaURL(match) && !seenURLs[match] {
+				seenURLs[match] = true
+				out = append(out, match)
+			}
+			if match != value {
+				walk(match, depth-1)
+			}
+		}
+	}
+	walk(text, maxDepth)
+	return out
 }
 
 func isForceMediaKey(key string) bool {
@@ -219,12 +321,13 @@ func resolveLiveReplay(cookie, roomID, liveUUID string) (*liveReplayResult, erro
 }
 
 type liveReplayResult struct {
-	RoomID       string
-	LiveUUID     string
-	Title        string
-	PlaybackURLs []string
+	RoomID        string
+	LiveUUID      string
+	Title         string
+	PlaybackURLs  []string
 	PlaybackToken string
-	M3U8Content  string
+	M3U8Content   string
+	Extra         map[string]any
 }
 
 // ---------------------------------------------------------------------------
@@ -322,8 +425,8 @@ func resolveLiveRoom(client *lwpClient, roomID, liveUUID string) (*roomInfoResul
 	body := []any{
 		map[string]any{
 			"mustReturnRoomInfo": true,
-			"roomId":            roomID,
-			"liveUuid":          liveUUID,
+			"roomId":             roomID,
+			"liveUuid":           liveUUID,
 		},
 	}
 
