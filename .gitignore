@@ -29,3 +29,4 @@ Thumbs.db
 *.log
 *.mp4
 cctalk_cookies.txt
+.claude/worktrees/

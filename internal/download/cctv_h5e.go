@@ -9,10 +9,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
 )
 
 //go:embed cctv_h5e_decrypt.js
 var cctvH5eDecryptJS []byte
+
+const cctvWorkerURL = "https://js.player.cntv.cn/creator/live.worker.js"
 
 type cctvH5eJob struct {
 	Input  string `json:"input"`
@@ -31,34 +34,33 @@ func (e *Engine) decryptCCTVH5E(ctx context.Context, segmentPaths []string) erro
 	}
 	defer os.RemoveAll(tmpDir)
 
-	// Write decoder script
 	decoderPath := filepath.Join(tmpDir, "cctv_h5e_decrypt.js")
 	if err := os.WriteFile(decoderPath, cctvH5eDecryptJS, 0o644); err != nil {
 		return err
 	}
 
-	// Build job list
+	workerPath, err := e.ensureCCTVWorker(ctx, tmpDir)
+	if err != nil {
+		return err
+	}
+
 	jobs := make([]cctvH5eJob, 0, len(segmentPaths))
 	for _, p := range segmentPaths {
-		jobs = append(jobs, cctvH5eJob{
-			Input:  p,
-			Output: p, // decrypt in-place
-		})
+		jobs = append(jobs, cctvH5eJob{Input: p, Output: p})
 	}
 	jobJSON, err := json.Marshal(jobs)
 	if err != nil {
 		return err
 	}
 
-	// Run batch decrypt (self-contained pure-JS TEA decoder)
-	cmd := exec.CommandContext(ctx, nodeExe, decoderPath, "--batch")
+	cmd := exec.CommandContext(ctx, nodeExe, "--stack-size=65536", decoderPath, workerPath)
 	cmd.Stdin = strings.NewReader(string(jobJSON))
-	output, err := cmd.CombinedOutput()
+	cmd.Stderr = os.Stderr
+	output, err := cmd.Output()
 	if err != nil {
 		return fmt.Errorf("cctv h5e decrypt failed: %w\n%s", err, output)
 	}
 
-	// Verify results
 	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
 		if line == "" {
 			continue
@@ -77,6 +79,36 @@ func (e *Engine) decryptCCTVH5E(ctx context.Context, segmentPaths []string) erro
 	}
 
 	return nil
+}
+
+func (e *Engine) ensureCCTVWorker(ctx context.Context, tmpDir string) (string, error) {
+	cacheDir, err := os.UserCacheDir()
+	if err != nil {
+		cacheDir = tmpDir
+	}
+	cachedPath := filepath.Join(cacheDir, "mediago", "cctv_live_worker.js")
+
+	if info, err := os.Stat(cachedPath); err == nil && info.Size() > 1000000 {
+		return cachedPath, nil
+	}
+
+	os.MkdirAll(filepath.Dir(cachedPath), 0o755)
+	body, err := e.client.GetBytes(cctvWorkerURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to download CCTV worker.js: %w", err)
+	}
+	if len(body) < 1000000 {
+		return "", fmt.Errorf("CCTV worker.js too small (%d bytes)", len(body))
+	}
+
+	if err := os.WriteFile(cachedPath, body, 0o644); err != nil {
+		fallback := filepath.Join(tmpDir, "live.worker.js")
+		if err := os.WriteFile(fallback, body, 0o644); err != nil {
+			return "", err
+		}
+		return fallback, nil
+	}
+	return cachedPath, nil
 }
 
 func findNode() (string, error) {

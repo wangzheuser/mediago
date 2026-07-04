@@ -1,219 +1,49 @@
-#!/usr/bin/env node
-/**
- * CCTV H5E TS Segment Decryptor (mediago embedded)
- *
- * Pure-JS TEA decryptor. No WASM, no worker.js, no --stack-size, no deps.
- *
- * Usage:
- *   node cctv_h5e_decrypt.js <input.ts> <output.ts>
- *
- * Batch (stdin JSON array of {input,output}):
- *   echo '[{"input":"a.ts","output":"b.ts"}]' | node cctv_h5e_decrypt.js --batch
- *
- * Emits one JSON line per segment: {"ok":true,"file":...,"size":N,"nalu_count":M}
- */
-'use strict';
-const fs = require('fs');
+global.self={location:{host:'',hostname:'',href:'blob:https://tv.cctv.com/5bca710b',origin:'https://tv.cctv.com',protocol:'blob:'}};
+global.location=global.self.location;global.document={currentScript:{src:''}};
+Object.defineProperty(global,'navigator',{value:{userAgent:'x'},writable:true,configurable:true});
+global.fetch=()=>Promise.resolve({ok:true,status:200,statusText:'OK',arrayBuffer:()=>Promise.resolve(Buffer.from('{"h5player":{"ver":20190904}}').buffer)});
+const fs=require('fs');
+const workerPath=process.argv[2];
+const jobsJSON=fs.readFileSync(0,'utf-8');
+const jobs=JSON.parse(jobsJSON);
 
-const VIDEO_PID = 0x100;
-const TEA_DELTA = 0x9e3779b9;
+// Load and patch worker (skip if already patched)
+let code=fs.readFileSync(workerPath,'utf-8');
+if (!code.includes('privateXMLHttpRequest')) {
+// patches inline...
+code=code.replace('theAnswer(thearg){var name=UTF8ToString(thearg),a=eval(name','theAnswer(thearg){var i={location:{hash:"",host:"",hostname:"",href:"blob:https://tv.cctv.com/5bca710b-9f02-41f0-a9f1-102bbc65192a",origin:"https://tv.cctv.com",pathname:"",port:"",protocol:"blob:",search:""}};i.self={location:i.location};var name=UTF8ToString(thearg),a=eval("i."+name');
+code=code.replace(/function emval_get_global\(\)\{return"object"==typeof globalThis\?globalThis:Function\("return this"\)\(\)\}/,'function emval_get_global(){var i={location:{hash:"",host:"",hostname:"",href:"blob:https://tv.cctv.com/5bca710b",origin:"https://tv.cctv.com",pathname:"",port:"",protocol:"blob:",search:""}};i.self={location:i.location};return i}');
+code=code.replace('A=_emscripten_get_callstack_js(A)','A="blob:https://tv.cctv.com/5bca710b"');
+const xhr='class privateXMLHttpRequest{constructor(){this.status=0;this.readyState=0;this.response=null;this.responseText="";this.statusText="";this.responseType="";this.timeout=0;this.withCredentials=false;this.url_=""}open(m,u,a){this.url_=u||"";if(this.url_==="https://tv.cctv.com/Library/H5player.json")this.url_="data:application/json;base64,eyJoNXBsYXllciI6eyJ2ZXIiOjIwMTkwOTA0LCJtZDUiOiJjN2VkNWE3MWRiZTRkZWUxYTJiYTE3MWY2NjBlZTk4ZCIsIkJUaW1lIjoiMjAxOS0wOS0wNC0yMDoyNToxMCJ9fQ==";this.readyState=1;if(this.onreadystatechange)this.onreadystatechange()}setRequestHeader(){}overrideMimeType(){}getResponseHeader(){return null}send(body){const url=this.url_;if(url&&url.startsWith("data:")){const c=url.indexOf(","),meta=url.slice(5,c),pl=url.slice(c+1);if(meta.includes("base64")){const buf=Buffer.from(pl,"base64");if(this.responseType==="arraybuffer")this.response=buf.buffer.slice(buf.byteOffset,buf.byteOffset+buf.byteLength);else{this.responseText=buf.toString("utf-8");this.response=this.responseText}}this.status=200;this.readyState=4;if(this.onload)this.onload();if(this.onreadystatechange)this.onreadystatechange();return}if(typeof fetch!=="undefined"){fetch(url,{body,method:"GET"}).then(r=>{this.readyState=4;this.status=r.status;if(!r.ok)throw new Error;return r.arrayBuffer()}).then(ab=>{this.response=ab;if(this.onload)this.onload();if(this.onreadystatechange)this.onreadystatechange()}).catch(()=>{if(this.onerror)this.onerror();if(this.onreadystatechange)this.onreadystatechange()})}}}\n';
+code=code.replace('return function(CNTVModule)',xhr+'return function(CNTVModule)');
+code=code.replace(/new XMLHttpRequest/g,'new privateXMLHttpRequest');
+code=code.replace(/"undefined"!=typeof XMLHttpRequest/g,'"undefined"!=typeof privateXMLHttpRequest');
+code=code.replace(/([a-z])=!!\(4&([a-z])\),([a-z])=!!\(32&\2\),\2=!!\(16&\2\);/,'$1=!!(4&$2),$3=!!(32&$2),$2=!!(16&$2);__emscripten_fetch_xhr(A,n,E,I,o);return A;');
+} // end if (!code.includes('privateXMLHttpRequest'))
 
-// TEA decrypt one 8-byte block (two u32 LE words). 16 rounds, sum starts at delta*16.
-function teaDecryptBlock(v0, v1, k0, k1, k2, k3) {
-    let sum = (TEA_DELTA * 16) >>> 0;
-    for (let i = 0; i < 16; i++) {
-        v1 = (v1 - ((((v0 << 4) >>> 0) + k2 ^ (v0 + sum) ^ ((v0 >>> 5) + k3)) >>> 0)) >>> 0;
-        v0 = (v0 - ((((v1 << 4) >>> 0) + k0 ^ (v1 + sum) ^ ((v1 >>> 5) + k1)) >>> 0)) >>> 0;
-        sum = (sum - TEA_DELTA) >>> 0;
-    }
-    return [v0 >>> 0, v1 >>> 0];
-}
+(0,eval)(code);
 
-// Strip H.264 emulation-prevention bytes (00 00 03 -> 00 00) from a NAL unit.
-function removeSCEP(nal) {
-    const out = Buffer.allocUnsafe(nal.length);
-    let j = 0, i = 0;
-    const n = nal.length;
-    while (i < n) {
-        if (i + 2 < n && nal[i] === 0 && nal[i + 1] === 0 && nal[i + 2] === 3) {
-            out[j++] = 0;
-            out[j++] = 0;
-            i += 3;
-        } else {
-            out[j++] = nal[i++];
-        }
-    }
-    return out.subarray(0, j);
-}
-
-// TEA-decrypt an SCEP-removed NAL payload in place.
-// Key = bytes 16..31 (4 u32 LE). Decrypt 8 bytes every 80 bytes starting at offset 32.
-function teaDecryptNAL(clean) {
-    if (clean.length < 33) return;
-    const k0 = clean.readUInt32LE(16);
-    const k1 = clean.readUInt32LE(20);
-    const k2 = clean.readUInt32LE(24);
-    const k3 = clean.readUInt32LE(28);
-    const iterations = Math.floor((clean.length - 32) / 80);
-    for (let i = 0; i < iterations; i++) {
-        const off = 32 + i * 80;
-        const v0 = clean.readUInt32LE(off);
-        const v1 = clean.readUInt32LE(off + 4);
-        const [d0, d1] = teaDecryptBlock(v0, v1, k0, k1, k2, k3);
-        clean.writeUInt32LE(d0, off);
-        clean.writeUInt32LE(d1, off + 4);
-    }
-}
-
-// Locate NAL units in an ES buffer.
-// Returns { scStart, scLen, nalStart, nalEnd } where nalEnd is the next start-code position.
-function parseNALs(es) {
-    const n = es.length;
-    const units = [];
-    let i = 0;
-    while (i < n - 3) {
-        if (es[i] === 0 && es[i + 1] === 0) {
-            if (i + 3 < n && es[i + 2] === 0 && es[i + 3] === 1) {
-                units.push({ scStart: i, scLen: 4, nalStart: i + 4 });
-                i += 4;
-            } else if (es[i + 2] === 1) {
-                units.push({ scStart: i, scLen: 3, nalStart: i + 3 });
-                i += 3;
-            } else {
-                i++;
-            }
-        } else {
-            i++;
-        }
-    }
-    const result = [];
-    for (let k = 0; k < units.length; k++) {
-        const nalEnd = k + 1 < units.length ? units[k + 1].scStart : n;
-        result.push({ ...units[k], nalEnd });
-    }
-    return result;
-}
-
-// Decrypt one ES buffer. Removes SCEP from type 1/5/25 NALs, TEA-decrypts, and
-// rebuilds the ES WITHOUT re-inserting SCEP bytes (output is shorter).
-// Returns { es: Buffer, count } or null if nothing was decrypted.
-function decryptES(es) {
-    const nals = parseNALs(es);
-    if (nals.length === 0) return null;
-
-    const parts = [];
-    let prevEnd = 0;
-    let count = 0;
-
-    for (const { scStart, scLen, nalStart, nalEnd } of nals) {
-        if (scStart > prevEnd) parts.push(es.subarray(prevEnd, scStart));
-        const startCode = es.subarray(scStart, scStart + scLen);
-        const nal = es.subarray(nalStart, nalEnd);
-        const type = nal.length ? nal[0] & 0x1f : 0;
-
-        if (type === 1 || type === 5 || type === 25) {
-            const clean = removeSCEP(nal);
-            teaDecryptNAL(clean);
-            parts.push(startCode);
-            parts.push(clean); // shorter (SCEP removed), NOT re-added
-            count++;
-        } else {
-            parts.push(startCode);
-            parts.push(nal);
-        }
-        prevEnd = nalEnd;
-    }
-    if (prevEnd < es.length) parts.push(es.subarray(prevEnd));
-
-    if (count === 0) return null;
-    return { es: Buffer.concat(parts), count };
-}
-
-// Collect video-PID PES units and the TS packet payload slots that carry them.
-function collectPES(data) {
-    const units = [];
-    let cur = null;
-    for (let pos = 0; pos < data.length; pos += 188) {
-        if (data[pos] !== 0x47) continue;
-        const pid = ((data[pos + 1] & 0x1f) << 8) | data[pos + 2];
-        if (pid !== VIDEO_PID) continue;
-        const pusi = (data[pos + 1] & 0x40) >> 6;
-        const afc = (data[pos + 3] & 0x30) >> 4;
-        if (afc === 0 || afc === 2) continue;
-        const ps = afc === 3 ? pos + 5 + data[pos + 4] : pos + 4;
-        const pe = pos + 188;
-        if (pusi) {
-            if (cur) units.push(cur);
-            cur = { bufs: [data.subarray(ps, pe)], slots: [{ ps, pe }] };
-        } else if (cur) {
-            cur.bufs.push(data.subarray(ps, pe));
-            cur.slots.push({ ps, pe });
-        }
-    }
-    if (cur) units.push(cur);
-    return units;
-}
-
-// Decrypt a full TS segment. Returns { data: Buffer, count }.
-function decryptSegment(tsData) {
-    const data = Buffer.from(tsData);
-    const pesUnits = collectPES(data);
-    let count = 0;
-
-    for (const pes of pesUnits) {
-        const pesData = Buffer.concat(pes.bufs);
-        if (pesData.length < 9 || pesData[0] !== 0 || pesData[1] !== 0 || pesData[2] !== 1) continue;
-        const hdrLen = pesData[8];
-        const esOff = 9 + hdrLen;
-        const es = pesData.subarray(esOff);
-
-        const res = decryptES(es);
-        if (!res) continue;
-        count += res.count;
-
-        // Rebuilt PES is shorter than the original ES (SCEP bytes dropped).
-        // Scatter it back across the original TS payload slots, padding the tail
-        // of each slot with 0xFF stuffing when the cleaned data runs out.
-        const newPES = Buffer.concat([pesData.subarray(0, esOff), res.es]);
-        let off = 0;
-        for (const { ps, pe } of pes.slots) {
-            const slot = pe - ps;
-            const chunk = newPES.subarray(off, off + slot);
-            if (chunk.length > 0) chunk.copy(data, ps);
-            if (chunk.length < slot) data.fill(0xff, ps + chunk.length, pe);
-            off += slot;
-        }
-    }
-    return { data, count };
-}
-
-function runJob(job) {
-    try {
-        const ts = fs.readFileSync(job.input);
-        const { data, count } = decryptSegment(ts);
-        fs.writeFileSync(job.output, data);
-        process.stdout.write(JSON.stringify({ ok: true, file: job.output, size: data.length, nalu_count: count }) + '\n');
-    } catch (e) {
-        process.stdout.write(JSON.stringify({ ok: false, file: job.output, error: e.message }) + '\n');
-    }
-}
-
-function main() {
-    const args = process.argv.slice(2);
-    let jobs;
-
-    if (args[0] === '--batch') {
-        jobs = JSON.parse(fs.readFileSync(0, 'utf-8'));
-    } else {
-        if (!args[0] || !args[1]) {
-            process.stderr.write('Usage: node cctv_h5e_decrypt.js <input.ts> <output.ts>\n');
-            process.stderr.write('Batch: echo \'[{"input":"a.ts","output":"b.ts"}]\' | node cctv_h5e_decrypt.js --batch\n');
-            process.exit(1);
-        }
-        jobs = [{ input: args[0], output: args[1] }];
-    }
-
-    for (const job of jobs) runJob(job);
-}
-
-main();
+const TAG='player_container_player',HOST='https://tv.cctv.com',EXT=2048,HB=Array.from(HOST,c=>c.charCodeAt(0));
+const M=CNTVModule({onRuntimeInitialized(){
+    const tm=M._jsmalloc(TAG.length+EXT);M.HEAP8.fill(0,tm,tm+TAG.length+EXT);M.HEAP8.set(Array.from(TAG,c=>c.charCodeAt(0)),tm);
+    M._CNTV_InitPlayer(tm);
+    const t2s=M._jsmalloc((TAG+'##1000000##0').length+1);M.HEAP8.set(Array.from(TAG+'##1000000##0',c=>c.charCodeAt(0)),t2s);
+    const t2n=M._jsmalloc(TAG.length+1);M.HEAP8.set(Array.from(TAG,c=>c.charCodeAt(0)),t2n);
+    const db=M._jsmalloc(512*1024);
+    const t0=Date.now();
+    for(let ji=0;ji<jobs.length;ji++){const job=jobs[ji];try{
+        const ts=Buffer.from(fs.readFileSync(job.input));
+        let cur=null;const pu=[];
+        for(let p=0;p<ts.length;p+=188){if(ts[p]!==0x47)continue;const pid=((ts[p+1]&0x1f)<<8)|ts[p+2];if(pid!==0x100)continue;const pusi=(ts[p+1]&0x40)>>6,afc=(ts[p+3]&0x30)>>4;let ps=afc===1?p+4:afc===3?p+5+ts[p+4]:-1;if(ps<0)continue;if(pusi){if(cur)pu.push(cur);cur={bufs:[ts.slice(ps,p+188)],pkts:[{pos:p,ps}]};}else if(cur){cur.bufs.push(ts.slice(ps,p+188));cur.pkts.push({pos:p,ps});}}
+        if(cur)pu.push(cur);let dc=0,sd=true;
+        for(const pes of pu){const pd=Buffer.concat(pes.bufs);if(pd.length<9||pd[0]!==0||pd[1]!==0||pd[2]!==1)continue;const hl=pd[8],eo=9+hl,es=Buffer.from(pd.slice(eo));const nals=[];for(let i=0;i<es.length-3;i++){if(es[i]===0&&es[i+1]===0){if(i+3<es.length&&es[i+2]===0&&es[i+3]===1){nals.push({sc:i,s:i+4});i+=3;}else if(es[i+2]===1){nals.push({sc:i,s:i+3});i+=2;}}}let mod=false;
+        for(let ni=0;ni<nals.length;ni++){const s=nals[ni].s,e=ni+1<nals.length?nals[ni+1].sc:es.length;const t=es[s]&0x1f;
+            if(t===25){if(e-s>1)sd=es[s+1]===1;const pay=es.slice(s+1,e);M.HEAP8[db]=es[s];M.HEAP8.set(pay,db+1);M.HEAP8.set(HB,db+pay.length+1);const vt=(M._CNTV_UpdatePlayer(tm)>>>0).toString(16).padStart(8,'0');for(let i=0;i<8;i++){if('0123456'.includes(vt[i])){const fn=M['_CNTV_jsdecVOD'+(7-i)];if(fn)fn(t2n,db,pay.length+1,HOST.length);}}M._CNTV_jsdecVOD8(t2n,db,pay.length+1,HOST.length);continue;}
+            if((t===1||t===5)&&sd){const pay=es.slice(s+1,e);M.HEAP8[db]=es[s];M.HEAP8.set(pay,db+1);M.HEAP8.set(HB,db+pay.length+1);const vt=(M._CNTV_UpdatePlayer(tm)>>>0).toString(16).padStart(8,'0');for(let i=0;i<8;i++){if('0123456'.includes(vt[i])){const fn=M['_CNTV_jsdecVOD'+(7-i)];if(fn)fn(t2s,db,pay.length+1,HOST.length);}}const dl=M._CNTV_jsdecVOD8(t2s,db,pay.length+1,HOST.length);const dec=Buffer.from(M.HEAP8.slice(db,db+dl));dec.slice(0,Math.min(dl,e-s)).copy(es,s);mod=true;dc++;}}
+        if(!mod)continue;const np=Buffer.concat([pd.slice(0,eo),es]);let off=0;for(const{pos,ps}of pes.pkts){const sl=pos+188-ps;np.copy(ts,ps,off,off+sl);off+=sl;}}
+        fs.writeFileSync(job.output,ts);process.stdout.write(JSON.stringify({ok:true,file:job.output,size:ts.length,nalu_count:dc})+'\n');
+    }catch(e){process.stdout.write(JSON.stringify({ok:false,file:job.output,error:e.message})+'\n');}}
+    process.stderr.write('[decrypt] done: '+jobs.length+' segments in '+((Date.now()-t0)/1000).toFixed(1)+'s\n');
+    process.exit(0);
+}});
+setTimeout(()=>{process.stderr.write('timeout\n');process.exit(1);},600000);
