@@ -72,13 +72,17 @@ func (c *CCTV) Extract(url string, opts *extractor.ExtractOpts) (*extractor.Medi
 	streams := make(map[string]extractor.Stream)
 
 	if selected := selectBestHLSURL(client, info, headers); selected != nil && selected.URL != "" {
-		streams["hls"] = extractor.Stream{
+		s := extractor.Stream{
 			Quality:   selected.Quality(),
 			URLs:      []string{selected.URL},
 			Format:    "m3u8",
 			NeedMerge: true,
 			Headers:   cloneHeaders(headers),
 		}
+		if selected.EncryptedType != "" {
+			s.Extra = map[string]any{"encrypted_type": selected.EncryptedType}
+		}
+		streams["hls"] = s
 	}
 
 	if videoURL := stringFromAny(info["video_url"]); videoURL != "" {
@@ -251,7 +255,7 @@ func candidateHLSURLs(info map[string]interface{}) []hlsCandidate {
 	}
 
 	if manifest := manifestMap(info["manifest"]); manifest != nil {
-		orderedKeys := []string{"hls_h5e_url", "hls_enc_url", "hls_url", "hls_enc2_url", "hls_audio_url"}
+		orderedKeys := []string{"hls_url", "hls_h5e_url", "hls_enc_url", "hls_enc2_url", "hls_audio_url"}
 		for i, key := range orderedKeys {
 			encryptedType := ""
 			supported := true

@@ -66,7 +66,7 @@ func (e *Engine) downloadHLS(filename string, stream extractor.Stream) (string, 
 		}
 	}
 
-	if e.ffmpeg != "" {
+	if e.ffmpeg != "" && streamEncryptedType(stream) != "cctv_h5e" {
 		return outPath, e.hlsViaFFmpeg(m3u8URL, outPath, stream.Headers)
 	}
 
@@ -75,6 +75,45 @@ func (e *Engine) downloadHLS(filename string, stream extractor.Stream) (string, 
 		return "", err
 	}
 	tsPath := outPath + ".ts"
+
+	isCCTVH5E := streamEncryptedType(stream) == "cctv_h5e"
+
+	if isCCTVH5E {
+		segPaths, err := e.downloadHLSSegmentsToDir(segments, stream.Headers)
+		if err != nil {
+			return "", err
+		}
+		defer func() {
+			for _, p := range segPaths {
+				os.Remove(p)
+			}
+		}()
+		if err := e.decryptCCTVH5E(e.ctx, segPaths); err != nil {
+			return "", fmt.Errorf("cctv h5e decrypt: %w", err)
+		}
+		if err := concatFilePaths(segPaths, tsPath); err != nil {
+			return "", err
+		}
+		if e.ffmpeg != "" {
+			partPath := outPath + ".part"
+			args := []string{"-y", "-i", tsPath, "-c", "copy", "-f", "mp4", partPath}
+			cmd := exec.CommandContext(e.ctx, e.ffmpeg, args...)
+			if err := runFFmpeg(cmd); err != nil {
+				os.Remove(partPath)
+				return "", err
+			}
+			os.Remove(tsPath)
+			if err := os.Rename(partPath, outPath); err != nil {
+				return "", err
+			}
+		} else {
+			if err := os.Rename(tsPath, outPath); err != nil {
+				return "", err
+			}
+		}
+		return outPath, nil
+	}
+
 	if hasEncryptedHLSSegments(segments) {
 		if err := e.downloadHLSSegments(segments, tsPath, stream.Headers); err != nil {
 			return "", err
@@ -697,6 +736,86 @@ func (e *Engine) muxDASH(videoPath, audioPath, outPath string, hasAudio bool) er
 		return err
 	}
 	return os.Rename(partPath, outPath)
+}
+
+func streamEncryptedType(s extractor.Stream) string {
+	if s.Extra == nil {
+		return ""
+	}
+	if v, ok := s.Extra["encrypted_type"].(string); ok {
+		return v
+	}
+	return ""
+}
+
+func (e *Engine) downloadHLSSegmentsToDir(segments []hlsSegment, headers map[string]string) ([]string, error) {
+	tmpDir, err := os.MkdirTemp("", "mediago-h5e-seg-*")
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithCancel(e.ctx)
+	defer cancel()
+
+	sem := make(chan struct{}, e.opts.Concurrency)
+	var wg sync.WaitGroup
+	var firstErr error
+	var errOnce sync.Once
+
+	paths := make([]string, len(segments))
+	for i, seg := range segments {
+		paths[i] = filepath.Join(tmpDir, fmt.Sprintf("seg_%05d.ts", i))
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case sem <- struct{}{}:
+		}
+		wg.Add(1)
+		go func(idx int, seg hlsSegment, outPath string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if ctx.Err() != nil {
+				return
+			}
+			if err := e.downloadHLSSegment(ctx, seg, outPath, headers); err != nil {
+				errOnce.Do(func() {
+					firstErr = err
+					cancel()
+				})
+			}
+		}(i, seg, paths[i])
+	}
+	wg.Wait()
+	if firstErr != nil {
+		for _, p := range paths {
+			os.Remove(p)
+		}
+		os.Remove(tmpDir)
+		return nil, firstErr
+	}
+	return paths, nil
+}
+
+func concatFilePaths(paths []string, outPath string) error {
+	os.MkdirAll(filepath.Dir(outPath), 0o755)
+	out, err := os.Create(outPath)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	for _, p := range paths {
+		f, err := os.Open(p)
+		if err != nil {
+			return err
+		}
+		_, err = io.Copy(out, f)
+		f.Close()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func SelectBestStream(streams map[string]extractor.Stream, preferred string) (string, extractor.Stream) {
