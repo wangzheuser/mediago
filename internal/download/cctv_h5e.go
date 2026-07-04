@@ -14,8 +14,6 @@ import (
 //go:embed cctv_h5e_decrypt.js
 var cctvH5eDecryptJS []byte
 
-const cctvWorkerURL = "https://js.player.cntv.cn/creator/vod.worker.js"
-
 type cctvH5eJob struct {
 	Input  string `json:"input"`
 	Output string `json:"output"`
@@ -39,12 +37,6 @@ func (e *Engine) decryptCCTVH5E(ctx context.Context, segmentPaths []string) erro
 		return err
 	}
 
-	// Ensure worker.js exists
-	workerPath, err := e.ensureCCTVWorker(ctx, tmpDir)
-	if err != nil {
-		return err
-	}
-
 	// Build job list
 	jobs := make([]cctvH5eJob, 0, len(segmentPaths))
 	for _, p := range segmentPaths {
@@ -58,8 +50,8 @@ func (e *Engine) decryptCCTVH5E(ctx context.Context, segmentPaths []string) erro
 		return err
 	}
 
-	// Run batch decrypt
-	cmd := exec.CommandContext(ctx, nodeExe, decoderPath, "--batch", workerPath)
+	// Run batch decrypt (self-contained pure-JS TEA decoder)
+	cmd := exec.CommandContext(ctx, nodeExe, decoderPath, "--batch")
 	cmd.Stdin = strings.NewReader(string(jobJSON))
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -85,39 +77,6 @@ func (e *Engine) decryptCCTVH5E(ctx context.Context, segmentPaths []string) erro
 	}
 
 	return nil
-}
-
-func (e *Engine) ensureCCTVWorker(ctx context.Context, tmpDir string) (string, error) {
-	// Check cached worker
-	cacheDir, err := os.UserCacheDir()
-	if err != nil {
-		cacheDir = tmpDir
-	}
-	cachedPath := filepath.Join(cacheDir, "mediago", "cctv_vod_worker.js")
-
-	if info, err := os.Stat(cachedPath); err == nil && info.Size() > 1000000 {
-		return cachedPath, nil
-	}
-
-	// Download worker.js
-	os.MkdirAll(filepath.Dir(cachedPath), 0o755)
-	body, err := e.client.GetBytes(cctvWorkerURL, nil)
-	if err != nil {
-		return "", fmt.Errorf("failed to download CCTV worker.js: %w", err)
-	}
-	if len(body) < 1000000 {
-		return "", fmt.Errorf("CCTV worker.js too small (%d bytes)", len(body))
-	}
-
-	if err := os.WriteFile(cachedPath, body, 0o644); err != nil {
-		// Fallback to tmpDir
-		fallback := filepath.Join(tmpDir, "vod.worker.js")
-		if err := os.WriteFile(fallback, body, 0o644); err != nil {
-			return "", err
-		}
-		return fallback, nil
-	}
-	return cachedPath, nil
 }
 
 func findNode() (string, error) {
